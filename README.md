@@ -14,8 +14,11 @@ Crypto trading can lose money quickly. Keep live trading disabled until you have
 
 ## Install
 
+The project lives at `C:\Users\marcu\Projects\Robinhood Trading Agent\agent`. The `.venv`
+is already built there; these steps only need repeating on a fresh machine.
+
 ```console
-cd ~/Desktop/digital-solomon-crypto-agent
+cd "C:\Users\marcu\Projects\Robinhood Trading Agent\agent"
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
