@@ -1,0 +1,131 @@
+{
+  "validated_at": "2026-07-18T00:39:50.065664+00:00",
+  "submitted": false,
+  "available_for_live": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "LINK-USD",
+    "AVAX-USD",
+    "AAVE-USD",
+    "UNI-USD",
+    "NEAR-USD",
+    "ARB-USD",
+    "OP-USD",
+    "SUI-USD",
+    "SEI-USD",
+    "ONDO-USD",
+    "GRT-USD",
+    "HYPE-USD"
+  ],
+  "unavailable": [],
+  "unknown": [
+    "INJ-USD",
+    "TAO-USD",
+    "RENDER-USD",
+    "TIA-USD",
+    "KAS-USD"
+  ],
+  "details": {
+    "BTC-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "ETH-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "SOL-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "LINK-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "AVAX-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "AAVE-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "UNI-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "NEAR-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "ARB-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "OP-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "SUI-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "INJ-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "market_error": "Client error '400 Bad Request' for url 'https://trading.robinhood.com/api/v2/crypto/marketdata/best_bid_ask/?symbol=INJ-USD'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400"
+    },
+    "SEI-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "TAO-USD": {
+      "submitted": false,
+      "pair_available": null,
+      "market_error": "Client error '400 Bad Request' for url 'https://trading.robinhood.com/api/v2/crypto/marketdata/best_bid_ask/?symbol=TAO-USD'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400"
+    },
+    "RENDER-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "market_error": "Client error '400 Bad Request' for url 'https://trading.robinhood.com/api/v2/crypto/marketdata/best_bid_ask/?symbol=RENDER-USD'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400"
+    },
+    "ONDO-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "GRT-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    },
+    "TIA-USD": {
+      "submitted": false,
+      "pair_available": null,
+      "market_error": "Client error '400 Bad Request' for url 'https://trading.robinhood.com/api/v2/crypto/marketdata/best_bid_ask/?symbol=TIA-USD'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400"
+    },
+    "KAS-USD": {
+      "submitted": false,
+      "pair_error": "Client error '400 Bad Request' for url 'https://trading.robinhood.com/api/v2/crypto/trading/trading_pairs/?symbol=KAS-USD'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400",
+      "market_error": "Client error '400 Bad Request' for url 'https://trading.robinhood.com/api/v2/crypto/marketdata/best_bid_ask/?symbol=KAS-USD'\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/400"
+    },
+    "HYPE-USD": {
+      "submitted": false,
+      "pair_available": true,
+      "has_bid_ask": true
+    }
+  }
+}

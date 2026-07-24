@@ -1,0 +1,54 @@
+strategy:
+  name: profile_momentum_reversion
+  timeframe: 5m
+  active_profile: growth_test
+  minimum_history_points: 50
+profiles:
+  conservative_test:
+    risk_level: low
+    notes: Trend-confirmed entries with fewer trades.
+    buy_when:
+    - ema20_above_ema50
+    - rsi_between_35_and_70
+    - momentum_5_positive
+    sell_when:
+    - rsi_above_75
+    - momentum_5_negative
+    - stop_loss_hit
+    - take_profit_hit
+  balanced_test:
+    risk_level: medium
+    notes: Moderate signal threshold for testing.
+    buy_when:
+    - rsi_between_30_and_65
+    - momentum_5_positive
+    sell_when:
+    - rsi_above_70
+    - momentum_5_negative
+    - stop_loss_hit
+    - take_profit_hit
+  growth_test:
+    risk_level: high
+    notes: Higher frequency growth-oriented momentum profile for paper testing only.
+    buy_when:
+    - rsi_between_25_and_70
+    - momentum_5_positive
+    sell_when:
+    - rsi_above_78
+    - momentum_5_negative
+    - stop_loss_hit
+    - take_profit_hit
+  conservative_trend:
+    risk_level: low
+    notes: Only buys when trend and momentum agree.
+    buy_when:
+    - ema20_above_ema50
+    - rsi_between_40_and_60
+    - momentum_5_positive
+    sell_when:
+    - ema20_below_ema50
+    - stop_loss_hit
+    - take_profit_hit
+position_sizing:
+  type: fixed_usd
+  amount_usd: 25

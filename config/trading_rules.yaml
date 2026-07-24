@@ -1,0 +1,95 @@
+trading:
+  enabled: true
+  mode: live
+  allowed_symbols: &id001
+  - BTC-USD
+  - ETH-USD
+  - SOL-USD
+  - LINK-USD
+  - AVAX-USD
+  - AAVE-USD
+  - UNI-USD
+  - NEAR-USD
+  - ARB-USD
+  - OP-USD
+  - SUI-USD
+  - INJ-USD
+  - SEI-USD
+  - TAO-USD
+  - RENDER-USD
+  - ONDO-USD
+  - GRT-USD
+  - TIA-USD
+  - KAS-USD
+  - HYPE-USD
+symbols:
+  research_watchlist:
+  - BTC-USD
+  - ETH-USD
+  - SOL-USD
+  - LINK-USD
+  - AVAX-USD
+  - AAVE-USD
+  - UNI-USD
+  - NEAR-USD
+  - ARB-USD
+  - OP-USD
+  - SUI-USD
+  - INJ-USD
+  - SEI-USD
+  - TAO-USD
+  - RENDER-USD
+  - ONDO-USD
+  - GRT-USD
+  - TIA-USD
+  - KAS-USD
+  - HYPE-USD
+  paper_allowed_symbols:
+  - BTC-USD
+  - ETH-USD
+  - SOL-USD
+  - LINK-USD
+  - AVAX-USD
+  - AAVE-USD
+  - UNI-USD
+  - NEAR-USD
+  - ARB-USD
+  - OP-USD
+  - SUI-USD
+  - INJ-USD
+  - SEI-USD
+  - TAO-USD
+  - RENDER-USD
+  - ONDO-USD
+  - GRT-USD
+  - TIA-USD
+  - KAS-USD
+  - HYPE-USD
+  live_allowed_symbols: *id001
+risk:
+  max_trade_amount_usd: 100.0
+  max_daily_loss_usd: 100.0
+  max_open_positions: 10
+  max_trades_per_day: 5
+  max_symbol_allocation_percent: 25.0
+  min_order_cooldown_seconds: 300
+  require_live_order_reconciliation: true
+  require_cash_available: true
+  count_existing_robinhood_holdings: false
+  allow_position_scaling: false
+  allow_margin: false
+  allow_shorts: false
+  allow_shorting: false
+orders:
+  order_type: limit
+  time_in_force: gtc
+  max_slippage_percent: 0.25
+  require_stop_loss: true
+  require_take_profit: true
+exits:
+  stop_loss_percent: 2.0
+  take_profit_percent: 4.0
+  trailing_stop_enabled: false
+kill_switch:
+  stop_file: STOP_TRADING
+  env_var: TRADING_ENABLED

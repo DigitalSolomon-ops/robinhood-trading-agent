@@ -1,0 +1,23 @@
+[Unit]
+Description=Solomon Trader 007 Dashboard (crypto.digitalsolomon.com)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=solomon
+Group=solomon
+WorkingDirectory=/opt/solomon-trader/app
+# Bind to all interfaces so the load-balancer NEG can reach the VM's internal
+# IP:8000. Public access is blocked by firewall (LB/health-check ranges only)
+# and gated by Cloud IAP at the load balancer. The app reads .env via
+# python-dotenv, so no EnvironmentFile is needed here.
+ExecStart=/opt/solomon-trader/venv/bin/python -m uvicorn --factory --host 0.0.0.0 --port 8000 src.dashboard:dashboard_app
+Restart=always
+RestartSec=3
+# Harden a little.
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

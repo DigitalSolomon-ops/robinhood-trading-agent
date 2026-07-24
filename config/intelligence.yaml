@@ -1,0 +1,35 @@
+intelligence:
+  enabled: true
+  use_news_filter: true
+  use_macro_filter: true
+  use_market_context_filter: true
+  use_sentiment_filter: true
+  minimum_confidence_to_trade: 60
+
+  scoring:
+    micro_signal_weight: 50
+    news_sentiment_weight: 20
+    macro_risk_weight: 15
+    market_context_weight: 15
+
+  news:
+    provider: cryptopanic
+    refresh_minutes: 15
+    lookback_hours: 24
+    block_on_severe_negative_news: true
+    severe_negative_threshold: -80
+
+  macro:
+    provider: fred
+    refresh_hours: 6
+    risk_off_blocks_new_entries: true
+
+  market_context:
+    provider: coingecko
+    refresh_minutes: 15
+    require_btc_trend_confirmation: false
+    block_if_market_drawdown_24h_below_percent: -5
+
+  fallback:
+    if_intelligence_unavailable: allow_micro_strategy
+    log_missing_data: true
