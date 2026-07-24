@@ -13,14 +13,9 @@ trading:
   - ARB-USD
   - OP-USD
   - SUI-USD
-  - INJ-USD
   - SEI-USD
-  - TAO-USD
-  - RENDER-USD
   - ONDO-USD
   - GRT-USD
-  - TIA-USD
-  - KAS-USD
   - HYPE-USD
 symbols:
   research_watchlist:
