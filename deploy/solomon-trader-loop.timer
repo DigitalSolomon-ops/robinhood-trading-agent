@@ -1,0 +1,17 @@
+[Unit]
+Description=Schedule for the Solomon Trader 007 bounded live run
+Documentation=file:///opt/solomon-trader/app/deploy/DEPLOY-RUNBOOK.md
+
+[Timer]
+# Cadence is the real throttle on live activity, tighter in practice than the
+# per-day caps in trading_rules.yaml. This placeholder is deliberately slow.
+# Set it consciously before enabling; see the open questions in
+# GCP-MIGRATION-PLAN.md.
+OnCalendar=hourly
+# Spread launches so a restart does not fire a run immediately.
+RandomizedDelaySec=300
+Persistent=false
+Unit=solomon-trader-loop.service
+
+[Install]
+WantedBy=timers.target

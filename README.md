@@ -65,13 +65,18 @@ ROBINHOOD_PRIVATE_KEY=
 ROBINHOOD_BASE_URL=https://trading.robinhood.com
 TRADING_MODE=paper
 TRADING_ENABLED=false
-MAX_DAILY_LOSS_USD=25
-MAX_TRADE_AMOUNT_USD=25
-MAX_OPEN_POSITIONS=2
 POLL_INTERVAL_SECONDS=60
 ```
 
 Leave `TRADING_ENABLED=false` until you intentionally want to allow rule-approved orders. With defaults, the bot logs decisions and risk blocks but places no orders.
+
+**Risk caps are not set here.** They live in `config/trading_rules.yaml` under `risk:`. No code
+reads `MAX_DAILY_LOSS_USD`, `MAX_TRADE_AMOUNT_USD` or `MAX_OPEN_POSITIONS`; they were removed
+from `.env` because they read as authoritative and are not.
+
+When the dashboard runs behind Cloud IAP, two further keys switch on the edge guards in
+`src/web_security.py`: `IAP_AUDIENCE` (the backend service the assertion must be minted for) and
+`PUBLIC_ORIGIN` (the origin state-changing requests must come from). Neither is set locally.
 
 ## Run Paper Mode
 

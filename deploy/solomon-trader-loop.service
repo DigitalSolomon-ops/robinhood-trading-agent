@@ -1,0 +1,30 @@
+[Unit]
+Description=Solomon Trader 007 bounded live trading run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=solomon
+Group=solomon
+# REQUIRED, not cosmetic. main.py builds KillSwitch("STOP_TRADING") as a bare
+# relative path, so run_cycle's mid-cycle kill check resolves against the
+# process working directory. systemd defaults system units to "/", which would
+# make the kill file unfindable and the operator's stop command ineffective.
+WorkingDirectory=/opt/solomon-trader/app
+# Bounded by iteration count on purpose. The bounded gate
+# (_bounded_live_gate_reasons) re-runs in full on every launch, including the
+# pytest suite, the symbol validation check and every risk cap. Restart=no is
+# load-bearing: restarting this unit automatically would convert a deliberately
+# finite, fully re-gated run into an unsupervised continuous one.
+#
+# Never substitute "run-live" here. That path loops forever with no gate
+# function, no test run and no cap ceiling.
+ExecStart=/opt/solomon-trader/venv/bin/python -m src.main run-live-loop --iterations 1 --confirm-bounded-live
+Restart=no
+TimeoutStartSec=1800
+NoNewPrivileges=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

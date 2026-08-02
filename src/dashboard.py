@@ -54,6 +54,7 @@ from .order_manager import OrderManager
 from .paper_broker import PaperBroker
 from .portfolio import Portfolio
 from .risk_manager import RiskManager
+from .web_security import install_security_middleware
 
 SECRET_MARKERS = ("ROBINHOOD_API_KEY", "ROBINHOOD_PRIVATE_KEY", "PRIVATE_KEY", "API_KEY")
 
@@ -62,6 +63,18 @@ def dashboard_app(root: Path = ROOT) -> FastAPI:
     app = FastAPI(title="Digital Solomon Crypto Agent")
     app.state.root = Path(root)
     app.state.smoke_previews = {}
+    install_security_middleware(app)
+
+    @app.get("/healthz")
+    def healthz() -> dict[str, str]:
+        """Load-balancer health check.
+
+        Deliberately reads nothing: no database, no config file, and above all
+        no Robinhood API call. The home page does all three, so pointing a
+        health check at "/" would sign an authenticated broker request every
+        few seconds from a single egress IP.
+        """
+        return {"status": "ok"}
 
     @app.get("/", response_class=HTMLResponse)
     def home() -> str:
