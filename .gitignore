@@ -2,6 +2,7 @@
 logs/
 data/*.db
 data/private/
+data/proving_runs/
 __pycache__/
 *.pyc
 .venv/
