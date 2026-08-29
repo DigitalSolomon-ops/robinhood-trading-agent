@@ -5,3 +5,7 @@ data/private/
 __pycache__/
 *.pyc
 .venv/
+
+# ds-build-agent handoff artifacts (in-place build)
+BLOCKERS.md
+GHL-SETUP.md
