@@ -655,6 +655,78 @@ def test_live_control_safety_buttons_and_cancel_confirmation(monkeypatch, tmp_pa
     assert stop.status_code == 200
 
 
+def test_equities_page_renders_posture_gates_and_agentic_account(tmp_path: Path) -> None:
+    root = make_dashboard_root(tmp_path)
+    client = TestClient(dashboard_app(root))
+
+    response = client.get("/equities")
+    text = response.text
+
+    assert response.status_code == 200
+    assert "Equities Lane" in text
+    assert "STOP_TRADING_EQUITIES exists" in text
+    assert "Agentic" in text
+    assert "••2092" in text or "2092" in text
+    assert "••2833" in text or "2833" in text
+    assert "Agent-hosted" in text
+    assert "No open equities paper positions." in text
+
+
+def test_equities_page_shows_paper_positions_and_rationale(tmp_path: Path) -> None:
+    root = make_dashboard_root(tmp_path)
+    (root / "data" / "equity_paper_trades.db").parent.mkdir(parents=True, exist_ok=True)
+    from src.paper_broker import PaperBroker
+    from src.logger import SQLiteLogger
+
+    PaperBroker(root / "data" / "equity_paper_trades.db").place_order(
+        {"symbol": "AAPL", "side": "buy", "quantity": 2, "limit_price": 150.0, "reason": "test fill"}
+    )
+    logger = SQLiteLogger(root / "data" / "trading_agent.db")
+    logger.log_decision(
+        "AAPL",
+        "equity_signal_skipped",
+        "no order attempted for AAPL: strategy signal is 'hold' (no edge); risk and compliance gates were not evaluated",
+        {"venue": "robinhood_equities"},
+    )
+    logger.log_decision(None, "dashboard_settings_saved", "settings saved from dashboard")
+    client = TestClient(dashboard_app(root))
+
+    text = client.get("/equities").text
+
+    assert "AAPL" in text
+    assert "equity_signal_skipped" in text
+    assert "no order attempted for AAPL" in text
+    # Only equities-tagged decisions belong on this page.
+    assert "dashboard_settings_saved" not in text
+
+
+def test_equities_page_reflects_its_own_kill_switch(tmp_path: Path) -> None:
+    root = make_dashboard_root(tmp_path)
+    (root / "STOP_TRADING_EQUITIES").write_text("stop", encoding="utf-8")
+    client = TestClient(dashboard_app(root))
+
+    text = client.get("/equities").text
+
+    assert "BLOCKED: STOP_TRADING_EQUITIES Is Active" in text
+
+
+def test_equities_lane_does_not_weaken_existing_crypto_views(monkeypatch, tmp_path: Path) -> None:
+    root = make_dashboard_root(tmp_path)
+    monkeypatch.setattr(dashboard, "make_client", lambda: FakeDashboardClient())
+    client = TestClient(dashboard_app(root))
+
+    home = client.get("/")
+    live_control = client.get("/live-control")
+    live_readiness = client.get("/live-readiness")
+    kill = client.get("/kill")
+
+    assert home.status_code == 200 and "Safety Status" in home.text
+    assert live_control.status_code == 200 and "Live Control Center" in live_control.text
+    assert live_readiness.status_code == 200
+    assert kill.status_code == 200
+    assert "Equities Lane" in home.text  # present in nav, existing pages untouched otherwise
+
+
 def test_settings_symbols_and_help_include_plain_language_definitions(tmp_path: Path) -> None:
     root = make_dashboard_root(tmp_path)
     client = TestClient(dashboard_app(root))

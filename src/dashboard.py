@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
+from .equity_runtime import equity_kill_switch
 from .intelligence import (
     collect_intelligence as collect_intelligence_layer,
     export_intelligence_report as export_intelligence_report_layer,
@@ -25,6 +26,7 @@ from .intelligence.intelligence_store import IntelligenceStore
 from .kill_switch import KillSwitch
 from .live_broker import LiveBroker
 from .logger import SQLiteLogger
+from .market_hours import EASTERN, blocked_reason as market_blocked_reason
 from .main import (
     ROOT,
     _best_price_from_payload,
@@ -165,6 +167,10 @@ def dashboard_app(root: Path = ROOT) -> FastAPI:
         form = await parse_form(request)
         result = run_intelligence_action(app.state.root, str(form.get("action", "")))
         return page("Intelligence", intelligence_html(app.state.root, result))
+
+    @app.get("/equities", response_class=HTMLResponse)
+    def equities() -> str:
+        return page("Equities Lane", equities_html(app.state.root))
 
     @app.get("/live-readiness", response_class=HTMLResponse)
     def live_readiness() -> str:
@@ -784,8 +790,50 @@ def recent_rows(root: Path, db_name: str, table: str, limit: int = 25) -> list[d
     return [scrub_secrets(dict(row)) for row in rows]
 
 
+def recent_equity_decisions(root: Path, limit: int = 25) -> list[dict[str, Any]]:
+    """Decisions logged by the equities lane only, newest first.
+
+    Every decision equity_runtime/RobinhoodEquityBroker log carries an
+    action prefixed "equity_" (equity_signal_skipped, equity_order_refused,
+    equity_paper_loop_completed, ...), so filtering on that prefix separates
+    this lane's rationale from the crypto lane's decisions in the same table
+    without needing a schema change.
+    """
+    db_path = root / "data" / "trading_agent.db"
+    if not db_path.exists():
+        return []
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute(
+                "SELECT * FROM decisions WHERE action LIKE 'equity_%' ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+    return [scrub_secrets(dict(row)) for row in rows]
+
+
+def equities_positions(root: Path) -> dict[str, Any]:
+    """The equities paper broker's own ledger -- the lane's only fill source
+    for this build (paper_broker simulating fills against real read-only
+    quotes; see docs/rh-equities-binding.md). This dashboard process holds no
+    live Robinhood connector (the connector is session-bound to a Claude
+    agent), so live positions cannot be read from here."""
+    portfolio = PaperBroker(root / "data" / "equity_paper_trades.db").get_portfolio()
+    return {
+        "cash_usd": portfolio.cash_usd,
+        "positions": {
+            symbol: {"quantity": position.quantity, "average_price": position.average_price, "pnl": position.pnl}
+            for symbol, position in portfolio.positions.items()
+            if abs(position.quantity) > 1e-12
+        },
+    }
+
+
 NAV_ITEMS = [
     ("/", "Status", "Safety Status"),
+    ("/equities", "Equities Lane", "Equities Lane"),
     ("/live-control", "Live Control Center", "Live Control Center"),
     ("/live-readiness", "Live Readiness", "Live Readiness"),
     ("/settings", "Settings", "Settings"),
@@ -1237,6 +1285,73 @@ def audit_html(root: Path, result: dict[str, Any] | None = None) -> str:
     body = f"<table>{count_table}</table><form method='post'><button>Export Live Audit</button></form>{result_html}"
     body += "".join(f"<h3>{escape(title)}</h3>{rows_table(rows)}" for title, rows in sections.items())
     return body
+
+
+def equities_html(root: Path) -> str:
+    rules, _ = load_dashboard_settings(root)
+    equities_config = rules.get("equities", {})
+    kill = equity_kill_switch(rules, root)
+    stop_exists = kill.stop_file_exists()
+    trading_enabled = os.getenv("TRADING_ENABLED", "false").lower() == "true"
+    allow_extended = bool(equities_config.get("allow_extended_hours", False))
+    market_reason = market_blocked_reason(datetime.now(EASTERN), allow_extended_hours=allow_extended)
+    crypto_stop_exists = KillSwitch(stop_file=str(root / rules.get("kill_switch", {}).get("stop_file", "STOP_TRADING"))).stop_file_exists()
+
+    if stop_exists:
+        banner = '<p class="danger">BLOCKED: STOP_TRADING_EQUITIES Is Active - the equities lane will not place or simulate new orders</p>'
+    elif market_reason:
+        banner = f'<p class="warn">CAUTION: {escape(market_reason)} - equity orders would be refused right now</p>'
+    else:
+        banner = '<p class="safe">SAFE: EQUITIES PAPER MODE - simulated fills only, no live Robinhood equity order has a path from this dashboard</p>'
+
+    posture_rows = {
+        "Lane": "Robinhood equities (rules-based, long-only)",
+        "Execution surface": "Agent-hosted: the OAuth Robinhood MCP connector is session-bound to a Claude/harness agent session. This dashboard process holds no connector and cannot place or preview a live equity order.",
+        "Current posture": "paper (simulated fills against read-only quotes)" if not stop_exists else "halted",
+        "STOP_TRADING_EQUITIES exists": stop_exists,
+        "TRADING_ENABLED (shared env flag)": trading_enabled,
+        "Extended hours opt-in (config)": allow_extended,
+        "Regular trading hours right now": "closed" if market_reason else "open",
+        "Crypto lane STOP_TRADING (unrelated file, shown for awareness)": crypto_stop_exists,
+    }
+    posture_table = "".join(f"<tr><th>{escape(k)}</th><td>{escape(v)}</td></tr>" for k, v in posture_rows.items())
+
+    account_rows = {
+        "Designated account nickname": "Agentic",
+        "Designated account number": "••2092",
+        "Default account (off-limits to the agent)": "••2833 - never targeted by this lane",
+        "Options level": "none (long-only equities, no options)",
+        "Margin": "none - cash account only",
+        "Live account balance": "read live via the connector inside an agent session only; not available from this dashboard process",
+    }
+    account_table = "".join(f"<tr><th>{escape(k)}</th><td>{escape(v)}</td></tr>" for k, v in account_rows.items())
+
+    holdings = equities_positions(root)
+    position_rows = holdings["positions"]
+    if position_rows:
+        positions_table = rows_table(
+            [
+                {"symbol": symbol, "quantity": row["quantity"], "average_price": row["average_price"], "pnl": row["pnl"]}
+                for symbol, row in sorted(position_rows.items())
+            ]
+        )
+    else:
+        positions_table = "<p>No open equities paper positions.</p>"
+
+    decisions_table = rows_table(recent_equity_decisions(root, 25))
+
+    return f"""
+    {banner}
+    {section("Posture & Gates", "Everything that governs whether the equities lane can act: the lane's own kill switch (separate from the crypto lane's STOP_TRADING), the shared TRADING_ENABLED flag, market hours, and where live execution actually happens.")}
+    <table>{posture_table}</table>
+    {section("Agentic Account", "Robinhood confines all agent trading to exactly one designated account. The agent never targets the default account, whatever the rules would otherwise allow.")}
+    <table>{account_table}</table>
+    {section("Equities Positions (paper)", "Simulated fills from the local paper broker, priced against real read-only Robinhood quotes. This is the lane's only fill source in this build.")}
+    <p class="muted">Cash (paper): {escape(holdings["cash_usd"])}</p>
+    {positions_table}
+    {section("Recent Decisions & Rationale", "Every equities decision - a simulated fill, a skipped signal, or a refused order - with the human-readable reason the lane logged for it.")}
+    {decisions_table}
+    """
 
 
 def strategy_html(root: Path) -> str:
