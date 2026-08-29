@@ -26,7 +26,7 @@ from src.kill_switch import KillSwitch
 from src.logger import SQLiteLogger
 from src.order_manager import OrderManager
 from src.paper_broker import PaperBroker
-from src.portfolio import Portfolio
+from src.portfolio import Portfolio, Position
 from src.risk_manager import RiskManager
 from src.robinhood_equity_broker import RobinhoodEquityBroker, equity_portfolio
 from src.robinhood_equity_client import AgentAccountMismatchError, RobinhoodEquityClient
@@ -652,6 +652,160 @@ def test_portfolio_skips_zero_quantity_rows() -> None:
 
     assert TEST_SYMBOL not in portfolio.positions
     assert portfolio.open_position_count == 1
+
+
+def seed_order(logger: SQLiteLogger, symbol: str, side: str, day: str, notional: float = 100.0, status: str = "submitted") -> None:
+    """Insert an order history row with a chosen timestamp -- log_order()
+    always stamps `now()`, but the PDT/settlement guards need control over
+    which historical day a fill landed on."""
+    with logger.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO orders (timestamp, client_order_id, symbol, side, order_type, quantity, limit_price, notional, status, details)
+            VALUES (?, ?, ?, ?, 'limit', 1, 100.0, ?, ?, '{}')
+            """,
+            (f"{day}T10:00:00+00:00", f"seed-{symbol}-{side}-{day}", symbol, side, notional, status),
+        )
+
+
+# --- the pattern-day-trader guard ---------------------------------------------
+
+# DURING_RTH (2026-08-31) is a Monday, so "the trailing 5 business days" is
+# unambiguous: Mon 08-31 (today), Fri 08-28, Thu 08-27, Wed 08-26, Tue 08-25.
+_PRIOR_DAY_TRADE_DAYS = ("2026-08-25", "2026-08-26", "2026-08-27")
+
+
+def test_pdt_guard_blocks_the_fourth_day_trade_under_25k(tmp_path: Path) -> None:
+    connector = FakeConnector(positions=[{"symbol": TEST_SYMBOL, "quantity": "1", "average_buy_price": "100.00"}])
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    for day in _PRIOR_DAY_TRADE_DAYS:
+        seed_order(logger, TEST_SYMBOL, "buy", day)
+        seed_order(logger, TEST_SYMBOL, "sell", day)
+    seed_order(logger, TEST_SYMBOL, "buy", "2026-08-31")  # today's opening leg
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+    # Account equity here is cash (500) + 1 share @ $100 = $600 -- well under $25k.
+
+    with pytest.raises(RuntimeError, match="pattern-day-trader guard"):
+        broker.place_limit_order(order(side="sell", quantity=0.25))
+
+    assert connector.place_calls == []
+    assert "pattern-day-trader guard" in logger.get_last_decision()["reason"]
+
+
+def test_pdt_guard_allows_a_third_day_trade_under_25k(tmp_path: Path) -> None:
+    connector = FakeConnector(positions=[{"symbol": TEST_SYMBOL, "quantity": "1", "average_buy_price": "100.00"}])
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    for day in _PRIOR_DAY_TRADE_DAYS[:2]:
+        seed_order(logger, TEST_SYMBOL, "buy", day)
+        seed_order(logger, TEST_SYMBOL, "sell", day)
+    seed_order(logger, TEST_SYMBOL, "buy", "2026-08-31")
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+
+    result = broker.place_limit_order(order(side="sell", quantity=0.25))
+
+    assert result["submitted"] is True
+    assert len(connector.place_calls) == 1
+
+
+def test_pdt_guard_does_not_block_once_account_equity_clears_25k(tmp_path: Path) -> None:
+    # Same 3 prior day trades plus today's opening leg as the blocked case
+    # above, but enough held shares to put account equity at/over $25k.
+    connector = FakeConnector(positions=[{"symbol": TEST_SYMBOL, "quantity": "250", "average_buy_price": "100.00"}])
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    for day in _PRIOR_DAY_TRADE_DAYS:
+        seed_order(logger, TEST_SYMBOL, "buy", day)
+        seed_order(logger, TEST_SYMBOL, "sell", day)
+    seed_order(logger, TEST_SYMBOL, "buy", "2026-08-31")
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+
+    result = broker.place_limit_order(order(side="sell", quantity=0.25))
+
+    assert result["submitted"] is True
+    assert len(connector.place_calls) == 1
+
+
+def test_pdt_guard_is_re_checked_through_the_shared_lane(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    connector = FakeConnector(positions=[{"symbol": TEST_SYMBOL, "quantity": "1", "average_buy_price": "100.00"}])
+    broker, order_manager, risk_manager, logger, _ = build_lane(
+        tmp_path, connector, dry_run=False, confirm_live_order=True
+    )
+    for day in _PRIOR_DAY_TRADE_DAYS:
+        seed_order(logger, TEST_SYMBOL, "buy", day)
+        seed_order(logger, TEST_SYMBOL, "sell", day)
+    seed_order(logger, TEST_SYMBOL, "buy", "2026-08-31")
+    sell_signal = TradeSignal(TEST_SYMBOL, "sell", 0.8, "test", None, None, "sell")
+
+    with pytest.raises(RuntimeError, match="pattern-day-trader guard"):
+        broker.submit_signal(
+            order_manager,
+            sell_signal,
+            limit_price=100.0,
+            mode="live",
+            portfolio=Portfolio(cash_usd=1000.0, positions={TEST_SYMBOL: Position(TEST_SYMBOL, 1.0)}),
+            daily_summary={"realized_pnl": 0, "trade_count": 0},
+        )
+
+    assert connector.place_calls == []
+
+
+# --- shorts and margin are rejected -------------------------------------------
+
+
+def test_a_sell_beyond_the_held_quantity_is_refused_as_a_short(tmp_path: Path) -> None:
+    connector = FakeConnector(positions=[{"symbol": TEST_SYMBOL, "quantity": "0.1", "average_buy_price": "100.00"}])
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+
+    with pytest.raises(RuntimeError, match="short"):
+        broker.place_limit_order(order(side="sell", quantity=0.25))
+
+    assert connector.place_calls == []
+    assert "long-only guard" in logger.get_last_decision()["reason"]
+
+
+def test_a_sell_with_no_position_at_all_is_refused_as_a_short(tmp_path: Path) -> None:
+    connector = FakeConnector(positions=[])
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+
+    with pytest.raises(RuntimeError, match="short"):
+        broker.place_limit_order(order(side="sell", quantity=0.25))
+
+    assert connector.place_calls == []
+
+
+def test_a_buy_beyond_settled_cash_is_refused_as_margin(tmp_path: Path) -> None:
+    # A cash account has no margin buying power -- a buy that does not fit
+    # inside cash on hand is refused by the same guard that enforces
+    # settlement, since there is nowhere else for it to draw from.
+    connector = FakeConnector(positions=[])
+    connector.get_accounts = lambda: {  # cash-poor account, well under the $25 order
+        "accounts": [{**AGENT_ACCOUNT, "cash_available_for_trading": "1.00"}, DEFAULT_ACCOUNT]
+    }
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+
+    with pytest.raises(RuntimeError, match="good-faith guard"):
+        broker.place_limit_order(order(side="buy", quantity=0.25, notional=25.0))
+
+    assert connector.place_calls == []
+    assert "no margin" in logger.get_last_decision()["reason"]
+
+
+def test_a_buy_that_would_spend_same_day_unsettled_sale_proceeds_is_refused(tmp_path: Path) -> None:
+    connector = FakeConnector(positions=[])
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    # Sold $500 worth earlier today; those proceeds have not settled yet
+    # (T+1), so a buy funded by them today is a good-faith violation even
+    # though the account shows $500 of cash on hand.
+    seed_order(logger, TEST_SYMBOL, "sell", "2026-08-31", notional=500.0)
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+
+    with pytest.raises(RuntimeError, match="good-faith guard"):
+        broker.place_limit_order(order(side="buy", quantity=0.25, notional=25.0))
+
+    assert connector.place_calls == []
 
 
 def test_reads_resolve_against_the_pinned_account() -> None:

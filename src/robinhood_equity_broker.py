@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from . import market_hours
+from .equity_compliance import HISTORY_LOOKBACK_DAYS, PatternDayTraderGuard, SettlementGuard, assert_long_only
 from .kill_switch import KillSwitch
 from .logger import SQLiteLogger
 from .order_manager import OrderManager
@@ -82,7 +83,13 @@ class RobinhoodEquityBroker:
        returns an unsubmitted payload preview and never reaches the connector;
     3. at the irreversible moment, the kill switch is re-checked and a real
        order is refused outright if STOP_TRADING exists or TRADING_ENABLED is
-       not true.
+       not true;
+    4. the Agentic account's own compliance shape: long-only (a sell beyond
+       the held quantity is refused as a short), the FINRA pattern-day-trader
+       guard (blocks a 4th same-symbol day trade in 5 business days while
+       account equity is under $25k), and the cash-account good-faith /
+       settlement guard (a buy cannot spend still-unsettled sale proceeds --
+       this account has no margin to draw on instead). See equity_compliance.py.
 
     READ-ONLY is the default posture: dry_run defaults to True and
     confirm_live_order to False, so a broker built with no arguments cannot
@@ -202,6 +209,38 @@ class RobinhoodEquityBroker:
             self._log_refusal(symbol, side, reason)
             raise RuntimeError(reason)
 
+    def _order_history(self, as_of: datetime) -> list[dict[str, Any]]:
+        if self.logger is None:
+            return []
+        cutoff = (as_of - timedelta(days=HISTORY_LOOKBACK_DAYS)).isoformat()
+        return self.logger.get_orders_since(cutoff)
+
+    def _assert_long_only(self, symbol: str, side: str, order_quantity: float, portfolio: Portfolio) -> None:
+        """No shorts, ever -- checked here regardless of what trading_rules.yaml's
+        allow_shorting flag says, since that flag is the crypto lane's to set."""
+        decision = assert_long_only(symbol, side, order_quantity, portfolio.quantity_for(symbol))
+        if not decision.allowed:
+            self._log_refusal(symbol, side, decision.reason)
+            raise RuntimeError(decision.reason)
+
+    def _assert_pdt_guard(
+        self, symbol: str, side: str, portfolio: Portfolio, history: list[dict[str, Any]], as_of: datetime
+    ) -> None:
+        decision = PatternDayTraderGuard(history).evaluate(symbol, side, portfolio.equity(), as_of)
+        if not decision.allowed:
+            self._log_refusal(symbol, side, decision.reason)
+            raise RuntimeError(decision.reason)
+
+    def _assert_settlement_guard(
+        self, symbol: str, side: str, notional: float, portfolio: Portfolio, history: list[dict[str, Any]], as_of: datetime
+    ) -> None:
+        """Also the account's anti-margin check: the Agentic account is cash-only,
+        so a buy that does not fit inside settled cash has nowhere else to draw from."""
+        decision = SettlementGuard(history).evaluate(side, notional, portfolio.cash_usd, as_of)
+        if not decision.allowed:
+            self._log_refusal(symbol, side, decision.reason)
+            raise RuntimeError(decision.reason)
+
     @contextmanager
     def forced_preview(self) -> Iterator[None]:
         """Disarm the broker for the duration of a block, then restore it.
@@ -263,6 +302,13 @@ class RobinhoodEquityBroker:
         # explicitly.
         self._assert_regular_hours(symbol, side)
         self._assert_kill_switch_open(symbol, side)
+        as_of = self._clock()
+        history = self._order_history(as_of)
+        portfolio_snapshot = self.get_portfolio()
+        notional = float(order.get("notional") or 0.0)
+        self._assert_long_only(symbol, side, float(order["quantity"]), portfolio_snapshot)
+        self._assert_pdt_guard(symbol, side, portfolio_snapshot, history, as_of)
+        self._assert_settlement_guard(symbol, side, notional, portfolio_snapshot, history, as_of)
         result = self.client.place_order(
             symbol=symbol,
             side=side,

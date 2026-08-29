@@ -28,6 +28,15 @@ class Portfolio:
         position = self.positions.get(symbol)
         return float(position.quantity) if position else 0.0
 
+    def equity(self) -> float:
+        """Cash plus each position's book value (average price x quantity).
+
+        An approximation good enough for a threshold check like the PDT
+        guard's $25k line -- a live mark-to-market would need a fresh quote
+        per symbol instead, which is more than that guard needs.
+        """
+        return self.cash_usd + sum(max(position.quantity, 0.0) * position.average_price for position in self.positions.values())
+
     @classmethod
     def from_robinhood(cls, account_payload: Any, holdings_payload: Any) -> "Portfolio":
         cash = 0.0

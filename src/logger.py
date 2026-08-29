@@ -198,6 +198,41 @@ class SQLiteLogger:
             "details": details,
         }
 
+    def get_orders_since(self, cutoff_iso: str, symbol: str | None = None) -> list[dict[str, Any]]:
+        """Orders at or after `cutoff_iso`, oldest first -- the raw history
+        the equities lane's PDT/settlement guards replay to reconstruct
+        which days had a same-symbol buy+sell and which sale proceeds have
+        not yet settled."""
+        sql = "SELECT timestamp, client_order_id, symbol, side, status, notional, quantity, details FROM orders WHERE timestamp >= ?"
+        params: list[Any] = [cutoff_iso]
+        if symbol:
+            sql += " AND symbol = ?"
+            params.append(symbol)
+        sql += " ORDER BY id ASC"
+        with self.connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            details: dict[str, Any] = {}
+            if row[7]:
+                try:
+                    details = json.loads(row[7])
+                except json.JSONDecodeError:
+                    details = {}
+            results.append(
+                {
+                    "timestamp": row[0],
+                    "client_order_id": row[1],
+                    "symbol": row[2],
+                    "side": row[3],
+                    "status": row[4],
+                    "notional": row[5],
+                    "quantity": row[6],
+                    "details": details,
+                }
+            )
+        return results
+
     def recent_audit_rows(self, limit: int = 200) -> dict[str, list[dict[str, Any]]]:
         output: dict[str, list[dict[str, Any]]] = {}
         queries = {
