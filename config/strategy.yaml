@@ -52,3 +52,26 @@ profiles:
 position_sizing:
   type: fixed_usd
   amount_usd: 25
+# Equities lane -- its own namespace, deliberately separate from strategy/profiles
+# above (the crypto lane's). Selecting equity_strategy.active_profile never reads
+# or touches the crypto lane's active_profile, and vice versa. Equities are not
+# 24/7: the connector supplies regular-trading-hours bars only, so this profile is
+# tuned for a slower, session-bound cadence rather than crypto's continuous feed.
+equity_strategy:
+  name: equities_trend_confirmation
+  timeframe: 1d
+  active_profile: equities_core
+  minimum_history_points: 50
+equity_profiles:
+  equities_core:
+    risk_level: low
+    notes: Long-only trend-confirmed entries for regular-hours equities; paper-tested first.
+    buy_when:
+    - ema20_above_ema50
+    - rsi_between_35_and_70
+    - momentum_5_positive
+    sell_when:
+    - rsi_above_75
+    - momentum_5_negative
+    - stop_loss_hit
+    - take_profit_hit

@@ -131,11 +131,22 @@ class StrategyEngine:
                 failed.append(name)
         return tuple(met), tuple(failed)
 
-    def _active_profile(self) -> tuple[str, dict[str, Any]]:
-        strategy = self.strategy_config.get("strategy", {})
-        profiles = self.strategy_config.get("profiles", {})
-        name = strategy.get("active_profile", "conservative_test")
-        profile = profiles.get(name) or profiles.get("conservative_test") or {}
+    # Lane -> (strategy config key, profiles config key, fallback profile name).
+    # Equities get their OWN namespace (equity_strategy/equity_profiles) so
+    # selecting an equities profile never reads or depends on the crypto
+    # lane's `strategy.active_profile` -- the two lanes' active profiles are
+    # independent settings, on purpose.
+    _LANE_CONFIG_KEYS = {
+        "crypto": ("strategy", "profiles", "conservative_test"),
+        "equities": ("equity_strategy", "equity_profiles", "equities_core"),
+    }
+
+    def _active_profile(self, lane: str = "crypto") -> tuple[str, dict[str, Any]]:
+        strategy_key, profiles_key, fallback_name = self._LANE_CONFIG_KEYS[lane]
+        strategy = self.strategy_config.get(strategy_key, {})
+        profiles = self.strategy_config.get(profiles_key, {})
+        name = strategy.get("active_profile", fallback_name)
+        profile = profiles.get(name) or profiles.get(fallback_name) or {}
         return name, profile
 
     def generate_signal(
@@ -144,15 +155,17 @@ class StrategyEngine:
         prices: list[float],
         has_open_position: bool = False,
         allow_position_scaling: bool = False,
+        lane: str = "crypto",
     ) -> TradeSignal:
-        minimum_history = int(self.strategy_config.get("strategy", {}).get("minimum_history_points", 50))
+        strategy_key = self._LANE_CONFIG_KEYS[lane][0]
+        minimum_history = int(self.strategy_config.get(strategy_key, {}).get("minimum_history_points", 50))
         history_points = len(prices)
         current = prices[-1] if prices else None
         ema_20 = self.ema(prices, 20)
         ema_50 = self.ema(prices, 50)
         rsi_14 = self.rsi(prices)
         momentum_5 = self.momentum(prices)
-        profile_name, profile = self._active_profile()
+        profile_name, profile = self._active_profile(lane)
         buy_conditions = list(profile.get("buy_when", []))
         sell_conditions = list(profile.get("sell_when", []))
         indicators = {
@@ -218,3 +231,29 @@ class StrategyEngine:
             return signal("hold", 0.0, "position_scaling_disabled", "hold", buy_failed)
 
         return signal("hold", 0.0, "no_entry_conditions_met", "hold", buy_failed)
+
+    def generate_equity_signal(
+        self,
+        symbol: str,
+        prices: list[float],
+        has_open_position: bool = False,
+        allow_position_scaling: bool = False,
+    ) -> TradeSignal:
+        """Equities entry point for the shared engine.
+
+        Same indicators and condition machinery as the crypto lane, under
+        the equities lane's own profile namespace (equity_strategy /
+        equity_profiles in config/strategy.yaml). `prices` is expected to be
+        session-bound history from the connector, not a 24/7 series -- the
+        engine itself is time-agnostic (it only ever sees a plain price
+        list), so the "not 24/7" constraint is the caller's job: feed it
+        regular-hours bars only. Market-hours enforcement for the actual
+        order lives in RobinhoodEquityBroker, not here.
+        """
+        return self.generate_signal(
+            symbol,
+            prices,
+            has_open_position=has_open_position,
+            allow_position_scaling=allow_position_scaling,
+            lane="equities",
+        )
