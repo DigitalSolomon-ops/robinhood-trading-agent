@@ -93,3 +93,13 @@ equities:
   # Defaults OFF: equity orders submit only inside regular trading hours (09:30-16:00 ET,
   # Mon-Fri, non-holiday) until the operator explicitly flips this on.
   allow_extended_hours: false
+  # Equities symbol universe -- deliberately separate from trading.allowed_symbols /
+  # symbols.* above, which are the crypto lane's lists. Kept small and large-cap
+  # liquid for first proving (src.equity_symbols.validate_equity_symbols confirms
+  # each ticker returns an active quote via the connector before it trades).
+  universe:
+  - AAPL
+  - MSFT
+  - AMZN
+  - GOOGL
+  - NVDA
