@@ -17,6 +17,7 @@ shape is exercised below against the real call path.
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,17 @@ from src.risk_manager import RiskManager
 from src.robinhood_equity_broker import RobinhoodEquityBroker, equity_portfolio
 from src.robinhood_equity_client import AgentAccountMismatchError, RobinhoodEquityClient
 from src.strategy_engine import TradeSignal
+from src import market_hours
+
+# A weekday inside regular trading hours, and one well outside it -- both
+# non-holiday so only the time-of-day (and the extended-hours flag) is under
+# test.
+DURING_RTH = datetime(2026, 8, 31, 10, 0)
+# After the 16:00 regular close but inside the 04:00-20:00 extended window,
+# so this same timestamp exercises both "blocked by default" and "allowed
+# once extended hours are explicitly opted in".
+OUTSIDE_RTH = datetime(2026, 8, 31, 17, 0)
+A_MARKET_HOLIDAY = datetime.combine(sorted(market_hours.us_market_holidays(2026))[0], market_hours.REGULAR_OPEN)
 
 AGENT_ACCOUNT = {
     "account_number": "AGENT-ACCT-0001",
@@ -78,6 +90,11 @@ class FakeConnector:
 
 
 def make_broker(connector: FakeConnector, **kwargs) -> RobinhoodEquityBroker:
+    # Every test in this file except the market-hours-guard section below is
+    # about a DIFFERENT gate; pin the clock to a known weekday inside regular
+    # trading hours by default so those tests never flake depending on the
+    # real wall-clock time the suite happens to run at (e.g. a weekend).
+    kwargs.setdefault("clock", lambda: DURING_RTH)
     return RobinhoodEquityBroker(RobinhoodEquityClient(connector), **kwargs)
 
 
@@ -302,6 +319,133 @@ def test_the_kill_switch_is_re_read_at_the_moment_of_submission(monkeypatch, tmp
     with pytest.raises(RuntimeError, match="kill switch"):
         broker.place_limit_order(order())
 
+    assert connector.place_calls == []
+
+
+# --- the market-hours guard ----------------------------------------------------
+
+
+def test_a_broker_built_with_no_flags_defaults_extended_hours_off() -> None:
+    broker = make_broker(FakeConnector())
+
+    assert broker.allow_extended_hours is False
+
+
+def test_an_order_outside_regular_hours_is_refused_by_default() -> None:
+    connector = FakeConnector()
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, clock=lambda: OUTSIDE_RTH)
+
+    with pytest.raises(RuntimeError, match="outside regular trading hours"):
+        broker.place_limit_order(order())
+
+    assert connector.place_calls == []
+
+
+def test_an_order_inside_regular_hours_is_not_blocked_by_the_clock() -> None:
+    connector = FakeConnector()
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, clock=lambda: DURING_RTH)
+
+    result = broker.place_limit_order(order())
+
+    assert result["submitted"] is True
+    assert len(connector.place_calls) == 1
+
+
+def test_extended_hours_opt_out_defaults_off_so_the_same_clock_still_blocks() -> None:
+    connector = FakeConnector()
+    broker = make_broker(
+        connector,
+        dry_run=False,
+        confirm_live_order=True,
+        clock=lambda: OUTSIDE_RTH,
+        allow_extended_hours=False,
+    )
+
+    with pytest.raises(RuntimeError, match="outside regular trading hours"):
+        broker.place_limit_order(order())
+
+    assert connector.place_calls == []
+
+
+def test_explicit_extended_hours_opt_in_allows_the_same_clock_through() -> None:
+    connector = FakeConnector()
+    broker = make_broker(
+        connector,
+        dry_run=False,
+        confirm_live_order=True,
+        clock=lambda: OUTSIDE_RTH,
+        allow_extended_hours=True,
+    )
+
+    result = broker.place_limit_order(order())
+
+    assert result["submitted"] is True
+    assert len(connector.place_calls) == 1
+
+
+def test_a_market_holiday_is_refused_even_with_extended_hours_opted_in() -> None:
+    """Market-closed (holiday) must be handled cleanly -- refused with a
+    readable reason, not a crash -- and an extended-hours opt-in cannot open
+    a day the market itself never opens."""
+    connector = FakeConnector()
+    broker = make_broker(
+        connector,
+        dry_run=False,
+        confirm_live_order=True,
+        clock=lambda: A_MARKET_HOLIDAY,
+        allow_extended_hours=True,
+    )
+
+    with pytest.raises(RuntimeError, match="market closed"):
+        broker.place_limit_order(order())
+
+    assert connector.place_calls == []
+
+
+def test_market_hours_guard_refuses_before_the_kill_switch_check(monkeypatch, tmp_path: Path) -> None:
+    """Both the market-hours guard and the kill switch re-check happen at the
+    submission moment; prove the hours guard alone is enough to stop an
+    order (the kill switch is left open here)."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    connector = FakeConnector()
+    broker, _, _, logger, _ = build_lane(tmp_path, connector, dry_run=False, confirm_live_order=True)
+    broker._clock = lambda: OUTSIDE_RTH
+
+    with pytest.raises(RuntimeError, match="outside regular trading hours"):
+        broker.place_limit_order(order())
+
+    assert connector.place_calls == []
+    assert "outside regular trading hours" in logger.get_last_decision()["reason"]
+
+
+def test_a_dry_run_preview_is_never_blocked_by_the_market_clock() -> None:
+    """Previewing a payload is harmless at any hour -- only a real
+    submission is time-gated -- so a broker with no live confirmation must
+    still hand back a clean preview instead of raising, weekend or not."""
+    connector = FakeConnector()
+    broker = make_broker(connector, clock=lambda: OUTSIDE_RTH)
+
+    result = broker.place_limit_order(order())
+
+    assert result["submitted"] is False
+    assert result["status"] == "dry_run_order_preview"
+    assert connector.place_calls == []
+
+
+def test_the_shared_lane_blocks_a_live_signal_outside_regular_hours(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    connector = FakeConnector()
+    broker, order_manager, risk_manager, logger, _ = build_lane(
+        tmp_path, connector, dry_run=False, confirm_live_order=True
+    )
+    broker._clock = lambda: OUTSIDE_RTH
+
+    with pytest.raises(RuntimeError, match="outside regular trading hours"):
+        run_lane(broker, order_manager)
+
+    # The market-hours guard fires inside place_limit_order, reached only
+    # after the shared risk layer has already allowed the order through.
+    assert risk_manager.evaluations == 1
     assert connector.place_calls == []
 
 

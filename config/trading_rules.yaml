@@ -88,3 +88,8 @@ exits:
 kill_switch:
   stop_file: STOP_TRADING
   env_var: TRADING_ENABLED
+equities:
+  # Config-gated extended-hours opt-out (RobinhoodEquityBroker.allow_extended_hours).
+  # Defaults OFF: equity orders submit only inside regular trading hours (09:30-16:00 ET,
+  # Mon-Fri, non-holiday) until the operator explicitly flips this on.
+  allow_extended_hours: false

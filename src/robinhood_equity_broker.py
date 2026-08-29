@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Any
 
+from . import market_hours
 from .kill_switch import KillSwitch
 from .logger import SQLiteLogger
 from .order_manager import OrderManager
@@ -85,6 +87,11 @@ class RobinhoodEquityBroker:
     READ-ONLY is the default posture: dry_run defaults to True and
     confirm_live_order to False, so a broker built with no arguments cannot
     place an order. Flipping either is the operator's explicit call.
+
+    Equities are not 24/7: `allow_extended_hours` is the config-gated
+    opt-out for pre/post-market submission and defaults OFF, so a broker
+    built with no arguments only ever submits inside regular trading hours
+    (RTH) -- weekends and market holidays are refused regardless.
     """
 
     def __init__(
@@ -94,12 +101,16 @@ class RobinhoodEquityBroker:
         confirm_live_order: bool = False,
         kill_switch: KillSwitch | None = None,
         logger: SQLiteLogger | None = None,
+        allow_extended_hours: bool = False,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.client = client
         self.dry_run = dry_run
         self.confirm_live_order = confirm_live_order
         self.kill_switch = kill_switch
         self.logger = logger
+        self.allow_extended_hours = allow_extended_hours
+        self._clock = clock or (lambda: datetime.now(market_hours.EASTERN))
 
     @property
     def account_number(self) -> str:
@@ -180,6 +191,17 @@ class RobinhoodEquityBroker:
             self._log_refusal(symbol, side, reason)
             raise RuntimeError(reason)
 
+    def _assert_regular_hours(self, symbol: str | None, side: str | None) -> None:
+        """Refuse a real order outside RTH (or the extended-hours window,
+        when explicitly opted in). Weekends and holidays are handled inside
+        market_hours.blocked_reason without raising anything but this clean,
+        human-readable RuntimeError -- there is no crash path here, just a
+        refusal like every other gate in this broker."""
+        reason = market_hours.blocked_reason(self._clock(), allow_extended_hours=self.allow_extended_hours)
+        if reason:
+            self._log_refusal(symbol, side, reason)
+            raise RuntimeError(reason)
+
     @contextmanager
     def forced_preview(self) -> Iterator[None]:
         """Disarm the broker for the duration of a block, then restore it.
@@ -236,8 +258,10 @@ class RobinhoodEquityBroker:
                 "order_payload": order_payload,
             }
 
-        # Past this point the next call is irreversible: re-read the kill
-        # switch, then hand the client both flags explicitly.
+        # Past this point the next call is irreversible: re-read the market
+        # clock and the kill switch, then hand the client both flags
+        # explicitly.
+        self._assert_regular_hours(symbol, side)
         self._assert_kill_switch_open(symbol, side)
         result = self.client.place_order(
             symbol=symbol,
