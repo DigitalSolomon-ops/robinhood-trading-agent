@@ -349,6 +349,18 @@ class RobinhoodEquityBroker:
 
     # --- lane entry point ---------------------------------------------------
 
+    @staticmethod
+    def _skip_rationale(signal: TradeSignal) -> str:
+        """Human-readable reason no order was attempted, for a signal that
+        never reaches the risk/compliance gates below because it is not
+        actionable in the first place (a strategy hold). Read back the
+        signal's own reason so the audit log says WHY the strategy held,
+        not just that it did."""
+        return (
+            f"no order attempted for {signal.symbol}: strategy signal is "
+            f"'{signal.side}' ({signal.reason}); risk and compliance gates were not evaluated"
+        )
+
     def submit_signal(
         self,
         order_manager: OrderManager,
@@ -362,7 +374,13 @@ class RobinhoodEquityBroker:
     ) -> dict[str, Any] | None:
         """Gate the account, then hand the signal to the SHARED OrderManager.
 
-        The account check happens here, ahead of the risk layer, because an
+        A non-actionable signal (a strategy hold) is logged and returned here,
+        before the account/risk gates, since there is no order to gate -- this
+        is the "skip" half of every equities decision writing a readable
+        rationale; the "act" half is the existing OrderManager/RiskManager
+        below, unchanged.
+
+        The account check happens next, ahead of the risk layer, because an
         order aimed at the off-limits default account must be refused whatever
         the risk rules would have decided. Everything after it -- kill switch,
         caps, allowlist, cooldown, audit rationale -- is the existing
@@ -373,6 +391,16 @@ class RobinhoodEquityBroker:
         client already proved it by resolving the account list through it.
         """
         logger = self.logger or order_manager.logger
+
+        if signal.side not in {"buy", "sell"}:
+            logger.log_decision(
+                signal.symbol,
+                "equity_signal_skipped",
+                self._skip_rationale(signal),
+                {"venue": VENUE, "side": signal.side, "profile": signal.profile},
+            )
+            return None
+
         try:
             self.assert_agent_account(account_number)
         except AgentAccountMismatchError as exc:

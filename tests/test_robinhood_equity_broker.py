@@ -540,6 +540,38 @@ def test_confirmed_lane_run_submits_exactly_once(monkeypatch, tmp_path: Path) ->
     assert last["reason"] == "ema cross with rsi confirmation"
 
 
+# --- a readable rationale for every decision, act or skip --------------------
+
+
+def test_a_hold_signal_is_skipped_with_a_readable_rationale_and_never_gated(monkeypatch, tmp_path: Path) -> None:
+    """The strategy's own reason for holding must survive into the audit
+    log, and a hold must never reach the risk/compliance gates -- there is no
+    order to gate."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    connector = FakeConnector()
+    broker, order_manager, risk_manager, logger, _ = build_lane(
+        tmp_path, connector, dry_run=False, confirm_live_order=True
+    )
+    hold_signal = TradeSignal(TEST_SYMBOL, "hold", 0.0, "no_entry_conditions_met", None, None, "hold")
+
+    result = broker.submit_signal(
+        order_manager,
+        hold_signal,
+        limit_price=100.0,
+        mode="live",
+        portfolio=Portfolio(cash_usd=1000.0),
+        daily_summary={"realized_pnl": 0, "trade_count": 0},
+    )
+
+    assert result is None
+    assert risk_manager.evaluations == 0
+    assert connector.place_calls == []
+    last = logger.get_last_decision()
+    assert last["action"] == "equity_signal_skipped"
+    assert TEST_SYMBOL in last["reason"]
+    assert "no_entry_conditions_met" in last["reason"]
+
+
 # --- routing through the shared OrderManager ---------------------------------
 
 
