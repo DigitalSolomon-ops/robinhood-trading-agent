@@ -93,6 +93,13 @@ equities:
   # Defaults OFF: equity orders submit only inside regular trading hours (09:30-16:00 ET,
   # Mon-Fri, non-holiday) until the operator explicitly flips this on.
   allow_extended_hours: false
+  # The equities lane's OWN kill switch -- a separate stop file from the crypto
+  # lane's top-level kill_switch.stop_file (STOP_TRADING) above. Disarming crypto
+  # for this build must never silently disarm equities paper proving, and vice
+  # versa: re-arming crypto later must not require touching this file.
+  kill_switch:
+    stop_file: STOP_TRADING_EQUITIES
+    env_var: TRADING_ENABLED
   # Equities symbol universe -- deliberately separate from trading.allowed_symbols /
   # symbols.* above, which are the crypto lane's lists. Kept small and large-cap
   # liquid for first proving (src.equity_symbols.validate_equity_symbols confirms
