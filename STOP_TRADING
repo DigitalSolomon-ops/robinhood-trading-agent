@@ -1,0 +1,4 @@
+Disarmed 2026-08-28 by operator decision (Marcus) while the Robinhood stock lane
+is built through the ds-build-agent harness. The crypto lane was live-armed and
+idle; this kill file blocks all execution. Re-arming to live is Marcus's explicit
+call: delete this file AND confirm .env / trading_rules.yaml posture.
