@@ -10,7 +10,9 @@
 # It does NOT authorize option quotes, greeks, or IV -- so every price level
 # below is on the UNDERLYING, which the reader maps onto the listed contract.
 
-# Liquid, deeply-optionable names. Override freely.
+# Liquid, deeply-optionable names ranked down to the top_n best setups each day.
+# A larger pool means the daily top-10 is a real selection, not just the whole
+# list. Override freely (more names = more Massive calls = slower on the free tier).
 universe:
   - AAPL
   - MSFT
@@ -19,11 +21,21 @@ universe:
   - GOOGL
   - META
   - TSLA
+  - AMD
+  - NFLX
+  - AVGO
+  - JPM
+  - BAC
+  - DIS
+  - BA
+  - COIN
+  - PLTR
   - SPY
   - QQQ
+  - IWM
 
 # How many ranked plays to email.
-top_n: 5
+top_n: 10
 
 # Trading-day horizon the setup is judged over (target-reach window) and the
 # minimum days-to-expiry used when picking a contract.
