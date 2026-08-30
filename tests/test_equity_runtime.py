@@ -23,12 +23,12 @@ from src.logger import SQLiteLogger
 from src.paper_broker import PaperBroker
 
 AGENT_ACCOUNT = {
-    "account_number": "AGENT-ACCT-0001",
+    "account_number": "RH-EQ-AGENTIC-2092",
     "nickname": "Agentic",
-    "agent_tradable": True,
+    "agentic_allowed": True,
     "cash_available_for_trading": "10000.00",
 }
-DEFAULT_ACCOUNT = {"account_number": "DEFAULT-ACCT-0002", "nickname": "Default", "agent_tradable": False}
+DEFAULT_ACCOUNT = {"account_number": "RH-EQ-DEFAULT-2833", "nickname": "Default", "agentic_allowed": False}
 
 SYMBOL = "AAPL"
 
@@ -104,6 +104,7 @@ def write_config(root: Path, universe: list[str] | None = None) -> None:
         "equities": {
             "allow_extended_hours": False,
             "kill_switch": {"stop_file": "STOP_TRADING_EQUITIES", "env_var": "TRADING_ENABLED"},
+            "expected_account": {"nickname": "Agentic", "number_suffix": "2092"},
             "universe": universe if universe is not None else [SYMBOL],
         },
     }

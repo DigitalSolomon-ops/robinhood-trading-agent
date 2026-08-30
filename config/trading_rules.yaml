@@ -89,6 +89,20 @@ kill_switch:
   stop_file: STOP_TRADING
   env_var: TRADING_ENABLED
 equities:
+  # Out-of-band identity anchor for the single agent-tradable Robinhood account.
+  # The connector self-declares which account is agent-tradable via the
+  # `agentic_allowed` boolean, but a self-declared flag is necessary, not
+  # sufficient: RobinhoodEquityClient cross-checks the flag-selected account
+  # against THIS expected identity (nickname AND account-number suffix) and
+  # refuses to pin anything that does not match. Ground truth 2026-08-28:
+  # nickname "Agentic", number suffix 2092. The default ••2833 account is
+  # off-limits and must never be pinned or targeted.
+  expected_account:
+    nickname: Agentic
+    number_suffix: "2092"
+  # The default, human-only account the agent must never trade -- shown on the
+  # dashboard for awareness, never a trade target.
+  off_limits_account_suffix: "2833"
   # Config-gated extended-hours opt-out (RobinhoodEquityBroker.allow_extended_hours).
   # Defaults OFF: equity orders submit only inside regular trading hours (09:30-16:00 ET,
   # Mon-Fri, non-holiday) until the operator explicitly flips this on.

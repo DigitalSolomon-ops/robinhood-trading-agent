@@ -44,13 +44,13 @@ OUTSIDE_RTH = datetime(2026, 8, 31, 17, 0)
 A_MARKET_HOLIDAY = datetime.combine(sorted(market_hours.us_market_holidays(2026))[0], market_hours.REGULAR_OPEN)
 
 AGENT_ACCOUNT = {
-    "account_number": "AGENT-ACCT-0001",
+    "account_number": "RH-EQ-AGENTIC-2092",
     "nickname": "Agentic",
-    "agent_tradable": True,
+    "agentic_allowed": True,
     "cash_available_for_trading": "500.00",
     "buying_power": "1000.00",
 }
-DEFAULT_ACCOUNT = {"account_number": "DEFAULT-ACCT-0002", "nickname": "Default", "agent_tradable": False}
+DEFAULT_ACCOUNT = {"account_number": "RH-EQ-DEFAULT-2833", "nickname": "Default", "agentic_allowed": False}
 
 # A placeholder ticker: never a real one, so this file cannot suggest a symbol
 # the lane is not configured for.

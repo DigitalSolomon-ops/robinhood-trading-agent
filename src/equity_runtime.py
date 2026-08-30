@@ -86,7 +86,7 @@ def run_equity_cycle(connector: EquityConnector, root: Path, logger: SQLiteLogge
         logger.log_decision(None, "equity_halted", "; ".join(kill_reasons), {"venue": VENUE})
         return {"halted": True, "reasons": kill_reasons, "results": {}}
 
-    client = RobinhoodEquityClient(connector)
+    client = RobinhoodEquityClient(connector, config_root=root)
     paper_broker = PaperBroker(root / "data" / "equity_paper_trades.db")
     market_data = EquityMarketDataService(client, root / "data" / "equity_market_data.db")
     effective_rules = equity_effective_rules(rules)

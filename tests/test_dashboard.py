@@ -56,6 +56,17 @@ exits:
 kill_switch:
   stop_file: STOP_TRADING
   env_var: TRADING_ENABLED
+equities:
+  allow_extended_hours: false
+  kill_switch:
+    stop_file: STOP_TRADING_EQUITIES
+    env_var: TRADING_ENABLED
+  expected_account:
+    nickname: Agentic
+    number_suffix: "2092"
+  off_limits_account_suffix: "2833"
+  universe:
+    - AAPL
 """,
         encoding="utf-8",
     )
@@ -698,6 +709,52 @@ def test_equities_page_shows_paper_positions_and_rationale(tmp_path: Path) -> No
     assert "no order attempted for AAPL" in text
     # Only equities-tagged decisions belong on this page.
     assert "dashboard_settings_saved" not in text
+
+
+def test_equities_page_renders_the_actually_resolved_account(monkeypatch, tmp_path: Path) -> None:
+    """When a live client IS resolvable and it pinned the expected ••2092
+    Agentic account, the page renders THAT account (not a literal) and stays
+    SAFE."""
+    root = make_dashboard_root(tmp_path)
+
+    class FakeResolvedClient:
+        account_number = "RH-EQ-AGENTIC-2092"
+        nickname = "Agentic"
+
+    monkeypatch.setattr(dashboard, "resolve_equity_account", lambda _root: FakeResolvedClient())
+    client = TestClient(dashboard_app(root))
+
+    text = client.get("/equities").text
+
+    # The rendered account is the one the client actually pinned, and it matches
+    # the expected identity, so there is no DANGER banner (the top banner may be
+    # SAFE or a market-hours CAUTION depending on wall-clock, which is fine).
+    assert "••2092" in text
+    assert "DANGER" not in text
+    assert "resolved live from the connector" in text
+
+
+def test_equities_page_shows_danger_banner_for_a_mis_pinned_client(monkeypatch, tmp_path: Path) -> None:
+    """MUTATION TEST for the dashboard confinement view: a resolved client that
+    pinned the off-limits ••2833 account (or any non-Agentic identity) must
+    replace the SAFE row with a DANGER banner. If equities_html reverts to
+    rendering the hardcoded ••2092 literal and never compares, this fails."""
+    root = make_dashboard_root(tmp_path)
+
+    class MisPinnedClient:
+        account_number = "RH-EQ-DEFAULT-2833"
+        nickname = "Default"
+
+    monkeypatch.setattr(dashboard, "resolve_equity_account", lambda _root: MisPinnedClient())
+    client = TestClient(dashboard_app(root))
+
+    text = client.get("/equities").text
+
+    assert "DANGER" in text
+    assert "does NOT match" in text
+    assert "SAFE: EQUITIES PAPER MODE" not in text
+    # The off-limits account's suffix surfaces in the danger detail, not as a SAFE pin.
+    assert "2833" in text
 
 
 def test_equities_page_reflects_its_own_kill_switch(tmp_path: Path) -> None:

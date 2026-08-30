@@ -1287,6 +1287,21 @@ def audit_html(root: Path, result: dict[str, Any] | None = None) -> str:
     return body
 
 
+def resolve_equity_account(root: Path) -> Any:
+    """The resolved, pinned equities account -- or None.
+
+    The dashboard process holds no Robinhood connector (execution is
+    agent-hosted: the OAuth connector is bound to an agent session, not to this
+    web process), so in normal operation there is nothing live to resolve and
+    this returns None. The page then renders the config-declared EXPECTED
+    identity. A harness that DOES hold a connector can monkeypatch this to
+    return the live RobinhoodEquityClient, so the page shows the account that
+    was ACTUALLY pinned and raises a DANGER banner if it does not match the
+    expected ••2092 Agentic identity.
+    """
+    return None
+
+
 def equities_html(root: Path) -> str:
     rules, _ = load_dashboard_settings(root)
     equities_config = rules.get("equities", {})
@@ -1297,8 +1312,40 @@ def equities_html(root: Path) -> str:
     market_reason = market_blocked_reason(datetime.now(EASTERN), allow_extended_hours=allow_extended)
     crypto_stop_exists = KillSwitch(stop_file=str(root / rules.get("kill_switch", {}).get("stop_file", "STOP_TRADING"))).stop_file_exists()
 
+    # The out-of-band expected identity for the single agent-tradable account,
+    # read from config (never a literal baked into this view).
+    expected = equities_config.get("expected_account", {}) or {}
+    expected_nickname = str(expected.get("nickname", "Agentic"))
+    expected_suffix = str(expected.get("number_suffix", "2092"))
+    off_limits_suffix = str(equities_config.get("off_limits_account_suffix", "2833"))
+
+    # If a live client is resolvable, render the account it ACTUALLY pinned and
+    # compare it to the expected identity; otherwise render the expected identity.
+    resolved = resolve_equity_account(root)
+    account_mismatch = False
+    mismatch_detail = ""
+    if resolved is not None:
+        resolved_number = str(getattr(resolved, "account_number", "") or "")
+        resolved_nickname = getattr(resolved, "nickname", None) or "(unknown)"
+        account_mismatch = (resolved_nickname != expected_nickname) or (not resolved_number.endswith(expected_suffix))
+        designated_nickname = resolved_nickname
+        designated_number = ("••" + resolved_number[-4:]) if resolved_number else "(unknown)"
+        if account_mismatch:
+            mismatch_detail = (
+                f"resolved account {designated_number} (nickname {designated_nickname}) does NOT match the "
+                f"pinned Agentic ••{expected_suffix} identity"
+            )
+    else:
+        designated_nickname = expected_nickname
+        designated_number = "••" + expected_suffix
+
     if stop_exists:
         banner = '<p class="danger">BLOCKED: STOP_TRADING_EQUITIES Is Active - the equities lane will not place or simulate new orders</p>'
+    elif account_mismatch:
+        banner = (
+            f'<p class="danger">DANGER: {escape(mismatch_detail)} - the equities lane must not trade until this is '
+            'corrected; every order path is pinned to the wrong account</p>'
+        )
     elif market_reason:
         banner = f'<p class="warn">CAUTION: {escape(market_reason)} - equity orders would be refused right now</p>'
     else:
@@ -1316,10 +1363,17 @@ def equities_html(root: Path) -> str:
     }
     posture_table = "".join(f"<tr><th>{escape(k)}</th><td>{escape(v)}</td></tr>" for k, v in posture_rows.items())
 
+    resolution_label = (
+        "resolved live from the connector (agent session)"
+        if resolved is not None
+        else "expected identity from config (no live client in this dashboard process)"
+    )
     account_rows = {
-        "Designated account nickname": "Agentic",
-        "Designated account number": "••2092",
-        "Default account (off-limits to the agent)": "••2833 - never targeted by this lane",
+        "Designated account nickname": designated_nickname,
+        "Designated account number": designated_number,
+        "Account identity source": resolution_label,
+        "Matches expected Agentic ••" + expected_suffix + " identity": ("no - MISMATCH" if account_mismatch else "yes"),
+        "Default account (off-limits to the agent)": f"••{off_limits_suffix} - never targeted by this lane",
         "Options level": "none (long-only equities, no options)",
         "Margin": "none - cash account only",
         "Live account balance": "read live via the connector inside an agent session only; not available from this dashboard process",

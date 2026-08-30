@@ -5,8 +5,8 @@ from pathlib import Path
 from src.equity_market_data import EquityMarketDataService
 from src.robinhood_equity_client import RobinhoodEquityClient
 
-AGENT_ACCOUNT = {"account_number": "AGENT-ACCT-0001", "nickname": "Agentic", "agent_tradable": True}
-DEFAULT_ACCOUNT = {"account_number": "DEFAULT-ACCT-0002", "nickname": "Default", "agent_tradable": False}
+AGENT_ACCOUNT = {"account_number": "RH-EQ-AGENTIC-2092", "nickname": "Agentic", "agentic_allowed": True}
+DEFAULT_ACCOUNT = {"account_number": "RH-EQ-DEFAULT-2833", "nickname": "Default", "agentic_allowed": False}
 
 
 class FakeConnector:

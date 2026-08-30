@@ -5,7 +5,7 @@ import yaml
 from src.equity_symbols import equities_universe, validate_equity_symbols
 from src.robinhood_equity_client import RobinhoodEquityClient
 
-AGENT_ACCOUNT = {"account_number": "AGENT-ACCT-0001", "nickname": "Agentic", "agent_tradable": True}
+AGENT_ACCOUNT = {"account_number": "RH-EQ-AGENTIC-2092", "nickname": "Agentic", "agentic_allowed": True}
 
 ROOT = __import__("pathlib").Path(__file__).resolve().parents[1]
 
