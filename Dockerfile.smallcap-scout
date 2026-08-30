@@ -1,0 +1,24 @@
+# Lean container for the Small-Cap Scout daily email (Cloud Run Job).
+# ANALYSIS ONLY -- needs just httpx + PyYAML; no trading-lane / crypto deps.
+FROM python:3.11-slim
+
+WORKDIR /app
+RUN pip install --no-cache-dir "httpx==0.28.1" "PyYAML==6.0.3"
+
+# Only the analysis-only packages + the scout's config. Nothing from the
+# trading lanes is copied, so the image cannot place an order even in principle.
+# options_scout is included because smallcap_scout reuses its secret/address
+# helpers; it is itself analysis-only.
+COPY src/__init__.py ./src/__init__.py
+COPY src/market_data_fields.py ./src/market_data_fields.py
+COPY src/smallcap_scout/ ./src/smallcap_scout/
+COPY src/options_scout/ ./src/options_scout/
+COPY src/equity_intelligence/ ./src/equity_intelligence/
+COPY config/smallcap_scout.yaml ./config/smallcap_scout.yaml
+COPY config/options_scout.yaml ./config/options_scout.yaml
+
+# Secrets arrive as env (MASSIVE_API_KEY, GMAIL_APP_PASSWORD) injected by Cloud
+# Run from Secret Manager; never shell out to gcloud in-container.
+ENV DS_VAULT_NO_GCLOUD=1 PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "-m", "src.smallcap_scout"]

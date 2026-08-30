@@ -137,6 +137,25 @@ class OptionContract:
 
 
 @dataclass(frozen=True)
+class TickerDetails:
+    """One row from the ticker-details REFERENCE endpoint (v3/reference/tickers).
+
+    Reference metadata only. `shares_outstanding` is the issuer's total shares
+    outstanding for the share class -- it is a PROXY for float, NOT the true
+    free float (which nets out insider/locked stock the free tier does not
+    expose). The Small-Cap Scout labels it as shares-outstanding for exactly
+    that reason. Nothing here is a price or a quote.
+    """
+
+    ticker: str
+    name: str | None
+    shares_outstanding: float | None  # share_class, else weighted; a FLOAT PROXY
+    shares_basis: str | None  # which field the proxy came from
+    market_cap: float | None
+    primary_exchange: str | None = None
+
+
+@dataclass(frozen=True)
 class NewsInsight:
     """Per-ticker sentiment attached to a news item."""
 
@@ -351,6 +370,37 @@ class MassiveClient:
         path = f"/v2/aggs/grouped/locale/{locale}/market/{market}/{date_str}"
         payload = self._get(path, {"adjusted": str(adjusted).lower()})
         return [_bar_from_row(row) for row in payload.get("results", []) or [] if isinstance(row, dict)]
+
+    # --- ticker details REFERENCE (shares outstanding = FLOAT PROXY) ----------
+
+    def get_ticker_details(self, ticker: str) -> TickerDetails:
+        """Fetch reference details for one ticker (GET /v3/reference/tickers/{ticker}).
+
+        Returns shares outstanding (share_class_shares_outstanding, falling back
+        to weighted_shares_outstanding) as a FLOAT PROXY, plus market cap and the
+        primary exchange. Reference metadata only -- no price, quote, or greeks.
+        Cached and rate-limit-aware like every other read here.
+        """
+        payload = self._get(f"/v3/reference/tickers/{ticker}", {})
+        result = payload.get("results") or {}
+        if not isinstance(result, dict):
+            result = {}
+        shares = result.get("share_class_shares_outstanding")
+        basis = "share_class_shares_outstanding"
+        if shares is None:
+            shares = result.get("weighted_shares_outstanding")
+            basis = "weighted_shares_outstanding"
+        if shares is None:
+            basis = None
+        market_cap = result.get("market_cap")
+        return TickerDetails(
+            ticker=str(result.get("ticker", ticker)),
+            name=result.get("name"),
+            shares_outstanding=float(shares) if shares is not None else None,
+            shares_basis=basis,
+            market_cap=float(market_cap) if market_cap is not None else None,
+            primary_exchange=result.get("primary_exchange"),
+        )
 
     # --- news + sentiment (use C) ---------------------------------------------
 

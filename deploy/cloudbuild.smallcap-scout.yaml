@@ -1,0 +1,6 @@
+# Cloud Build config for the Small-Cap Scout image (non-default Dockerfile name).
+# Invoked by deploy/deploy-smallcap-scout.sh with --substitutions=_IMAGE=...
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "Dockerfile.smallcap-scout", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]

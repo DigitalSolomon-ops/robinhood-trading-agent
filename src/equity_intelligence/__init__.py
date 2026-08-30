@@ -26,6 +26,7 @@ from .massive_client import (
     NewsInsight,
     NewsItem,
     OptionContract,
+    TickerDetails,
     resolve_massive_api_key,
 )
 from .news_sentiment import (
@@ -59,6 +60,7 @@ __all__ = [
     "SentimentFilterResult",
     "SentimentHeadline",
     "SentimentSnapshot",
+    "TickerDetails",
     "build_liquidity_provider",
     "build_regime_provider",
     "build_sentiment_provider",
