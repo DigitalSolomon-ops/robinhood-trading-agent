@@ -1,8 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from statistics import fmean
 from typing import Any
+
+from .equity_intelligence.indicator_signals import (
+    SKIP,
+    IndicatorModulation,
+    IndicatorProvider,
+    IndicatorSnapshot,
+    evaluate_indicators,
+    indicator_config,
+    modulated_confidence,
+)
 
 
 @dataclass(frozen=True)
@@ -25,6 +35,17 @@ class TradeSignal:
     sell_conditions_met: tuple[str, ...] = ()
     conditions_failed: tuple[str, ...] = ()
     final_signal: str = "hold"
+    # --- EOD indicator modulation (equities lane) --------------------------
+    # `strategy_signal` stays the RULES verdict; `side`/`final_signal` are the
+    # verdict after the indicators had their say. These fields record what the
+    # indicators saw and what it was taken to mean, so a decision's rationale
+    # can cite the numbers rather than assert a conclusion.
+    indicator_source: str = ""
+    indicator_action: str = ""
+    indicator_notes: tuple[str, ...] = ()
+    indicator_values: tuple[tuple[str, float], ...] = ()
+    indicator_confidence_multiplier: float = 1.0
+    base_confidence: float = 0.0
 
 
 class StrategyEngine:
@@ -232,28 +253,131 @@ class StrategyEngine:
 
         return signal("hold", 0.0, "no_entry_conditions_met", "hold", buy_failed)
 
+    # --- EOD indicator modulation (equities lane only) ----------------------
+
+    @property
+    def indicator_config(self) -> dict[str, Any]:
+        """`equity_indicators:` from config/strategy.yaml over the defaults."""
+        return indicator_config(self.strategy_config)
+
+    @staticmethod
+    def _indicator_snapshot(
+        symbol: str,
+        indicators: IndicatorSnapshot | None,
+        provider: IndicatorProvider | None,
+    ) -> IndicatorSnapshot | None:
+        """An explicit snapshot wins; otherwise ask the provider. A provider
+        that raises degrades to an errored snapshot -- an indicator feed going
+        down must never take the lane down with it."""
+        if indicators is not None:
+            return indicators
+        if provider is None:
+            return None
+        try:
+            return provider.snapshot(symbol)
+        except Exception as exc:  # noqa: BLE001 -- degrade, never crash
+            return IndicatorSnapshot(symbol=symbol, error=f"{type(exc).__name__}: {exc}")
+
+    def apply_indicator_modulation(self, signal: TradeSignal, modulation: IndicatorModulation) -> TradeSignal:
+        """Fold an IndicatorModulation into a rules signal.
+
+        The one-directional guarantee lives here: this method may move an
+        actionable side to "hold" and may change `confidence`, and it does
+        NOTHING else. It never sets `side` to "buy" or "sell", so no indicator
+        reading can create an order the rules did not already ask for, and
+        every risk gate, the kill switch and the human confirm-flag still run
+        afterwards on whatever comes out.
+        """
+        snapshot = modulation.snapshot
+        recorded = {
+            "indicator_source": snapshot.source if snapshot is not None else "",
+            "indicator_action": modulation.action,
+            "indicator_notes": modulation.notes,
+            "indicator_values": snapshot.values() if snapshot is not None else (),
+            "indicator_confidence_multiplier": modulation.confidence_multiplier,
+            "base_confidence": signal.confidence,
+        }
+
+        # A non-actionable rules signal is recorded and returned untouched --
+        # there is nothing to modulate, and nothing here may create something.
+        if signal.side not in {"buy", "sell"}:
+            return replace(signal, **recorded)
+
+        # An EXIT is annotated with what the indicators saw and otherwise left
+        # entirely alone -- not skipped, not reweighted, whatever the
+        # modulation says. A data feed must never trap an open position.
+        if signal.side == "sell":
+            return replace(signal, reason=f"{signal.reason} | {modulation.rationale()}", **recorded)
+
+        # From here the signal is an ENTRY, the only thing indicators may act on.
+        if modulation.action == SKIP:
+            return replace(
+                signal,
+                side="hold",
+                final_signal="hold",
+                confidence=0.0,
+                stop_loss_percent=None,
+                take_profit_percent=None,
+                reason=(
+                    f"entry skipped by indicators: {modulation.rationale()} "
+                    f"| rules signal was '{signal.strategy_signal}' ({signal.reason})"
+                ),
+                **recorded,
+            )
+
+        confidence = modulated_confidence(signal.confidence, modulation, self.indicator_config)
+        return replace(
+            signal,
+            confidence=confidence,
+            reason=(
+                f"{signal.reason} | {modulation.rationale()} "
+                f"| confidence {signal.confidence:.2f} -> {confidence:.2f}"
+            ),
+            **recorded,
+        )
+
     def generate_equity_signal(
         self,
         symbol: str,
         prices: list[float],
         has_open_position: bool = False,
         allow_position_scaling: bool = False,
+        indicators: IndicatorSnapshot | None = None,
+        indicator_provider: IndicatorProvider | None = None,
     ) -> TradeSignal:
         """Equities entry point for the shared engine.
 
-        Same indicators and condition machinery as the crypto lane, under
-        the equities lane's own profile namespace (equity_strategy /
+        Same conditions and condition machinery as the crypto lane, under the
+        equities lane's own profile namespace (equity_strategy /
         equity_profiles in config/strategy.yaml). `prices` is expected to be
         session-bound history from the connector, not a 24/7 series -- the
         engine itself is time-agnostic (it only ever sees a plain price
         list), so the "not 24/7" constraint is the caller's job: feed it
         regular-hours bars only. Market-hours enforcement for the actual
         order lives in RobinhoodEquityBroker, not here.
+
+        `indicators` / `indicator_provider` add the Massive EOD readings
+        (SMA/EMA trend filter, RSI bands, MACD cross) as a MODULATION on top
+        of that rules verdict, with thresholds from `equity_indicators:` in
+        config/strategy.yaml. They can downweight or skip an entry and they
+        annotate the rationale with the values used; they can never create an
+        order, and every risk gate still runs downstream. With both omitted
+        the signal is exactly what it was before indicators existed.
         """
-        return self.generate_signal(
+        signal = self.generate_signal(
             symbol,
             prices,
             has_open_position=has_open_position,
             allow_position_scaling=allow_position_scaling,
             lane="equities",
         )
+        config = self.indicator_config
+        snapshot = self._indicator_snapshot(symbol, indicators, indicator_provider)
+        if snapshot is None and not (config.get("enabled") and config.get("require_indicators")):
+            # No indicator data and none demanded: the signal is exactly what
+            # it was before indicators existed.
+            return signal
+        # Reaching here with snapshot None means the config demands indicators
+        # and none arrived -- evaluate_indicators fails that CLOSED for entries.
+        modulation = evaluate_indicators(snapshot, signal.side, signal.confidence, config)
+        return self.apply_indicator_modulation(signal, modulation)

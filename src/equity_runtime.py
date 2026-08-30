@@ -22,6 +22,7 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from .equity_intelligence.indicator_signals import IndicatorProvider, build_indicator_provider
 from .equity_market_data import EquityMarketDataService
 from .equity_symbols import equities_universe
 from .kill_switch import KillSwitch
@@ -73,10 +74,21 @@ def equity_effective_rules(rules: dict[str, Any]) -> dict[str, Any]:
     return effective
 
 
-def run_equity_cycle(connector: EquityConnector, root: Path, logger: SQLiteLogger | None = None) -> dict[str, Any]:
+def run_equity_cycle(
+    connector: EquityConnector,
+    root: Path,
+    logger: SQLiteLogger | None = None,
+    indicator_provider: IndicatorProvider | None = None,
+) -> dict[str, Any]:
     """One regular-hours-agnostic paper pass over the equities universe:
     read quotes, generate a signal per symbol, and either simulate a paper
     fill or log a readable skip rationale. Always paper -- mode is hardcoded.
+
+    `indicator_provider` supplies the Massive EOD readings the strategy
+    modulates its signal with; when omitted, one is built from
+    `equity_indicators:` in config/strategy.yaml (and is None unless that
+    section is enabled). It is a READ-ONLY data source: it can only make an
+    entry weaker or absent, and every risk gate still runs after it.
     """
     rules, strategy_config = load_equity_settings(root)
     logger = logger or SQLiteLogger(root / "data" / "trading_agent.db")
@@ -96,6 +108,8 @@ def run_equity_cycle(connector: EquityConnector, root: Path, logger: SQLiteLogge
     order_manager = OrderManager(effective_rules, risk, logger, paper_broker, equity_broker)
     portfolio = paper_broker.get_portfolio()
     symbols = effective_rules["trading"]["allowed_symbols"]
+    if indicator_provider is None:
+        indicator_provider = build_indicator_provider(strategy_config)
 
     try:
         prices = market_data.get_latest_prices(symbols, logger=logger)
@@ -139,7 +153,30 @@ def run_equity_cycle(connector: EquityConnector, root: Path, logger: SQLiteLogge
             continue
         history = market_data.recent_history(symbol)
         has_open_position = portfolio.quantity_for(symbol) > 0
-        signal = strategy.generate_equity_signal(symbol, history, has_open_position=has_open_position)
+        signal = strategy.generate_equity_signal(
+            symbol,
+            history,
+            has_open_position=has_open_position,
+            indicator_provider=indicator_provider,
+        )
+        if signal.indicator_action:
+            # The structured half of the rationale: the values themselves,
+            # alongside the human-readable clause already inside signal.reason.
+            cited = ", ".join(f"{name}={value:.2f}" for name, value in signal.indicator_values) or "no values read"
+            logger.log_decision(
+                symbol,
+                "equity_indicator_context",
+                f"{cited} -> {'; '.join(signal.indicator_notes) or 'no interpretation applied'}",
+                {
+                    "venue": VENUE,
+                    "source": signal.indicator_source,
+                    "action": signal.indicator_action,
+                    "values": {name: value for name, value in signal.indicator_values},
+                    "confidence_multiplier": signal.indicator_confidence_multiplier,
+                    "rules_signal": signal.strategy_signal,
+                    "final_signal": signal.final_signal,
+                },
+            )
         result = equity_broker.submit_signal(
             order_manager,
             signal,
@@ -161,6 +198,7 @@ def run_equity_paper_loop(
     hours: float | None = None,
     poll_interval_seconds: int = 60,
     sleep=time.sleep,
+    indicator_provider: IndicatorProvider | None = None,
 ) -> dict[str, Any]:
     """A BOUNDED, unattended paper loop -- iterations and/or hours cap it so
     it always terminates on its own rather than needing a human Ctrl+C, and
@@ -182,7 +220,7 @@ def run_equity_paper_loop(
             logger.log_decision(None, "equity_halted", f"{kill.stop_file} exists", {"venue": VENUE})
             halted = True
             break
-        run_equity_cycle(connector, root, logger)
+        run_equity_cycle(connector, root, logger, indicator_provider=indicator_provider)
         completed += 1
         if iterations is not None and completed >= iterations:
             break

@@ -92,9 +92,11 @@ KNOWN_TICKERS = frozenset(
 )
 
 # Tier 2 stop-words: all-caps short tokens this codebase genuinely contains --
-# SQL, HTTP verbs, order protocol, shouted prose. Some collide with real
-# tickers (A, ALL, KEY, ON, SET); those are reachable through tier 1, which is
-# fed by config, so a symbol this lane may actually trade is never excused here.
+# SQL, HTTP verbs, order protocol, shouted prose, and the technical-indicator
+# names the equities strategy labels its rationale with (SMA/EMA/RSI/MACD).
+# Some collide with real tickers (A, ALL, KEY, ON, SET, and RSI -- Rush Street
+# Interactive); those are reachable through tier 1, which is fed by config, so
+# a symbol this lane may actually trade is never excused here.
 NON_TICKER_WORDS = frozenset(
     """
     A AN AND ANY ARE AS ASC AT BE BUY BY CAN DAY DESC DO DONE ELSE END ERROR
@@ -104,6 +106,7 @@ NON_TICKER_WORDS = frozenset(
     USD UTC VALUE WHERE WILL WITH YES ALL API CLI IAP ROOT ID GMT DELETE
     TRACE HTTP HTTPS USER PASS NAME TYPE SIDE QTY OPTS ARGS SELF NONE INIT
     MAIN TEST DEBUG INFO WARN
+    SMA EMA RSI MACD HIST
     SELECT INSERT UPDATE VALUES CREATE EXISTS TABLE INDEX
     PASSED FAILED ABSENT CRYPTO A-Z
     """.split()
@@ -668,6 +671,20 @@ def test_config_listed_equity_symbols_extend_the_vocabulary(tmp_path: Path) -> N
     assert "ZZZQ" in config_equity_symbols(config)
     assert "BTC-USD" not in config_equity_symbols(config)
     assert scan_tree(tree, config_path=config).symbols() == {"ZZZQ"}
+
+
+def test_an_indicator_name_stop_word_is_still_caught_when_config_lists_it(tmp_path: Path) -> None:
+    """RSI is excused as a tier-2 shape match because the equities strategy
+    labels its rationale with SMA/EMA/RSI/MACD -- but RSI is also a real
+    ticker (Rush Street Interactive). The moment config says this lane may
+    trade it, tier 1 catches the literal anyway. Deleting the tier-1 check
+    ahead of the stop-word check is what this pins."""
+    config = tmp_path / "trading_rules.yaml"
+    config.write_text("equities:\n  universe:\n  - RSI\n", encoding="utf-8")
+    tree = write_tree(tmp_path / "src", {"lane.py": 'def go(c):\n    return c.place_equity_order(symbol="RSI")\n'})
+
+    assert "RSI" in NON_TICKER_WORDS
+    assert scan_tree(tree, config_path=config).symbols() == {"RSI"}
 
 
 # --- precision tests --------------------------------------------------------

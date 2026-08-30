@@ -75,3 +75,42 @@ equity_profiles:
     - momentum_5_negative
     - stop_loss_hit
     - take_profit_hit
+# Massive (EOD) technical indicators as SIGNAL INPUTS for the equities lane.
+# These MODULATE the rules-based signal above -- they downweight or skip an
+# ENTRY and write what they saw into the decision rationale. They never place
+# an order, never bypass a risk gate / the kill switch / the confirm-flag, and
+# never block an EXIT (an indicator feed must not trap an open position).
+# Daily/EOD data: signal generation only, never execution timing or pricing --
+# the Robinhood connector stays the sole source of execution-time price.
+equity_indicators:
+  enabled: true
+  # Fail-closed opt-in: when true, a buy whose indicator data could not be read
+  # is skipped rather than passed through on the rules alone. Off by default so
+  # a Massive outage degrades to today's rules-only behaviour.
+  require_indicators: false
+  max_confidence: 0.95
+  # A modulated confidence below this floor downgrades the entry to a hold.
+  min_confidence_to_act: 0.35
+  trend:
+    series: sma            # sma | ema
+    fast_window: 50
+    slow_window: 200
+    on_downtrend: skip     # skip | downweight -- SMA50 under SMA200 is no entry
+    downtrend_confidence_multiplier: 0.5
+    uptrend_confidence_multiplier: 1.1
+  rsi:
+    window: 14
+    oversold: 30
+    overbought: 70
+    strongly_overbought: 80
+    on_overbought: downweight
+    on_strongly_overbought: skip
+    overbought_confidence_multiplier: 0.5
+    oversold_confidence_multiplier: 1.15
+  macd:
+    short_window: 12
+    long_window: 26
+    signal_window: 9
+    on_bearish_cross: downweight
+    bearish_confidence_multiplier: 0.6
+    bullish_confidence_multiplier: 1.1
