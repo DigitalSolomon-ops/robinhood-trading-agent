@@ -2064,6 +2064,14 @@ def build_parser() -> argparse.ArgumentParser:
     equity_readiness_parser = sub.add_parser("equity-live-readiness")
     equity_readiness_parser.add_argument("--format", choices=["json", "markdown"], default="json")
     equity_readiness_parser.add_argument("--output", default=None, help="write the report to this path instead of stdout")
+    proving_parser = sub.add_parser(
+        "run-equity-proving-run",
+        help="A bounded, unattended equities paper proving run priced on REAL Massive history.",
+    )
+    proving_parser.add_argument("--iterations", type=int, default=60, help="bounded cycle count (default 60)")
+    proving_parser.add_argument("--hours", type=float, default=None, help="alternative time bound")
+    proving_parser.add_argument("--lookback-days", type=int, default=None, help="Massive history depth per symbol")
+    proving_parser.add_argument("--cash", default="10000.00", help="paper starting cash")
     sub.add_parser("validate-symbols")
     sub.add_parser("collect-intelligence")
     sub.add_parser("intelligence-status")
@@ -2155,6 +2163,19 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(live_launch_readiness(args.run_tests, args.check_connection), indent=2))
     elif args.command == "equity-live-readiness":
         equity_live_readiness_command(args.format, args.output)
+    elif args.command == "run-equity-proving-run":
+        from src.equity_runtime import run_equity_proving_run, build_paper_proving_connector
+
+        connector = build_paper_proving_connector(ROOT, cash=args.cash)
+        kwargs: dict[str, Any] = {}
+        if args.iterations is not None:
+            kwargs["iterations"] = args.iterations
+        if args.hours is not None:
+            kwargs["hours"] = args.hours
+        if args.lookback_days is not None:
+            kwargs["lookback_days"] = args.lookback_days
+        summary = run_equity_proving_run(connector, ROOT, **kwargs)
+        print(json.dumps(summary, indent=2, default=str))
     elif args.command == "validate-symbols":
         validate_symbols()
     elif args.command == "collect-intelligence":

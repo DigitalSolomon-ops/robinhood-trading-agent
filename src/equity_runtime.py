@@ -596,6 +596,53 @@ def build_massive_quote_source(
     return MassiveHistoryFeed(client or MassiveClient(), universe, lookback_days=lookback_days)
 
 
+class PaperProvingConnector:
+    """Headless connector for a PAPER proving run.
+
+    It exposes ONLY the agent-tradable account identity (read from
+    config/trading_rules.yaml's equities.expected_account) so the client can
+    resolve and identity-check the account pin, holds no real credential, and
+    REFUSES every order path. A proving run prices on real Massive history and
+    never places, reviews, or cancels a real order -- the connector is held for
+    shape, not to trade. (The live Robinhood MCP connector is session-bound and
+    unavailable to a headless run; this stands in for it in paper mode only.)
+    """
+
+    def __init__(self, expected: dict[str, str], cash: str = "10000.00") -> None:
+        self._account = {
+            "account_number": f"PAPER-AGENTIC-{expected['number_suffix']}",
+            "nickname": expected["nickname"],
+            "agentic_allowed": True,
+            "cash_available_for_trading": cash,
+        }
+
+    def get_accounts(self) -> Any:
+        return {"accounts": [self._account]}
+
+    def get_equity_positions(self, account_number: str | None = None) -> Any:
+        return {"positions": []}
+
+    def get_equity_quotes(self, symbols: list[str]) -> Any:
+        # Pricing comes from the Massive history feed, never this connector.
+        return {"quotes": []}
+
+    def review_equity_order(self, **kwargs: Any) -> Any:
+        raise RuntimeError("PaperProvingConnector: a paper proving run reviews no real order")
+
+    def place_equity_order(self, **kwargs: Any) -> Any:
+        raise RuntimeError("PaperProvingConnector: a paper proving run places no real order")
+
+    def cancel_equity_order(self, order_id: str, account_number: str | None = None) -> Any:
+        raise RuntimeError("PaperProvingConnector: a paper proving run cancels no real order")
+
+
+def build_paper_proving_connector(root: Path, cash: str = "10000.00") -> PaperProvingConnector:
+    """Build the headless paper-proving connector from the configured agent-account identity."""
+    from src.robinhood_equity_client import _load_expected_account
+
+    return PaperProvingConnector(_load_expected_account(root), cash=cash)
+
+
 def run_equity_proving_run(
     connector: EquityConnector,
     root: Path,
