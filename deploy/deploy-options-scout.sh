@@ -37,9 +37,16 @@ gcloud builds submit --project="$PROJECT" \
   --substitutions=_IMAGE="$IMAGE" .
 
 echo "==> Runtime service account + secret access"
-gcloud iam service-accounts describe "$SA" --project="$PROJECT" >/dev/null 2>&1 \
-  || gcloud iam service-accounts create "$SA_NAME" --project="$PROJECT" \
-       --display-name="Options Scout daily job"
+if ! gcloud iam service-accounts describe "$SA" --project="$PROJECT" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "$SA_NAME" --project="$PROJECT" \
+    --display-name="Options Scout daily job"
+  # A brand-new SA is not immediately usable in IAM bindings (eventual
+  # consistency); wait until it resolves before binding secrets to it.
+  for _ in $(seq 1 12); do
+    gcloud iam service-accounts describe "$SA" --project="$PROJECT" >/dev/null 2>&1 && break
+    sleep 5
+  done
+fi
 for S in massive-api gmail-app-password; do
   gcloud secrets add-iam-policy-binding "$S" --project="$PROJECT" \
     --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor" >/dev/null
