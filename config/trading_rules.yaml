@@ -124,3 +124,95 @@ equities:
   - AMZN
   - GOOGL
   - NVDA
+  # Market-regime BRAKE (src/equity_intelligence/market_regime.py). One reading
+  # per cycle from Massive grouped-daily breadth -- what share of the market
+  # advanced in the last completed session -- turned into a position-size
+  # multiplier, or into a refusal to open anything new at all. It may ONLY
+  # reduce or block: a multiplier above 1.0 is clamped, an EXIT is never scaled
+  # or blocked, and the scaled size is still measured against
+  # risk.max_trade_amount_usd by RiskManager afterwards. It is not a risk gate
+  # and stands in for none of them.
+  market_regime:
+    enabled: true
+    # Fail-closed opt-in: when true, a cycle whose breadth could not be read
+    # opens nothing new. Off by default so a Massive outage degrades to sizing
+    # at the ordinary configured cap rather than halting the lane.
+    require_breadth: false
+    # Calendar days to walk back looking for the most recent COMPLETED session
+    # (covers a long weekend plus a market holiday).
+    lookback_days: 6
+    # Below this many counted names the response is not a market-wide reading.
+    min_symbols: 500
+    # Sub-dollar names are excluded; their moves swamp an advance/decline ratio.
+    min_close_price: 1.0
+    # Share of (advancers + decliners) that advanced.
+    risk_on_advance_ratio: 0.55
+    risk_off_advance_ratio: 0.4
+    # block_entries | scale_down. Spelled with an underscore, not a bare word:
+    # a short all-alpha value under `equities:` here is indistinguishable from a
+    # ticker to tests/test_order_symbol_guard.py's config vocabulary scan.
+    on_risk_off: block_entries
+    risk_on_size_multiplier: 1.0
+    neutral_size_multiplier: 0.75
+    # Only consulted when on_risk_off is scale_down.
+    risk_off_size_multiplier: 0.4
+    # A regime-scaled entry below this is refused with a rationale, not sent as dust.
+    min_size_usd: 5.0
+  # Liquidity / still-trading screen (src/equity_intelligence/liquidity.py) --
+  # the second half of the tradability gate in src/equity_symbols.py, which
+  # run_equity_cycle now runs every cycle. The connector-quote half refuses a
+  # halted/delisted/unquoted name; this half refuses one whose recent Massive
+  # daily bars are stale, thin or absent. It may ONLY remove a symbol from
+  # evaluation, never add one, and every risk gate still runs on what survives.
+  liquidity:
+    enabled: true
+    # Fail-closed opt-in: when true, a symbol whose bars could not be read is
+    # skipped rather than passed through on the connector quote alone.
+    require_liquidity: false
+    lookback_days: 45
+    # Fewer sessions than this inside the window is not "actively trading".
+    min_bars: 10
+    # A latest bar older than this is how a halted/suspended/delisted name shows
+    # up in end-of-day data.
+    max_stale_days: 5
+    min_close_price: 3.0
+    min_average_volume: 300000
+    min_average_dollar_volume: 5000000
+  # Pre-trade news-sentiment RISK FILTER (src/equity_intelligence/news_sentiment.py).
+  # It reads recent Massive ticker news + per-ticker sentiment and may SKIP or
+  # DOWNWEIGHT an ENTRY when recent sentiment is strongly negative. It lives here
+  # rather than in strategy.yaml because it is a risk cap, not a signal input.
+  # It may ONLY block or reduce: it never initiates a trade, never raises a
+  # confidence (a multiplier above 1.0 is clamped), never blocks an EXIT, and
+  # never stands in for a risk gate -- RiskManager, the kill switch and the human
+  # confirm-flag all still run after it, unchanged.
+  news_sentiment:
+    enabled: true
+    # Fail-closed opt-in: when true, a buy whose news could not be read (or that
+    # has too little rated coverage) is skipped rather than passed through on the
+    # rules alone. Off by default so a Massive outage degrades to rules-only.
+    require_news: false
+    # The recency window. Anything older is not "recent sentiment" and is ignored.
+    recency_hours: 48
+    max_articles: 20
+    # Below this many RATED articles in the window there is not enough coverage
+    # to act on; the filter says so in the rationale and stands down.
+    min_rated_articles: 2
+    # Which vendor labels count as which. Massive/Polygon emits
+    # positive|neutral|negative today; a relabelling is a config change, not code.
+    negative_labels:
+    - negative
+    positive_labels:
+    - positive
+    # Share of rated in-window articles that are negative.
+    strongly_negative_ratio: 0.6
+    negative_ratio: 0.34
+    # skip_entry | downweight. Spelled skip_entry, not skip: a 4-letter
+    # lowercase value under `equities:` here is indistinguishable from a ticker
+    # to tests/test_order_symbol_guard.py's config vocabulary scan.
+    on_strongly_negative: skip_entry
+    on_negative: downweight
+    strongly_negative_confidence_multiplier: 0.4
+    negative_confidence_multiplier: 0.6
+    # A filtered confidence below this floor downgrades the entry to a hold.
+    min_confidence_to_act: 0.35

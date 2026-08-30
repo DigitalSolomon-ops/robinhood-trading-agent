@@ -27,16 +27,29 @@ HOW A MODULE GETS INTO SCOPE (discovery is by CONTENT, not by filename)
        is not hinted (its path token is "robinhood", not "rh") and does not
        touch the equity order tools, so the crypto lane stays out of scope.
 
-HOW A SYMBOL IS DETECTED (case-insensitive both tiers)
+HOW A SYMBOL IS DETECTED
     Tier 1 -- vocabulary. A curated US equity/ETF ticker list, PLUS every symbol
         the repo's own config lists under an equities/stock key. Tier 1 is the
         authoritative tier: whatever this lane is configured to trade can never
         be hardcoded, and it matches 'aapl' exactly as it matches 'AAPL'.
-    Tier 2 -- shape. An all-caps 1-5 letter literal that is not a documented
+    Tier 2 -- shape. An all-caps ticker-shaped literal that is not a documented
         stop-word (SQL, HTTP, order-protocol and prose tokens this repo really
         contains). Catches a ticker outside the vocabulary. Its stop-word list
         is the reason tier 1 exists: tickers that collide with English ('A',
         'KEY', 'ALL') are only reachable through tier 1's config-fed vocabulary.
+    Tier 3 -- POSITION. A ticker-shaped literal, matched case-INSENSITIVELY and
+        with no stop-word excuse, sitting in a `symbol=` slot at an order
+        call-site. Tier 2 has to stay upper-case-only because a bare lowercase
+        token cannot be told from English prose by shape alone -- but a literal
+        in a symbol argument to place/review/cancel_equity_order is not prose,
+        the position itself says it is a ticker. Without this tier a lowercase
+        OFF-vocabulary ticker (`place_equity_order(symbol="gevity")`) evaded
+        tier 1 (not in the list) and tier 2 (not upper-case) and reached the
+        broker, which up-cased it into a well-formed live order.
+        The runtime half of the same property is the broker's own
+        `assert_in_universe` (src/robinhood_equity_broker.py): this tier stops
+        an unapproved ticker being written into src/ at all, and that check
+        stops one that got there anyway from reaching Robinhood.
 
 WHAT IT DELIBERATELY DOES NOT DO
     No static "no order without a confirm flag" polarity analysis. That is not
@@ -107,7 +120,7 @@ NON_TICKER_WORDS = frozenset(
     TRACE HTTP HTTPS USER PASS NAME TYPE SIDE QTY OPTS ARGS SELF NONE INIT
     MAIN TEST DEBUG INFO WARN
     SMA EMA RSI MACD HIST
-    SELECT INSERT UPDATE VALUES CREATE EXISTS TABLE INDEX
+    SELECT INSERT UPDATE VALUES CREATE EXISTS TABLE INDEX GROUP COUNT HAVING
     PASSED FAILED ABSENT CRYPTO A-Z
     """.split()
 )
@@ -118,9 +131,11 @@ NON_TICKER_WORDS = frozenset(
 # class-share dot ('BRK.B') purely on length and punctuation. The shape tier
 # stays anchored to UPPER-case, though -- a bare, context-free lowercase token
 # ('rblx' but also 'must', 'both', 'agent') cannot be told apart from English
-# prose by shape alone, so lowercase tickers are caught by the case-insensitive
-# tier-1 vocabulary below (where 'rblx' now lives), never by a shape guess that
-# would flag every short word in the tree.
+# prose by shape alone. Lowercase tickers are reached two other ways instead:
+# the case-insensitive tier-1 vocabulary below (where 'rblx' now lives), and
+# tier 3, which applies the case-insensitive _CONFIG_TICKER_SHAPE to a literal
+# in a `symbol=` position at an order call-site -- where CONTEXT, not shape,
+# establishes that the token is a ticker.
 _TICKER_SHAPE = re.compile(r"^[A-Z][A-Z.\-]{0,5}$")
 _CONFIG_TICKER_SHAPE = re.compile(r"^[A-Za-z][A-Za-z.\-]{0,5}$")
 
@@ -349,12 +364,19 @@ def _tainted_assignments(tree: ast.Module, tainted: set[str]) -> set[str]:
     return found
 
 
-def discover_execution_modules(root: Path) -> tuple[dict[str, ast.Module], set[str], set[str]]:
-    """Return (parsed modules, in-scope module paths, direct order-tool modules).
+def discover_execution_modules(
+    root: Path,
+) -> tuple[dict[str, ast.Module], set[str], set[str], frozenset[str]]:
+    """Return (parsed modules, in-scope paths, direct order-tool modules, tainted names).
 
     Scope = direct order-tool references
           UNION modules reached by constant propagation (to a fixpoint)
           UNION filename hints.
+
+    The tainted-name set is returned as well as used: tier 3 below needs it to
+    recognise a dispatch call-site (`connector._call(_ORDER_TOOL, {...})`) as
+    an order call-site, and recomputing the fixpoint there would only risk the
+    two answers drifting apart.
     """
     parsed: dict[str, ast.Module] = {}
     unparsable: set[str] = set()
@@ -389,7 +411,7 @@ def discover_execution_modules(root: Path) -> tuple[dict[str, ast.Module], set[s
     in_scope |= {relative for relative, tree in parsed.items() if invokes_generic_wrapper(tree)}
     in_scope &= set(parsed)
 
-    return parsed, in_scope, direct | (unparsable & direct)
+    return parsed, in_scope, direct | (unparsable & direct), frozenset(tainted)
 
 
 # --- symbol detection -------------------------------------------------------
@@ -405,38 +427,125 @@ def _docstring_ids(tree: ast.Module) -> set[int]:
     return ids
 
 
+# Tier 3. Argument names that hold a ticker, and the order tools whose
+# call-sites make that position meaningful.
+_SYMBOL_ARGUMENT_NAMES = frozenset({"symbol", "symbols", "ticker", "tickers"})
+_ORDER_TOOL_NAMES = frozenset(tool.lower() for tool in ORDER_TOOLS)
+
+
+def _callee_name(call: ast.Call) -> str:
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    return ""
+
+
+def _is_order_call(call: ast.Call, tainted: frozenset[str]) -> bool:
+    """True if this call reaches the connector's order path.
+
+    Three routes, mirroring the three ways a module gets into scope: the callee
+    IS an order tool (`connector.place_equity_order(...)`); the callee is a
+    generic dispatch wrapper (`connector._call(...)`); or an argument carries an
+    order-tool name, either as a literal / folded `+` concatenation or as a
+    constant tainted elsewhere in the tree (`connector.route(ORDER, {...})`).
+    """
+    name = _callee_name(call).lower()
+    if name in _ORDER_TOOL_NAMES or name in _WRAPPER_METHODS:
+        return True
+    for argument in [*call.args, *(keyword.value for keyword in call.keywords)]:
+        if any(literal.strip().lower() in _ORDER_TOOL_NAMES for literal in _string_constants(argument)):
+            return True
+        if _referenced_names(argument) & tainted:
+            return True
+    return False
+
+
+def _symbol_position_constants(call: ast.Call) -> list[ast.Constant]:
+    """String constants sitting in a SYMBOL position of one call.
+
+    Both spellings the connector's payloads actually take: a keyword argument
+    (`symbol="gevity"`) and a payload-dict entry (`{"symbol": "gevity"}`) at any
+    depth of an argument. A list or tuple in either position is unpacked, so
+    `symbols=["gevity"]` is seen too.
+    """
+    found: list[ast.Constant] = []
+
+    def collect(value: ast.AST) -> None:
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            found.append(value)
+        elif isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+            for element in value.elts:
+                collect(element)
+
+    arguments = [*call.args, *(keyword.value for keyword in call.keywords)]
+    for keyword in call.keywords:
+        if keyword.arg and keyword.arg.strip().lower() in _SYMBOL_ARGUMENT_NAMES:
+            collect(keyword.value)
+    for argument in arguments:
+        for node in ast.walk(argument):
+            if not isinstance(node, ast.Dict):
+                continue
+            for key, value in zip(node.keys, node.values):
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    if key.value.strip().lower() in _SYMBOL_ARGUMENT_NAMES:
+                        collect(value)
+    return found
+
+
+def order_call_symbol_constants(tree: ast.AST, tainted: frozenset[str] = frozenset()) -> set[int]:
+    """ids of every string constant in a symbol position at an order call-site."""
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and _is_order_call(node, tainted):
+            ids.update(id(constant) for constant in _symbol_position_constants(node))
+    return ids
+
+
 def hardcoded_symbols(
     module: str,
     tree: ast.Module,
     vocabulary: frozenset[str],
+    tainted: frozenset[str] = frozenset(),
 ) -> list[Violation]:
     """Ticker literals inside a module, case-insensitively.
 
     Docstrings are skipped -- a docstring cannot place an order -- but every
     other string constant is examined, including dict keys, list items, default
     arguments and the literal parts of f-strings.
+
+    Exactly one tier claims each token, most authoritative first, so a literal
+    is never reported twice: config/curated vocabulary, then the order call-site
+    POSITION (case-insensitive, no stop-word excuse), then bare upper-case shape.
     """
     skip = _docstring_ids(tree)
+    at_order_call_site = order_call_symbol_constants(tree, tainted)
     violations: list[Violation] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
             continue
         if id(node) in skip:
             continue
+        in_symbol_position = id(node) in at_order_call_site
         for part in re.split(r"[,\s;|]+", node.value.strip()):
             token = part.strip("\"'`()[]{}").rstrip(".")
             if not token:
                 continue
             if _CONFIG_TICKER_SHAPE.match(token) and _vocab_key(token) in vocabulary:
-                violations.append(Violation(module, token, node.lineno, "known ticker"))
+                tier = "known ticker"
+            elif in_symbol_position and _CONFIG_TICKER_SHAPE.match(token):
+                tier = "order call-site symbol"
             elif _TICKER_SHAPE.match(token) and token.upper() not in NON_TICKER_WORDS:
-                violations.append(Violation(module, token, node.lineno, "ticker-shaped literal"))
+                tier = "ticker-shaped literal"
+            else:
+                continue
+            violations.append(Violation(module, token, node.lineno, tier))
     return violations
 
 
 def scan_tree(root: Path, config_path: Path = TRADING_RULES) -> ScanReport:
     """Scan a source tree for hardcoded order symbols in execution modules."""
-    parsed, in_scope, _ = discover_execution_modules(root)
+    parsed, in_scope, _, tainted = discover_execution_modules(root)
     unparsable = [
         _rel(path, root)
         for path in python_modules(root)
@@ -450,7 +559,7 @@ def scan_tree(root: Path, config_path: Path = TRADING_RULES) -> ScanReport:
     vocabulary = ticker_vocabulary(config_path)
     violations: list[Violation] = []
     for relative in sorted(in_scope):
-        violations.extend(hardcoded_symbols(relative, parsed[relative], vocabulary))
+        violations.extend(hardcoded_symbols(relative, parsed[relative], vocabulary, tainted))
     return ScanReport(
         order_tool_modules=direct,
         scanned=set(in_scope),
@@ -549,6 +658,41 @@ def submit(connector):
 GENERIC_WRAPPER_INVOCATION = '''
 def submit(connector, tool):
     return connector._call(tool, {"symbol": "GEVITY", "quantity": 1})
+'''
+
+# THE RESIDUAL RE-AUDIT FINDING. A lowercase, OFF-vocabulary ticker in a
+# `symbol=` slot: tier 1 misses it (not curated, not in config) and tier 2
+# misses it (upper-case only). Only tier 3's positional reading catches it.
+LOWERCASE_OFF_UNIVERSE_CALL_SITE = '''
+def submit(connector, quantity):
+    return connector.place_equity_order(symbol="gevity", side="buy", quantity=quantity)
+'''
+
+# The same evasion routed through a constant dispatch and a payload dict, so
+# the positional tier is proved on the shape src/rh_lane.py-style code takes,
+# not just on a direct call.
+LOWERCASE_OFF_UNIVERSE_DISPATCH = '''
+_ORDER_TOOL = "place_equity_order"
+
+
+def submit(connector):
+    return connector._call(_ORDER_TOOL, {"symbol": "gevity", "quantity": 1})
+'''
+
+# The precision counterpart to tier 3: an in-scope execution module full of
+# short LOWERCASE tokens, none of which sits in a symbol position. If tier 3
+# were widened from "a symbol argument" to "any lowercase ticker-shaped
+# literal", every one of these would be flagged and the guard would be
+# allowlisted away within a week.
+LOWERCASE_PROSE_IN_AN_EXECUTION_MODULE = '''
+ORDER_TOOL = "place_equity_order"
+MODES = ["paper", "live", "both"]
+
+
+def submit(connector, symbol, mode):
+    if mode not in MODES:
+        return {"status": "unknown mode", "note": "must be one of them"}
+    return connector._call(ORDER_TOOL, {"symbol": symbol, "mode": mode})
 '''
 
 # A correct module: the symbol arrives as an argument, never as a literal.
@@ -656,6 +800,52 @@ def test_a_generic_call_wrapper_pulls_a_module_into_scope(tmp_path: Path) -> Non
 
     assert "generic.py" in report.scanned
     assert report.symbols() == {"GEVITY"}
+
+
+def test_a_lowercase_off_universe_ticker_at_an_order_call_site_is_flagged(tmp_path: Path) -> None:
+    """MUTATION TEST for the residual re-audit finding. 'gevity' is lowercase
+    AND outside every vocabulary, so tier 1 cannot see it and tier 2's
+    upper-case anchor excuses it -- it used to reach the broker, which up-cased
+    it into a well-formed live order. Delete the positional tier (or narrow
+    _CONFIG_TICKER_SHAPE back to the upper-case _TICKER_SHAPE here) and this
+    module scans clean again."""
+    report = scan_tree(write_tree(tmp_path, {"lane_exec.py": LOWERCASE_OFF_UNIVERSE_CALL_SITE}))
+
+    assert "lane_exec.py" in report.scanned
+    assert report.symbols() == {"GEVITY"}
+    assert [violation.tier for violation in report.violations] == ["order call-site symbol"]
+    # The literal is reported as it was WRITTEN, so the diff line is findable.
+    assert report.violations[0].symbol == "gevity"
+
+
+@pytest.mark.parametrize("tool", ORDER_TOOLS)
+def test_the_positional_tier_covers_every_order_tool(tmp_path: Path, tool: str) -> None:
+    """place / review / cancel alike -- a preview of an unapproved ticker and a
+    cancel aimed at one are order call-sites too."""
+    source = f'def submit(connector):\n    return connector.{tool}(symbol="gevity")\n'
+    report = scan_tree(write_tree(tmp_path, {"lane_exec.py": source}))
+
+    assert report.symbols() == {"GEVITY"}
+
+
+def test_a_lowercase_ticker_in_a_dispatched_payload_dict_is_flagged(tmp_path: Path) -> None:
+    """The same evasion through a constant dispatch: no ticker-looking callee,
+    the symbol buried in a payload dict, and lowercase. The taint set returned
+    by discover_execution_modules is what makes this call-site recognisable."""
+    report = scan_tree(write_tree(tmp_path, {"rh_lane.py": LOWERCASE_OFF_UNIVERSE_DISPATCH}))
+
+    assert "rh_lane.py" in report.scanned
+    assert report.symbols() == {"GEVITY"}
+
+
+def test_lowercase_prose_outside_a_symbol_position_is_not_flagged(tmp_path: Path) -> None:
+    """Tier 3 reads POSITION, not case. An in-scope module whose lowercase
+    short words are modes, statuses and prose stays clean -- widening the tier
+    to any lowercase ticker-shaped literal would flag all of them."""
+    report = scan_tree(write_tree(tmp_path, {"equity_exec.py": LOWERCASE_PROSE_IN_AN_EXECUTION_MODULE}))
+
+    assert "equity_exec.py" in report.scanned
+    assert report.violations == []
 
 
 def test_config_listed_equity_symbols_extend_the_vocabulary(tmp_path: Path) -> None:

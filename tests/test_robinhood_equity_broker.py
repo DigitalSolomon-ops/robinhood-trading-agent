@@ -56,6 +56,11 @@ DEFAULT_ACCOUNT = {"account_number": "RH-EQ-DEFAULT-2833", "nickname": "Default"
 # the lane is not configured for.
 TEST_SYMBOL = "SYMBOL"
 OPTION_SYMBOL = "SYMBOL250117C00150000"
+# A second placeholder, deliberately NOT in the universe every broker below is
+# built with, and spelled in both cases so the universe gate is proved to be
+# case-folded rather than upper-case-only.
+OFF_UNIVERSE_SYMBOL = "OFFLST"
+OFF_UNIVERSE_LOWERCASE = "offlst"
 
 
 class FakeConnector:
@@ -95,6 +100,10 @@ def make_broker(connector: FakeConnector, **kwargs) -> RobinhoodEquityBroker:
     # trading hours by default so those tests never flake depending on the
     # real wall-clock time the suite happens to run at (e.g. a weekend).
     kwargs.setdefault("clock", lambda: DURING_RTH)
+    # The lane universe these tests trade inside. Passed explicitly so this file
+    # never depends on which tickers the real config happens to list, and so the
+    # universe-gate tests below can hand a symbol that is provably outside it.
+    kwargs.setdefault("universe", [TEST_SYMBOL])
     return RobinhoodEquityBroker(RobinhoodEquityClient(connector), **kwargs)
 
 
@@ -284,6 +293,138 @@ def test_a_non_agentic_account_is_rejected_before_the_risk_layer(monkeypatch, tm
     last = logger.get_last_decision()
     assert last["action"] == "equity_order_refused"
     assert DEFAULT_ACCOUNT["account_number"] in last["reason"]
+
+
+# --- the configured-universe gate ---------------------------------------------
+#
+# The broker's OWN membership check, independent of the shared RiskManager
+# allowlist. RiskManager screens orders that arrive through OrderManager; these
+# tests call place_limit_order DIRECTLY, which is exactly the bypass the second
+# layer exists for. Its companion is the static half in
+# tests/test_order_symbol_guard.py: that one stops an off-universe ticker being
+# written into src/ at all, this one stops one that got there anyway from
+# reaching Robinhood.
+
+
+def test_a_symbol_outside_the_configured_universe_is_refused_before_submit(tmp_path: Path) -> None:
+    """The acceptance property: an armed broker, every other gate open, still
+    refuses a ticker the configured universe does not list -- and the refusal
+    is written to the audit log with a readable reason."""
+    connector = FakeConnector()
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+
+    assert broker.will_submit is True  # nothing else is stopping this order
+
+    with pytest.raises(RuntimeError, match="not in this lane's configured equities universe"):
+        broker.place_limit_order(order(symbol=OFF_UNIVERSE_SYMBOL))
+
+    assert connector.place_calls == []
+    last = logger.get_last_decision()
+    assert last["action"] == "equity_order_refused"
+    assert OFF_UNIVERSE_SYMBOL in last["reason"]
+
+
+def test_a_lowercase_off_universe_symbol_is_refused_rather_than_up_cased(tmp_path: Path) -> None:
+    """The residual gap this closes: assert_equity_symbol UP-CASES whatever it
+    is handed, so a lowercase literal would otherwise arrive at the connector as
+    a perfectly well-formed live order. The universe check is case-folded, so
+    the up-casing happens INTO a membership test, not around one."""
+    connector = FakeConnector()
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+
+    with pytest.raises(RuntimeError, match="not in this lane's configured equities universe"):
+        broker.place_limit_order(order(symbol=OFF_UNIVERSE_LOWERCASE))
+
+    assert connector.place_calls == []
+
+
+def test_a_lowercase_universe_symbol_is_still_accepted() -> None:
+    """Precision: the gate refuses off-universe names, not lowercase spellings
+    of on-universe ones. Without this, the check could 'pass' by rejecting
+    everything that is not already upper-case."""
+    connector = FakeConnector()
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True)
+
+    result = broker.place_limit_order(order(symbol=TEST_SYMBOL.lower()))
+
+    assert result["submitted"] is True
+    assert connector.place_calls[0]["symbol"] == TEST_SYMBOL
+
+
+def test_the_universe_gate_holds_when_the_order_manager_is_bypassed(monkeypatch, tmp_path: Path) -> None:
+    """Through the shared lane the RiskManager allowlist would have caught this
+    first; here the broker is called directly, so the ONLY thing between an
+    off-universe ticker and Robinhood is the broker's own check. Delete
+    assert_in_universe from place_limit_order and this submits."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    connector = FakeConnector()
+    broker, _, risk_manager, _, _ = build_lane(tmp_path, connector, dry_run=False, confirm_live_order=True)
+
+    with pytest.raises(RuntimeError, match="not in this lane's configured equities universe"):
+        broker.place_limit_order(order(symbol=OFF_UNIVERSE_SYMBOL))
+
+    assert risk_manager.evaluations == 0  # the risk layer was never consulted
+    assert connector.place_calls == []
+
+
+def test_a_broker_built_with_no_universe_reads_the_lane_config(monkeypatch, tmp_path: Path) -> None:
+    """No universe passed: the broker resolves config's equities.universe from
+    ROOT, the same list equity_runtime hands the shared RiskManager."""
+    import src.robinhood_equity_broker as rh_broker
+
+    monkeypatch.setattr(rh_broker, "ROOT", tmp_path)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "trading_rules.yaml").write_text(
+        f"equities:\n  universe:\n  - {TEST_SYMBOL}\n", encoding="utf-8"
+    )
+    connector = FakeConnector()
+
+    broker = RobinhoodEquityBroker(
+        RobinhoodEquityClient(connector),
+        dry_run=False,
+        confirm_live_order=True,
+        clock=lambda: DURING_RTH,
+    )
+
+    assert broker.universe == frozenset({TEST_SYMBOL})
+    with pytest.raises(RuntimeError, match="not in this lane's configured equities universe"):
+        broker.place_limit_order(order(symbol=OFF_UNIVERSE_SYMBOL))
+    assert connector.place_calls == []
+
+
+def test_an_unreadable_universe_config_fails_closed_and_refuses_everything(monkeypatch, tmp_path: Path) -> None:
+    """A universe check that cannot read its own list must refuse every symbol,
+    not wave every symbol through. tmp_path has no config/ at all."""
+    import src.robinhood_equity_broker as rh_broker
+
+    monkeypatch.setattr(rh_broker, "ROOT", tmp_path)
+    connector = FakeConnector()
+
+    broker = RobinhoodEquityBroker(
+        RobinhoodEquityClient(connector),
+        dry_run=False,
+        confirm_live_order=True,
+        clock=lambda: DURING_RTH,
+    )
+
+    assert broker.universe == frozenset()
+    with pytest.raises(RuntimeError, match="not in this lane's configured equities universe"):
+        broker.place_limit_order(order())
+    assert connector.place_calls == []
+
+
+def test_a_dry_run_preview_of_an_off_universe_symbol_never_reaches_the_connector() -> None:
+    """A preview is read-only and is allowed to render, but it is not a route
+    to the connector: the armed path is where the universe gate bites."""
+    connector = FakeConnector()
+    broker = make_broker(connector)
+
+    result = broker.place_limit_order(order(symbol=OFF_UNIVERSE_SYMBOL))
+
+    assert result["submitted"] is False
+    assert connector.place_calls == []
 
 
 # --- the shared kill switch ---------------------------------------------------

@@ -814,11 +814,28 @@ def recent_equity_decisions(root: Path, limit: int = 25) -> list[dict[str, Any]]
     return [scrub_secrets(dict(row)) for row in rows]
 
 
+def equity_price_sources(root: Path) -> dict[str, int]:
+    """Row count per recorded price source in the equities candle ledger.
+
+    Read straight off the ledger so this view states what the prices behind the
+    simulated fills ACTUALLY were, rather than what the lane means them to be.
+    """
+    db_path = root / "data" / "equity_market_data.db"
+    if not db_path.exists():
+        return {}
+    with sqlite3.connect(db_path) as conn:
+        try:
+            rows = conn.execute("SELECT source, COUNT(*) FROM equity_candles GROUP BY source").fetchall()
+        except sqlite3.Error:
+            return {}
+    return {str(row[0]): int(row[1]) for row in sorted(rows)}
+
+
 def equities_positions(root: Path) -> dict[str, Any]:
     """The equities paper broker's own ledger -- the lane's only fill source
-    for this build (paper_broker simulating fills against a deterministic
-    synthetic quote feed, NOT live market quotes; see
-    docs/rh-equities-binding.md). This dashboard process holds no
+    for this build (paper_broker simulating fills against REAL Massive
+    historical daily bars replayed one per cycle, never a live execution
+    quote; see docs/rh-equities-binding.md). This dashboard process holds no
     live Robinhood connector (the connector is session-bound to a Claude
     agent), so live positions cannot be read from here."""
     portfolio = PaperBroker(root / "data" / "equity_paper_trades.db").get_portfolio()
@@ -1312,6 +1329,7 @@ def equities_html(root: Path) -> str:
     allow_extended = bool(equities_config.get("allow_extended_hours", False))
     market_reason = market_blocked_reason(datetime.now(EASTERN), allow_extended_hours=allow_extended)
     crypto_stop_exists = KillSwitch(stop_file=str(root / rules.get("kill_switch", {}).get("stop_file", "STOP_TRADING"))).stop_file_exists()
+    price_sources = equity_price_sources(root)
 
     # The out-of-band expected identity for the single agent-tradable account,
     # read from config (never a literal baked into this view).
@@ -1355,7 +1373,12 @@ def equities_html(root: Path) -> str:
     posture_rows = {
         "Lane": "Robinhood equities (rules-based, long-only)",
         "Execution surface": "Agent-hosted: the OAuth Robinhood MCP connector is session-bound to a Claude/harness agent session. This dashboard process holds no connector and cannot place or preview a live equity order.",
-        "Current posture": "paper (simulated fills against read-only quotes)" if not stop_exists else "halted",
+        "Current posture": "paper (simulated fills against real historical bars)" if not stop_exists else "halted",
+        "Proving/backtest price source": (
+            ", ".join(f"{name} ({count} rows)" for name, count in price_sources.items())
+            or "none recorded yet (a counted proving run is priced on massive: real Massive historical daily bars)"
+        ),
+        "Execution price source": "the Robinhood OAuth connector's own quote, read at order time inside an agent session",
         "STOP_TRADING_EQUITIES exists": stop_exists,
         "TRADING_ENABLED (shared env flag)": trading_enabled,
         "Extended hours opt-in (config)": allow_extended,
@@ -1401,7 +1424,7 @@ def equities_html(root: Path) -> str:
     <table>{posture_table}</table>
     {section("Agentic Account", "Robinhood confines all agent trading to exactly one designated account. The agent never targets the default account, whatever the rules would otherwise allow.")}
     <table>{account_table}</table>
-    {section("Equities Positions (paper)", "Simulated fills from the local paper broker, priced against a deterministic synthetic quote feed (not live Robinhood quotes). This is the lane's only fill source in this build.")}
+    {section("Equities Positions (paper)", "Simulated fills from the local paper broker, priced against REAL Massive historical daily bars replayed one per cycle (not a live Robinhood execution quote). This is the lane's only fill source in this build.")}
     <p class="muted">Cash (paper): {escape(holdings["cash_usd"])}</p>
     {positions_table}
     {section("Recent Decisions & Rationale", "Every equities decision - a simulated fill, a skipped signal, or a refused order - with the human-readable reason the lane logged for it.")}

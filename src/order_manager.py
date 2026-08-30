@@ -56,8 +56,15 @@ class OrderManager:
         portfolio,
         daily_summary: dict[str, Any],
         has_api_credentials: bool,
+        amount_usd: float | None = None,
     ) -> dict[str, Any] | None:
-        order = self.build_limit_order(signal, limit_price, portfolio)
+        # `amount_usd` is an optional REDUCED per-trade cap a caller may impose
+        # (the equities lane's market-regime brake does this in a risk-off
+        # market). Left None the configured risk.max_trade_amount_usd applies
+        # exactly as before, and either way RiskManager below still checks the
+        # resulting notional against that same configured cap -- a caller can
+        # only ever shrink an order this way, never enlarge one past the cap.
+        order = self.build_limit_order(signal, limit_price, portfolio, amount_usd=amount_usd)
         decision = self.risk_manager.evaluate(
             signal=signal,
             mode=mode,

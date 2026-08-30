@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from . import market_hours
 from .equity_compliance import HISTORY_LOOKBACK_DAYS, PatternDayTraderGuard, SettlementGuard, assert_long_only
+from .equity_symbols import equities_universe
 from .kill_switch import KillSwitch
 from .logger import SQLiteLogger
 from .order_manager import OrderManager
@@ -33,6 +36,37 @@ def _default_equities_kill_switch() -> KillSwitch:
     production, so the emergency stop is honored no matter where the process
     was launched from. Never the crypto lane's STOP_TRADING (a different file)."""
     return KillSwitch(stop_file=str(ROOT / "STOP_TRADING_EQUITIES"), env_var="TRADING_ENABLED")
+
+
+def _normalize_universe(symbols: Iterable[str]) -> frozenset[str]:
+    """Universe membership keys: stripped and upper-cased, the same form
+    assert_equity_symbol returns, so a lowercase literal ('gevity') is compared
+    against the configured list rather than sliding past it on case."""
+    return frozenset(
+        str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()
+    )
+
+
+def _default_equity_universe() -> frozenset[str]:
+    """Fail-closed default universe for a broker built without an explicit one.
+
+    Reads config/trading_rules.yaml's `equities.universe` from the lane ROOT --
+    the SAME list src.equity_symbols.equities_universe returns and the same one
+    equity_runtime hands the shared RiskManager as its allowlist, so the two
+    layers can never disagree about what this lane may trade.
+
+    A missing or unreadable config yields an EMPTY universe, which refuses
+    every symbol. The failure mode of a universe check that cannot read its own
+    list must be "trade nothing", never "trade anything".
+    """
+    try:
+        with (ROOT / "config" / "trading_rules.yaml").open("r", encoding="utf-8") as handle:
+            rules = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError):
+        return frozenset()
+    if not isinstance(rules, dict):
+        return frozenset()
+    return _normalize_universe(equities_universe(rules))
 
 # Long-only plain equities. A ticker is 1-6 letters with an optional dot or
 # dash class suffix; a 21-character OCC option symbol can never match it. That
@@ -98,9 +132,15 @@ class RobinhoodEquityBroker:
     2. nothing is submitted unless BOTH human-gate flags are set -- dry_run
        False AND confirm_live_order True. Either flag alone, or neither,
        returns an unsubmitted payload preview and never reaches the connector;
-    3. at the irreversible moment, the kill switch is re-checked and a real
-       order is refused outright if STOP_TRADING exists or TRADING_ENABLED is
-       not true;
+    3. at the irreversible moment, the kill switch is re-checked, the symbol is
+       re-checked against the configured `equities.universe`, and a real order
+       is refused outright if STOP_TRADING exists, TRADING_ENABLED is not true,
+       or the ticker is not one this lane is configured to trade. The universe
+       check duplicates the shared RiskManager allowlist ON PURPOSE: a caller
+       that reaches place_limit_order directly, bypassing OrderManager, must
+       still be unable to send Robinhood a ticker nobody approved -- and the
+       comparison is case-folded, so a lowercase off-universe literal
+       ('gevity') is refused rather than quietly up-cased into a live order;
     4. the Agentic account's own compliance shape: long-only (a sell beyond
        the held quantity is refused as a short), the FINRA pattern-day-trader
        guard (blocks a 4th same-symbol day trade in 5 business days while
@@ -127,10 +167,18 @@ class RobinhoodEquityBroker:
         logger: SQLiteLogger | None = None,
         allow_extended_hours: bool = False,
         clock: Callable[[], datetime] | None = None,
+        universe: Iterable[str] | None = None,
     ) -> None:
         self.client = client
         self.dry_run = dry_run
         self.confirm_live_order = confirm_live_order
+        # Fail closed, exactly like the kill switch below: a broker built with
+        # no universe still gets one -- config's equities.universe, read from
+        # ROOT -- so the membership check can never be silently skipped. An
+        # unreadable config leaves this empty, which refuses every symbol.
+        self.universe = (
+            _normalize_universe(universe) if universe is not None else _default_equity_universe()
+        )
         # Fail closed: a broker built with no kill switch still gets one -- the
         # ROOT-anchored equities switch -- so the irreversible-moment re-check
         # below can never be silently skipped.
@@ -204,6 +252,28 @@ class RobinhoodEquityBroker:
                 f"{candidate!r} is not a plain equity ticker; this lane is long-only equities, no options"
             )
         return candidate.upper()
+
+    def assert_in_universe(self, symbol: str, side: str | None = None) -> str:
+        """Refuse a ticker the configured `equities.universe` does not list.
+
+        Independent of the shared RiskManager allowlist on purpose. RiskManager
+        checks membership for orders that arrive through OrderManager; this
+        checks it again at the broker, immediately before the connector call,
+        so a caller that reaches place_limit_order directly still cannot send
+        Robinhood a symbol nobody approved. Comparison is on the upper-cased,
+        stripped form both sides normalize to, so 'gevity' and 'GEVITY' are the
+        same lookup -- up-casing a literal must not be what makes it tradable.
+        """
+        candidate = str(symbol).strip().upper()
+        if candidate not in self.universe:
+            listed = ", ".join(sorted(self.universe)) or "(none configured)"
+            reason = (
+                f"refusing an equity order for {candidate}: it is not in this lane's configured "
+                f"equities universe [{listed}]"
+            )
+            self._log_refusal(symbol, side, reason)
+            raise RuntimeError(reason)
+        return candidate
 
     @staticmethod
     def time_in_force(value: str | None) -> str:
@@ -354,9 +424,10 @@ class RobinhoodEquityBroker:
                 "order_payload": order_payload,
             }
 
-        # Past this point the next call is irreversible: re-read the market
-        # clock and the kill switch, then hand the client both flags
-        # explicitly.
+        # Past this point the next call is irreversible: re-check what this lane
+        # is allowed to trade, re-read the market clock and the kill switch,
+        # then hand the client both flags explicitly.
+        self.assert_in_universe(symbol, side)
         self._assert_regular_hours(symbol, side)
         self._assert_kill_switch_open(symbol, side)
         as_of = self._clock()
@@ -430,6 +501,7 @@ class RobinhoodEquityBroker:
         daily_summary: dict[str, Any],
         account_number: str | None = None,
         has_api_credentials: bool = True,
+        amount_usd: float | None = None,
     ) -> dict[str, Any] | None:
         """Gate the account, then hand the signal to the SHARED OrderManager.
 
@@ -448,6 +520,13 @@ class RobinhoodEquityBroker:
         `has_api_credentials` defaults True because the OAuth connector IS the
         credential for this lane (agent/docs/rh-equities-binding.md); the
         client already proved it by resolving the account list through it.
+
+        `amount_usd` is an optional REDUCED per-trade cap for this one signal
+        (the market-regime brake in src/equity_intelligence/market_regime.py
+        passes a scaled-down cap in a weak market). It is handed straight to
+        OrderManager and changes nothing else: RiskManager still measures the
+        resulting notional against the configured risk.max_trade_amount_usd, so
+        this can only shrink an order, never enlarge one or excuse it a gate.
         """
         logger = self.logger or order_manager.logger
 
@@ -474,6 +553,7 @@ class RobinhoodEquityBroker:
                 portfolio=portfolio,
                 daily_summary=daily_summary,
                 has_api_credentials=has_api_credentials,
+                amount_usd=amount_usd,
             )
 
         if mode == "live":

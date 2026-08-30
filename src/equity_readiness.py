@@ -67,6 +67,20 @@ ORDER_SYMBOL_GUARD = "order_symbol_guard"
 # unattended and the reconcile that followed it came back clean. Two of them.
 REQUIRED_CLEAN_PAPER_RUNS = 2
 
+# ...and only if it was priced on the REAL market. A proving run records the
+# name of the price series it ran on (src/equity_runtime.py logs it into
+# equity_paper_loop_completed); this is the only name that counts. Anything
+# else -- a generated series, a connector quote read on an idle desk, or a run
+# from before the source was recorded at all -- proves nothing about how the
+# lane behaves against a market that actually happened, so it is not counted.
+# This is the audit's "synthetic feed sold as real quotes" finding, closed at
+# the gate rather than in prose.
+REQUIRED_QUOTE_SOURCE = "massive"
+
+# What a run records when it predates the recorded-source rule. Reported by
+# name so the evidence says why an old run stopped counting.
+UNRECORDED_QUOTE_SOURCE = "unrecorded"
+
 # A decision logged inside a run's window that is a MANUAL state mutation --
 # a daily-counter reset being the one this repo actually produced -- means the
 # run was not left alone: someone reached in and changed the lane's state, so
@@ -369,6 +383,10 @@ def paper_proving_runs(root: Path) -> list[dict[str, Any]]:
     of the following hold, so that a run being clean is a real, falsifiable
     claim rather than a tautology:
 
+      - the run recorded its price source, and that source is the REAL Massive
+        historical feed (REQUIRED_QUOTE_SOURCE). A run priced on a generated
+        series -- or one that never said what it was priced on -- is not
+        evidence about a real market and is not counted;
       - a reconcile falls in this run's OWN window -- after this loop and
         before the NEXT loop_completed -- and each reconcile is consumed by at
         most one run, so a single reconcile can never vouch for two runs;
@@ -414,9 +432,13 @@ def paper_proving_runs(root: Path) -> list[dict[str, Any]]:
         iterations = int(loop["details"].get("iterations_completed") or 0)
         errors = (following or {}).get("details", {}).get("errors", None)
         adjusted = (following or {}).get("details", {}).get("adjusted", [])
+        quote_source = str(loop["details"].get("quote_source") or UNRECORDED_QUOTE_SOURCE)
         runs.append(
             {
                 "completed_at": loop["timestamp"],
+                "quote_source": quote_source,
+                "quote_source_is_real": quote_source == REQUIRED_QUOTE_SOURCE,
+                "quote_source_provenance": loop["details"].get("quote_source_provenance") or {},
                 "iterations_completed": iterations,
                 "reconciled": following is not None,
                 "reconcile_at": (following or {}).get("timestamp"),
@@ -426,7 +448,8 @@ def paper_proving_runs(root: Path) -> list[dict[str, Any]]:
                 "ledger_delta": ledger_delta,
                 "manual_mutation_in_window": mutated,
                 "clean": (
-                    following is not None
+                    quote_source == REQUIRED_QUOTE_SOURCE
+                    and following is not None
                     and errors == []
                     and iterations > 0
                     and len(window_fills) >= 1
@@ -438,21 +461,70 @@ def paper_proving_runs(root: Path) -> list[dict[str, Any]]:
     return runs
 
 
+def recorded_quote_sources(root: Path) -> dict[str, int]:
+    """How many recorded proving runs ran on each price source, by name.
+
+    Read straight off the audit log so the posture can state what the runs were
+    ACTUALLY priced on rather than what the lane intends to price them on.
+    """
+    counts: dict[str, int] = {}
+    for run in paper_proving_runs(root):
+        counts[run["quote_source"]] = counts.get(run["quote_source"], 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def quote_source_summary(root: Path) -> str:
+    """One honest line about the proving runs' price source."""
+    counts = recorded_quote_sources(root)
+    real = counts.get(REQUIRED_QUOTE_SOURCE, 0)
+    others = {name: count for name, count in counts.items() if name != REQUIRED_QUOTE_SOURCE}
+    if not counts:
+        return (
+            f"no proving run recorded yet; a counted run must be priced on {REQUIRED_QUOTE_SOURCE} "
+            f"(real Massive historical daily bars, up to 2 years, read through massive_client)"
+        )
+    listed = ", ".join(f"{name} x{count}" for name, count in others.items())
+    if real and not others:
+        return (
+            f"{REQUIRED_QUOTE_SOURCE} -- real Massive historical daily bars (up to 2 years, adjusted "
+            f"closes via massive_client) across all {real} recorded proving run(s)"
+        )
+    if real:
+        return (
+            f"mixed: {real} run(s) on {REQUIRED_QUOTE_SOURCE} (real Massive historical daily bars); "
+            f"{listed} NOT counted"
+        )
+    return f"no run priced on {REQUIRED_QUOTE_SOURCE}; recorded sources are {listed}, none of which counts"
+
+
 def paper_runs_evidence(root: Path, rules: dict[str, Any]) -> Evidence:
     runs = paper_proving_runs(root)
     clean = [run for run in runs if run["clean"]]
-    data = {"runs": runs, "clean_run_count": len(clean), "required": REQUIRED_CLEAN_PAPER_RUNS}
+    wrong_source = [run for run in runs if not run["quote_source_is_real"]]
+    data = {
+        "runs": runs,
+        "clean_run_count": len(clean),
+        "required": REQUIRED_CLEAN_PAPER_RUNS,
+        "required_quote_source": REQUIRED_QUOTE_SOURCE,
+        "recorded_quote_sources": recorded_quote_sources(root),
+    }
     if len(clean) < REQUIRED_CLEAN_PAPER_RUNS:
-        return Evidence(
-            False,
-            f"{len(clean)} clean unattended paper run(s) in the audit log; "
-            f"{REQUIRED_CLEAN_PAPER_RUNS} are required",
-            data,
+        detail = (
+            f"{len(clean)} clean unattended paper run(s) priced on {REQUIRED_QUOTE_SOURCE} in the audit log; "
+            f"{REQUIRED_CLEAN_PAPER_RUNS} are required"
         )
+        if wrong_source:
+            listed = ", ".join(sorted({run["quote_source"] for run in wrong_source}))
+            detail += (
+                f" ({len(wrong_source)} recorded run(s) were not priced on the real feed -- "
+                f"source(s): {listed} -- and cannot count)"
+            )
+        return Evidence(False, detail, data)
     iterations = ", ".join(str(run["iterations_completed"]) for run in clean[-REQUIRED_CLEAN_PAPER_RUNS:])
     return Evidence(
         True,
-        f"{len(clean)} unattended bounded paper run(s) completed and reconciled with no errors "
+        f"{len(clean)} unattended bounded paper run(s) priced on {REQUIRED_QUOTE_SOURCE} (real Massive "
+        f"historical daily bars) completed and reconciled with no errors "
         f"(latest iteration counts: {iterations})",
         data,
     )
@@ -990,11 +1062,22 @@ GATES: tuple[Gate, ...] = (
     ),
     Gate(
         key="paper_proven_twice",
-        name="Paper ran unattended twice, reconciled clean",
-        why=f"The audit log records at least {REQUIRED_CLEAN_PAPER_RUNS} bounded paper loops that finished on their own bound without being halted, each followed by a reconcile reporting no errors.",
+        name="Paper ran unattended twice, reconciled clean, on real market data",
+        why=(
+            f"The audit log records at least {REQUIRED_CLEAN_PAPER_RUNS} bounded paper loops that finished on their "
+            f"own bound without being halted, each followed by a reconcile reporting no errors -- and each priced on "
+            f"`{REQUIRED_QUOTE_SOURCE}`, real Massive historical daily bars. A run on a generated series, or one that "
+            f"never recorded what it was priced on, does not count."
+        ),
         proving_tests=(
             R + "test_bounded_paper_loop_completes_unattended_and_reconciles_clean",
             R + "test_loop_requires_an_explicit_bound",
+            R + "test_a_proving_run_replays_real_massive_bars_and_records_the_source",
+            R + "test_a_connector_priced_loop_records_the_connector_not_the_real_feed",
+            R + "test_a_proving_run_refuses_to_fall_back_when_no_real_bars_exist",
+            E + "test_a_run_priced_on_a_synthetic_source_is_not_clean",
+            E + "test_a_run_that_recorded_no_quote_source_is_not_clean",
+            E + "test_the_paper_gate_requires_the_real_quote_source",
         ),
         evidence=paper_runs_evidence,
     ),
@@ -1129,10 +1212,17 @@ def equity_live_readiness(
             "execution_surface": "authorized Robinhood OAuth connector toolset (agent-hosted; no equities web service, no key to mint)",
             "auth": "the OAuth connector is itself the credential -- no vault entry, no .env key",
             "paper_broker": (
-                "local paper_broker simulating fills against a deterministic SYNTHETIC quote feed; "
-                "the recorded paper proving runs did not read live market quotes"
+                "local paper_broker simulating fills against REAL Massive historical daily bars "
+                "(up to 2 years of adjusted closes, replayed one bar per cycle through massive_client); "
+                "no order is placed and no price here is an execution price"
             ),
-            "quote_source": "synthetic",
+            "quote_source": quote_source_summary(root),
+            "quote_source_required": REQUIRED_QUOTE_SOURCE,
+            "quote_source_recorded": recorded_quote_sources(root),
+            "execution_price_source": (
+                "the authorized Robinhood OAuth connector's own quote, read at order time -- "
+                "the Massive series prices decisions and proving, never a fill"
+            ),
             "extended_hours_opt_in": bool(rules.get("equities", {}).get("allow_extended_hours", False)),
             "equities_universe": list(rules.get("equities", {}).get("universe", []) or []),
             "note": "switching paper->live is the operator's explicit call and is never a side effect of this report",
@@ -1236,6 +1326,9 @@ def readiness_markdown(report: dict[str, Any]) -> str:
         f"- Execution surface: {posture['execution_surface']}",
         f"- Auth: {posture['auth']}",
         f"- Paper: {posture['paper_broker']}",
+        f"- Proving/backtest price source: {posture['quote_source']} "
+        f"(required: `{posture['quote_source_required']}`)",
+        f"- Execution price: {posture['execution_price_source']}",
         f"- Extended-hours opt-in: {posture['extended_hours_opt_in']}",
         f"- Universe: {', '.join(posture['equities_universe']) or '(empty)'}",
         "",

@@ -26,6 +26,8 @@ from src.equity_readiness import (
     GATES,
     ORDER_SYMBOL_GUARD,
     REQUIRED_CLEAN_PAPER_RUNS,
+    REQUIRED_QUOTE_SOURCE,
+    UNRECORDED_QUOTE_SOURCE,
     Evidence,
     SuiteResult,
     agentic_account_evidence,
@@ -38,6 +40,8 @@ from src.equity_readiness import (
     paper_proving_runs,
     paper_runs_evidence,
     parse_pytest_output,
+    quote_source_summary,
+    recorded_quote_sources,
     readiness_markdown,
     readiness_verdict,
     risk_caps_evidence,
@@ -121,12 +125,23 @@ def paper_fill(db: Path, symbol: str = "AAPL", notional: float = 100.0) -> None:
     )
 
 
-def clean_paper_run(db: Path, iterations: int = 12, symbol: str = "AAPL", fills: int = 3) -> None:
-    """One GENUINE unattended bounded loop: real fills, the loop that finished,
-    then a clean reconcile. A run with no fills is not a clean run."""
+def clean_paper_run(
+    db: Path,
+    iterations: int = 12,
+    symbol: str = "AAPL",
+    fills: int = 3,
+    quote_source: str | None = REQUIRED_QUOTE_SOURCE,
+) -> None:
+    """One GENUINE unattended bounded loop: real fills, priced on the REAL
+    Massive historical feed, the loop that finished, then a clean reconcile.
+    A run with no fills is not a clean run; nor is one priced on anything but
+    the real feed, which is what `quote_source=None` models."""
     for _ in range(fills):
         paper_fill(db, symbol=symbol)
-    log_decision(db, "equity_paper_loop_completed", {"iterations_completed": iterations})
+    details: dict = {"iterations_completed": iterations}
+    if quote_source is not None:
+        details["quote_source"] = quote_source
+    log_decision(db, "equity_paper_loop_completed", details)
     log_decision(db, "equity_paper_reconcile", {"adjusted": [], "errors": []})
 
 
@@ -448,7 +463,7 @@ def test_a_run_whose_reconcile_reported_errors_is_not_clean(tmp_path: Path) -> N
     # A second run that DID trade, so the only thing keeping it from clean is
     # that its reconcile reported errors -- isolates the errors path.
     paper_fill(database, symbol="MSFT")
-    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 12})
+    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 12, "quote_source": REQUIRED_QUOTE_SOURCE})
     log_decision(database, "equity_paper_reconcile", {"adjusted": ["AAA"], "errors": ["negative position"]})
 
     evidence = paper_runs_evidence(tmp_path, RULES)
@@ -464,7 +479,7 @@ def test_a_completed_run_with_no_reconcile_after_it_is_not_clean(tmp_path: Path)
     # A second run that traded but has no reconcile -- isolates the missing
     # reconcile as the sole reason it is not clean.
     paper_fill(database, symbol="MSFT")
-    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 12})
+    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 12, "quote_source": REQUIRED_QUOTE_SOURCE})
 
     runs = paper_proving_runs(tmp_path)
 
@@ -478,7 +493,7 @@ def test_a_zero_trade_run_is_not_clean(tmp_path: Path) -> None:
     is the tautology the old evidence let through."""
     (tmp_path / "data").mkdir()
     database = tmp_path / "data" / "trading_agent.db"
-    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 80})
+    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 80, "quote_source": REQUIRED_QUOTE_SOURCE})
     log_decision(database, "equity_paper_reconcile", {"adjusted": [], "errors": []})
 
     runs = paper_proving_runs(tmp_path)
@@ -500,7 +515,7 @@ def test_a_run_preceded_by_a_manual_counter_reset_is_not_independent(tmp_path: P
     # Second run: someone resets the daily counter, THEN it trades and reconciles.
     log_decision(database, "equity_paper_run2_daily_counter_reset", {"before": {"trade_count": 5}, "after": {"trade_count": 0}})
     paper_fill(database, symbol="MSFT")
-    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 80})
+    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 80, "quote_source": REQUIRED_QUOTE_SOURCE})
     log_decision(database, "equity_paper_reconcile", {"adjusted": [], "errors": []})
 
     runs = paper_proving_runs(tmp_path)
@@ -521,11 +536,11 @@ def test_a_single_reconcile_cannot_vouch_for_two_runs(tmp_path: Path) -> None:
     database = tmp_path / "data" / "trading_agent.db"
     # Run 1: fill, loop, reconcile.
     paper_fill(database, symbol="AAPL")
-    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 5})
+    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 5, "quote_source": REQUIRED_QUOTE_SOURCE})
     log_decision(database, "equity_paper_reconcile", {"adjusted": [], "errors": []})
     # Run 2: fill, loop -- but no reconcile follows it.
     paper_fill(database, symbol="MSFT")
-    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 5})
+    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 5, "quote_source": REQUIRED_QUOTE_SOURCE})
 
     runs = paper_proving_runs(tmp_path)
 
@@ -535,6 +550,88 @@ def test_a_single_reconcile_cannot_vouch_for_two_runs(tmp_path: Path) -> None:
     # The one reconcile belongs to run 1 only -- run 2 never borrows it.
     assert runs[0]["reconcile_at"] is not None
     assert runs[1]["reconcile_at"] is None
+
+
+# --- the price source a run was proven on -----------------------------------
+
+
+def test_a_run_priced_on_a_synthetic_source_is_not_clean(tmp_path: Path) -> None:
+    """The audit finding, closed at the gate. A run that is perfect in every
+    other respect -- real fills, its own reconcile, no errors, no manual
+    mutation -- still does not count if it was priced on a generated series.
+    Only the real Massive feed counts."""
+    (tmp_path / "data").mkdir()
+    database = tmp_path / "data" / "trading_agent.db"
+    clean_paper_run(database, quote_source="synthetic")
+
+    runs = paper_proving_runs(tmp_path)
+
+    assert runs[0]["quote_source"] == "synthetic"
+    assert runs[0]["quote_source_is_real"] is False
+    # Everything else about it is clean; the source alone disqualifies it.
+    assert runs[0]["fills"] >= 1
+    assert runs[0]["reconcile_errors"] == []
+    assert runs[0]["manual_mutation_in_window"] is False
+    assert runs[0]["clean"] is False
+
+
+def test_a_run_that_recorded_no_quote_source_is_not_clean(tmp_path: Path) -> None:
+    """A run from before the source was recorded cannot vouch for itself. An
+    absent source reads exactly like a wrong one -- silence is not the real
+    feed."""
+    (tmp_path / "data").mkdir()
+    database = tmp_path / "data" / "trading_agent.db"
+    clean_paper_run(database, quote_source=None)
+
+    runs = paper_proving_runs(tmp_path)
+
+    assert runs[0]["quote_source"] == UNRECORDED_QUOTE_SOURCE
+    assert runs[0]["clean"] is False
+
+
+def test_the_paper_gate_requires_the_real_quote_source(tmp_path: Path) -> None:
+    """Two otherwise-clean runs on a synthetic feed do not satisfy the gate;
+    the same two on the real feed do. The source is the only thing that differs."""
+    (tmp_path / "data").mkdir()
+    synthetic_db = tmp_path / "data" / "trading_agent.db"
+    for _ in range(REQUIRED_CLEAN_PAPER_RUNS):
+        clean_paper_run(synthetic_db, quote_source="synthetic")
+
+    synthetic = paper_runs_evidence(tmp_path, RULES)
+
+    assert synthetic.passed is False
+    assert synthetic.data["clean_run_count"] == 0
+    assert synthetic.data["required_quote_source"] == REQUIRED_QUOTE_SOURCE == "massive"
+    assert "not priced on the real feed" in synthetic.detail
+
+    real_root = tmp_path / "real"
+    (real_root / "data").mkdir(parents=True)
+    for _ in range(REQUIRED_CLEAN_PAPER_RUNS):
+        clean_paper_run(real_root / "data" / "trading_agent.db")
+
+    real = paper_runs_evidence(real_root, RULES)
+
+    assert real.passed is True, real.detail
+    assert REQUIRED_QUOTE_SOURCE in real.detail
+    assert real.data["recorded_quote_sources"] == {REQUIRED_QUOTE_SOURCE: REQUIRED_CLEAN_PAPER_RUNS}
+
+
+def test_the_recorded_sources_are_reported_by_name(tmp_path: Path) -> None:
+    (tmp_path / "data").mkdir()
+    database = tmp_path / "data" / "trading_agent.db"
+    clean_paper_run(database, quote_source="synthetic")
+    clean_paper_run(database)
+
+    assert recorded_quote_sources(tmp_path) == {REQUIRED_QUOTE_SOURCE: 1, "synthetic": 1}
+    summary = quote_source_summary(tmp_path)
+    assert "mixed" in summary and "synthetic x1" in summary and "NOT counted" in summary
+
+
+def test_the_summary_says_so_when_nothing_ran_on_the_real_feed(tmp_path: Path) -> None:
+    (tmp_path / "data").mkdir()
+    clean_paper_run(tmp_path / "data" / "trading_agent.db", quote_source="synthetic")
+
+    assert "no run priced on massive" in quote_source_summary(tmp_path)
 
 
 def test_no_audit_database_means_no_proven_runs(tmp_path: Path) -> None:
@@ -549,47 +646,47 @@ def test_no_audit_database_means_no_proven_runs(tmp_path: Path) -> None:
 def test_the_repos_own_audit_log_is_counted_honestly() -> None:
     """Pinned against the real audit log, counted the GENUINE way.
 
-    Making the paper-proving evidence real turns up what the tautological count
-    hid: the recorded runs do NOT amount to two clean unattended runs. Run 1 is
-    genuine (real fills, a clean reconcile of its own). Run 2 filled nothing --
-    the daily cap was already spent, so 'clean' there only ever meant 'the loop
-    idled'. Run 3 traded only after a manual daily-counter reset landed in its
-    window, so it was not left unattended. Exactly ONE genuine clean run stands.
+    Two rounds of making this evidence real have each cost the lane a run it
+    thought it had. First: the tautological count hid that run 2 filled nothing
+    and run 3 traded only after a manual daily-counter reset, leaving exactly
+    one genuine run. Now: requiring a REAL price source costs it that one too.
+    Every recorded run here predates the Massive history feed -- they were
+    priced on a locally generated series and recorded no source at all -- so
+    ZERO runs count, and the gate is honestly not met.
 
-    This asserts the honest count -- and that each rejected run is rejected for
-    a real reason, and the one counted run carries a real fill, a real
-    rationale and its own distinct reconcile -- rather than pinning a number
-    that was never true. A second genuine unattended run (a separate trading
-    day, no manual reset) is owed before this gate can pass for real.
+    This asserts the honest count rather than a number that was never true.
+    Two genuine unattended runs priced on real Massive bars
+    (src.equity_runtime.run_equity_proving_run) are owed before this gate can
+    pass. The audit trail of the old runs is untouched; only what it is allowed
+    to prove has changed.
     """
     runs = paper_proving_runs(REPO_ROOT)
     clean = [run for run in runs if run["clean"]]
     evidence = paper_runs_evidence(REPO_ROOT, {})
 
-    # Genuine counting: exactly one clean run, so the gate is honestly NOT met.
     assert evidence.passed is False, evidence.detail
-    assert evidence.data["clean_run_count"] == 1
-    assert len(clean) == 1
+    assert evidence.data["clean_run_count"] == 0
+    assert clean == []
 
-    # The one counted run is real: a fill that moved the ledger, and its own
-    # reconcile with no errors -- not a tautological count.
-    the_run = clean[0]
-    assert the_run["fills"] >= 1
-    assert the_run["ledger_delta"] > 0
-    assert the_run["reconciled"] is True
-    assert the_run["reconcile_errors"] == []
+    # Not counted, and for the stated reason: none of them named a real feed.
+    assert runs, "the recorded runs are still in the audit log; they simply no longer count"
+    assert all(not run["quote_source_is_real"] for run in runs)
+    assert REQUIRED_QUOTE_SOURCE not in recorded_quote_sources(REPO_ROOT)
+    assert "not priced on the real feed" in evidence.detail
 
-    # ...and a real, non-empty rationale on the fills that make it up.
+    # The earlier, independent reasons still stand on the runs they applied to,
+    # so relaxing the source rule alone could never turn this gate green.
+    assert any(run["fills"] == 0 for run in runs), "the zero-trade run must still be visible as such"
+    assert any(run["manual_mutation_in_window"] for run in runs), "the reset-tainted run must still be visible as such"
+
+    # The fills that did happen carried a real, non-empty rationale -- the audit
+    # trail is genuine, it is the price series behind it that was not.
     with sqlite3.connect(REPO_ROOT / "data" / "trading_agent.db") as conn:
         reasons = [
             row[0]
             for row in conn.execute("SELECT reason FROM decisions WHERE action = 'paper_order_filled'").fetchall()
         ]
     assert reasons and all(reason and reason.strip() for reason in reasons)
-
-    # The rejected runs are rejected for the right, distinct reasons.
-    assert any(run["fills"] == 0 and not run["clean"] for run in runs), "the zero-trade run must be rejected"
-    assert any(run["manual_mutation_in_window"] and not run["clean"] for run in runs), "the reset-tainted run must be rejected"
 
 
 # --- the agentic-account and crypto-lane checks -----------------------------
@@ -788,17 +885,39 @@ def test_the_verdict_is_written_to_the_audit_log(tree: Path) -> None:
 
 
 def test_the_posture_states_the_paper_quote_source_honestly(tree: Path) -> None:
-    """The proving runs read a synthetic feed, not live quotes (the recorded
-    run-1 candles are exactly uptrend_prices()). The posture must say so, and
-    must not claim 'real' quotes. Reverting the string to the old
-    'real read-only quotes' claim fails this test -- that is the point."""
+    """The posture reports the source the recorded runs were ACTUALLY priced
+    on, read off the audit log -- not the source the lane intends to use. The
+    fixture tree's runs are on the real Massive feed, so it says so, names the
+    required source, and keeps execution price on the connector."""
     report = report_for(tree)
-    paper = report["posture"]["paper_broker"].lower()
+    posture = report["posture"]
+    paper = posture["paper_broker"].lower()
 
-    assert report["posture"]["quote_source"] == "synthetic"
-    assert "synthetic" in paper
-    assert "real read-only quotes" not in paper
-    assert "against real" not in paper
+    assert posture["quote_source_required"] == REQUIRED_QUOTE_SOURCE == "massive"
+    assert posture["quote_source_recorded"] == {REQUIRED_QUOTE_SOURCE: REQUIRED_CLEAN_PAPER_RUNS}
+    assert posture["quote_source"].startswith("massive -- real Massive historical daily bars")
+    assert "massive historical daily bars" in paper
+    assert "synthetic" not in paper
+    # The real source is the PROVING price only; a fill still prices off the
+    # connector, and the posture has to keep the two apart.
+    assert "connector" in posture["execution_price_source"].lower()
+    assert "never a fill" in posture["execution_price_source"]
+
+
+def test_the_posture_does_not_claim_a_real_source_the_runs_never_used(tmp_path: Path) -> None:
+    """The honesty property, from the other side: when the recorded runs were
+    priced on a generated series, the posture says that -- it never launders a
+    synthetic run into a claim about real data."""
+    (tmp_path / "data").mkdir()
+    clean_paper_run(tmp_path / "data" / "trading_agent.db", quote_source="synthetic")
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "trading_rules.yaml").write_text(yaml.safe_dump(RULES), encoding="utf-8")
+
+    report = equity_live_readiness(tmp_path, suite_runner=lambda _root: green_suite())
+
+    assert "no run priced on massive" in report["posture"]["quote_source"]
+    assert report["posture"]["quote_source_recorded"] == {"synthetic": 1}
+    assert report["ready"] is False
 
 
 def test_the_report_does_not_change_any_posture(tree: Path) -> None:

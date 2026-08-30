@@ -13,6 +13,14 @@ from .equity_intelligence.indicator_signals import (
     indicator_config,
     modulated_confidence,
 )
+from .equity_intelligence.news_sentiment import (
+    SKIP as SENTIMENT_SKIP,
+    SentimentFilterResult,
+    SentimentProvider,
+    SentimentSnapshot,
+    evaluate_news_sentiment,
+    news_sentiment_config,
+)
 
 
 @dataclass(frozen=True)
@@ -46,6 +54,20 @@ class TradeSignal:
     indicator_values: tuple[tuple[str, float], ...] = ()
     indicator_confidence_multiplier: float = 1.0
     base_confidence: float = 0.0
+    # --- news-sentiment pre-trade risk filter (equities lane) ---------------
+    # A veto only. These fields record what the news filter saw -- the counts,
+    # the negative share, and the headline behind it -- so the audit rationale
+    # can quote the article that refused the entry instead of asserting a
+    # conclusion. `pre_sentiment_confidence` is the confidence the filter was
+    # handed, so a downweight is legible as a before/after.
+    sentiment_source: str = ""
+    sentiment_action: str = ""
+    sentiment_notes: tuple[str, ...] = ()
+    sentiment_counts: tuple[tuple[str, int], ...] = ()
+    sentiment_negative_ratio: float = 0.0
+    sentiment_headline: str = ""
+    sentiment_confidence_multiplier: float = 1.0
+    pre_sentiment_confidence: float = 0.0
 
 
 class StrategyEngine:
@@ -336,6 +358,97 @@ class StrategyEngine:
             **recorded,
         )
 
+    # --- news-sentiment pre-trade risk filter (equities lane only) ----------
+
+    @property
+    def news_sentiment_config(self) -> dict[str, Any]:
+        """`equities.news_sentiment:` from config/trading_rules.yaml over the
+        defaults. It lives in the RULES file, not strategy.yaml, because it is
+        a risk cap rather than a signal-generation input."""
+        return news_sentiment_config(self.trading_rules)
+
+    @staticmethod
+    def _sentiment_snapshot(
+        symbol: str,
+        news: SentimentSnapshot | None,
+        provider: SentimentProvider | None,
+    ) -> SentimentSnapshot | None:
+        """An explicit snapshot wins; otherwise ask the provider. A provider
+        that raises degrades to an errored snapshot -- a news feed going down
+        must never take the lane down with it."""
+        if news is not None:
+            return news
+        if provider is None:
+            return None
+        try:
+            return provider.snapshot(symbol)
+        except Exception as exc:  # noqa: BLE001 -- degrade, never crash
+            return SentimentSnapshot(symbol=symbol, error=f"{type(exc).__name__}: {exc}")
+
+    def apply_sentiment_filter(self, signal: TradeSignal, result: SentimentFilterResult) -> TradeSignal:
+        """Fold a SentimentFilterResult into a signal.
+
+        The block-or-reduce guarantee lives here: this method may move an
+        actionable side to "hold" and may LOWER `confidence`, and it does
+        NOTHING else. It never sets `side` to "buy" or "sell" and it never
+        raises a confidence (the multiplier is clamped upstream AND the result
+        is floored against the incoming value here), so no headline can create
+        an order the rules did not already ask for. Every risk gate, the kill
+        switch and the human confirm-flag still run afterwards on whatever
+        comes out.
+        """
+        snapshot = result.snapshot
+        head = snapshot.worst_headline or snapshot.latest_headline if snapshot is not None else None
+        recorded = {
+            "sentiment_source": snapshot.source if snapshot is not None else "",
+            "sentiment_action": result.action,
+            "sentiment_notes": result.notes,
+            "sentiment_counts": snapshot.counts() if snapshot is not None else (),
+            "sentiment_negative_ratio": snapshot.negative_ratio if snapshot is not None else 0.0,
+            "sentiment_headline": head.citation() if head is not None else "",
+            "sentiment_confidence_multiplier": result.confidence_multiplier,
+            "pre_sentiment_confidence": signal.confidence,
+        }
+
+        # A non-actionable signal is recorded and returned untouched -- there is
+        # nothing to veto, and nothing here may create something.
+        if signal.side not in {"buy", "sell"}:
+            return replace(signal, **recorded)
+
+        # An EXIT is annotated with what the news said and otherwise left
+        # entirely alone. Bad news must never trap an open position.
+        if signal.side == "sell":
+            return replace(signal, reason=f"{signal.reason} | {result.rationale()}", **recorded)
+
+        # From here the signal is an ENTRY, the only thing this filter may act on.
+        if result.action == SENTIMENT_SKIP:
+            return replace(
+                signal,
+                side="hold",
+                final_signal="hold",
+                confidence=0.0,
+                stop_loss_percent=None,
+                take_profit_percent=None,
+                reason=(
+                    f"entry skipped by news sentiment: {result.rationale()} "
+                    f"| rules signal was '{signal.strategy_signal}' ({signal.reason})"
+                ),
+                **recorded,
+            )
+
+        # min(): a reduce-only filter, enforced a second time at the point of
+        # application so a bad multiplier cannot leak past the config clamp.
+        confidence = min(max(signal.confidence * result.confidence_multiplier, 0.0), signal.confidence)
+        return replace(
+            signal,
+            confidence=confidence,
+            reason=(
+                f"{signal.reason} | {result.rationale()} "
+                f"| confidence {signal.confidence:.2f} -> {confidence:.2f}"
+            ),
+            **recorded,
+        )
+
     def generate_equity_signal(
         self,
         symbol: str,
@@ -344,6 +457,8 @@ class StrategyEngine:
         allow_position_scaling: bool = False,
         indicators: IndicatorSnapshot | None = None,
         indicator_provider: IndicatorProvider | None = None,
+        news: SentimentSnapshot | None = None,
+        sentiment_provider: SentimentProvider | None = None,
     ) -> TradeSignal:
         """Equities entry point for the shared engine.
 
@@ -363,6 +478,14 @@ class StrategyEngine:
         annotate the rationale with the values used; they can never create an
         order, and every risk gate still runs downstream. With both omitted
         the signal is exactly what it was before indicators existed.
+
+        `news` / `sentiment_provider` then apply the news-sentiment PRE-TRADE
+        RISK FILTER (thresholds and recency window from
+        `equities.news_sentiment:` in config/trading_rules.yaml). It runs LAST
+        of the three, so it can veto anything upstream produced but nothing
+        upstream can undo its veto, and it is block-or-reduce only. It is not a
+        replacement for any risk gate -- RiskManager, the kill switch and the
+        human confirm-flag all still run after it, unchanged.
         """
         signal = self.generate_signal(
             symbol,
@@ -373,11 +496,17 @@ class StrategyEngine:
         )
         config = self.indicator_config
         snapshot = self._indicator_snapshot(symbol, indicators, indicator_provider)
-        if snapshot is None and not (config.get("enabled") and config.get("require_indicators")):
-            # No indicator data and none demanded: the signal is exactly what
-            # it was before indicators existed.
+        if snapshot is not None or (config.get("enabled") and config.get("require_indicators")):
+            # Reaching here with snapshot None means the config demands
+            # indicators and none arrived -- evaluate_indicators fails that
+            # CLOSED for entries. With no data and none demanded, the signal
+            # stays exactly what it was before indicators existed.
+            modulation = evaluate_indicators(snapshot, signal.side, signal.confidence, config)
+            signal = self.apply_indicator_modulation(signal, modulation)
+
+        news_config = self.news_sentiment_config
+        news_snapshot = self._sentiment_snapshot(symbol, news, sentiment_provider)
+        if news_snapshot is None and not (news_config.get("enabled") and news_config.get("require_news")):
             return signal
-        # Reaching here with snapshot None means the config demands indicators
-        # and none arrived -- evaluate_indicators fails that CLOSED for entries.
-        modulation = evaluate_indicators(snapshot, signal.side, signal.confidence, config)
-        return self.apply_indicator_modulation(signal, modulation)
+        result = evaluate_news_sentiment(news_snapshot, signal.side, signal.confidence, news_config)
+        return self.apply_sentiment_filter(signal, result)
