@@ -206,7 +206,7 @@ def send_or_preview(
     password = resolve_gmail_app_password()
     if not password:
         return EmailResult(subject, body, sent=False, dry_run=False, to_addr=to_addr,
-                           detail="no Gmail app password (env GMAIL_APP_PASSWORD or secret gmail-app-password); not sent")
+                           detail="no Gmail app password (env GMAIL_APP_PASSWORD or Secret Manager GMAIL_VAULT_NAME); not sent")
 
     email_cfg = config.get("email", {}) or {}
     host = email_cfg.get("smtp_host", "smtp.gmail.com")

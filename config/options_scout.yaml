@@ -98,7 +98,7 @@ regime:
 email:
   # Defaults to digitalsolomon.com@gmail.com when GMAIL_USER / OPTIONS_SCOUT_TO
   # are unset. The app password is read env-first (GMAIL_APP_PASSWORD) then
-  # Secret Manager secret `gmail-app-password` -- never hardcoded here.
+  # Secret Manager (GMAIL_VAULT_NAME, default "gmail-app-password") -- never hardcoded here.
   from_addr: "digitalsolomon.com@gmail.com"
   to_addr: "digitalsolomon.com@gmail.com"
   smtp_host: "smtp.gmail.com"
