@@ -114,6 +114,57 @@ def test_sell_requires_open_position(monkeypatch, tmp_path: Path) -> None:
     assert "no open position to sell" not in allowed.reasons
 
 
+def test_shorting_guard_blocks_a_sell_with_no_position_when_shorting_disallowed(monkeypatch, tmp_path: Path) -> None:
+    """MUTATION TEST for fix #3: the 'shorting is not allowed' guard was
+    logically inverted -- it fired only when allow_shorting was TRUE, making it
+    dead in the default (shorting-off) posture. Inverted correctly, a sell with
+    no position while shorting is disallowed must surface that exact reason."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    short_rules = rules()
+    short_rules["trading"]["enabled"] = True
+    short_rules["risk"]["allow_shorting"] = False
+    signal = TradeSignal("BTC-USD", "sell", 0.8, "test", strategy_signal="sell")
+    manager = RiskManager(short_rules, KillSwitch(stop_file=str(tmp_path / "STOP_TRADING")))
+
+    decision = manager.evaluate(
+        signal=signal,
+        mode="paper",
+        notional=25,
+        portfolio=Portfolio(cash_usd=100),  # no BTC-USD position held
+        daily_summary={"realized_pnl": 0, "trade_count": 0},
+        has_api_credentials=True,
+        order_quantity=0.01,
+    )
+
+    assert not decision.allowed
+    assert "shorting is not allowed" in decision.reasons
+
+
+def test_shorting_guard_stays_silent_when_shorting_is_explicitly_allowed(monkeypatch, tmp_path: Path) -> None:
+    """The polarity matters: the reason must appear ONLY when shorting is
+    disallowed. With allow_shorting TRUE the guard is silent -- which is exactly
+    where the OLD inverted code wrongly fired -- so this pins the fix rather
+    than an always-on gate."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    long_short_rules = rules()
+    long_short_rules["trading"]["enabled"] = True
+    long_short_rules["risk"]["allow_shorting"] = True
+    signal = TradeSignal("BTC-USD", "sell", 0.8, "test", strategy_signal="sell")
+    manager = RiskManager(long_short_rules, KillSwitch(stop_file=str(tmp_path / "STOP_TRADING")))
+
+    decision = manager.evaluate(
+        signal=signal,
+        mode="paper",
+        notional=25,
+        portfolio=Portfolio(cash_usd=100),
+        daily_summary={"realized_pnl": 0, "trade_count": 0},
+        has_api_credentials=True,
+        order_quantity=0.01,
+    )
+
+    assert "shorting is not allowed" not in decision.reasons
+
+
 def test_sell_exit_does_not_require_entry_exit_brackets(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TRADING_ENABLED", "true")
     paper_rules = rules()
@@ -330,6 +381,41 @@ def test_stop_trading_blocks_dry_run_payload_generation(monkeypatch, tmp_path: P
 
     assert result is None
     assert live_broker.calls == 0
+
+
+def test_root_created_stop_trading_halts_run_cycle_regardless_of_cwd(monkeypatch, tmp_path: Path) -> None:
+    """MUTATION TEST for fix #2: the crypto STOP_TRADING was created and checked
+    at INCONSISTENT paths -- CWD-relative in the loops vs ROOT-anchored in the
+    helpers -- so a stop file written at the project ROOT was invisible to a
+    loop running from another CWD. Anchored to ROOT everywhere, a ROOT-created
+    STOP_TRADING halts run_cycle no matter where the process was launched.
+
+    Revert run_cycle to a CWD-relative KillSwitch and the stop file (which lives
+    at ROOT, not the CWD) is not found: the cycle proceeds and calls make_client,
+    which this test has booby-trapped to fail."""
+    root = tmp_path / "root"
+    (root / "data").mkdir(parents=True)
+    (root / "STOP_TRADING").write_text("stop", encoding="utf-8")
+    monkeypatch.setattr(app_main, "ROOT", root)
+    # TRADING_ENABLED=true so the stop file is the ONLY possible halt reason --
+    # isolating that the ROOT-anchored path is what stopped the cycle.
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+
+    def _boom():
+        raise AssertionError("run_cycle proceeded past the ROOT STOP_TRADING instead of halting")
+
+    monkeypatch.setattr(app_main, "make_client", _boom)
+
+    # Run from a DIFFERENT working directory that has no STOP_TRADING of its own.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    app_main.run_cycle("paper", {}, {})
+
+    last = SQLiteLogger(root / "data" / "trading_agent.db").get_last_decision()
+    assert last["action"] == "halted"
+    assert "STOP_TRADING" in last["reason"]
 
 
 def test_trading_mode_paper_prevents_real_order_submission(monkeypatch, tmp_path: Path) -> None:

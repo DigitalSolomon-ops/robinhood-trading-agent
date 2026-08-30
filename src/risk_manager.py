@@ -95,7 +95,7 @@ class RiskManager:
             reasons.append("take-profit is missing")
         if risk.get("require_cash_available", True) and signal.side == "buy" and not portfolio.has_cash_for(notional):
             reasons.append("order would exceed available cash")
-        if risk.get("allow_shorting", risk.get("allow_shorts", False)) and signal.side == "sell" and portfolio.quantity_for(signal.symbol) <= 0:
+        if not risk.get("allow_shorting", risk.get("allow_shorts", False)) and signal.side == "sell" and portfolio.quantity_for(signal.symbol) <= 0:
             reasons.append("shorting is not allowed")
         if not risk.get("allow_margin", False) and not risk.get("require_cash_available", True):
             reasons.append("margin is not allowed")

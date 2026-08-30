@@ -1,11 +1,22 @@
 .env
+.env.*
+!.env.example
 logs/
 data/*.db
+# SQLite writes these beside the db. A run interrupted mid-write leaves one
+# behind, and `data/*.db` does not match them -- so without these a `git add -A`
+# would stage a fragment of the audit log / paper ledger.
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.sqlite
+data/*.sqlite3
 data/private/
 data/proving_runs/
 __pycache__/
 *.pyc
 .venv/
+.pytest_cache/
 
 # ds-build-agent handoff artifacts (in-place build)
 BLOCKERS.md

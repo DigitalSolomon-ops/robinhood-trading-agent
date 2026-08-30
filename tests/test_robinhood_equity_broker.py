@@ -179,6 +179,18 @@ def run_lane(broker, order_manager, mode="live", account_number=None, portfolio=
     )
 
 
+@pytest.fixture(autouse=True)
+def _enable_trading_env(monkeypatch):
+    """The broker now FAILS CLOSED: a broker built with no kill switch is given
+    the ROOT-anchored equities KillSwitch (STOP_TRADING_EQUITIES + TRADING_ENABLED)
+    instead of skipping the check. That switch reads TRADING_ENABLED, so the
+    direct-broker tests here that expect a real submit assume the operator's
+    global enable is on -- exactly the production posture for a live order. The
+    tests that assert a HALT set their own stop file or override this back to
+    'false' themselves, and this fixture is undone after every test."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+
+
 # --- default posture ---------------------------------------------------------
 
 
@@ -315,6 +327,34 @@ def test_the_kill_switch_is_re_read_at_the_moment_of_submission(monkeypatch, tmp
     connector = FakeConnector()
     broker, _, _, _, stop_file = build_lane(tmp_path, connector, dry_run=False, confirm_live_order=True)
     stop_file.write_text("stop", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="kill switch"):
+        broker.place_limit_order(order())
+
+    assert connector.place_calls == []
+
+
+def test_an_armed_broker_with_no_kill_switch_fails_closed_on_the_equities_stop_file(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """MUTATION TEST for fix #1: a broker built with kill_switch=None must NOT
+    become an unguarded submit path. The old code early-returned from the kill
+    switch check when kill_switch was None, so an armed broker sailed straight
+    through even while STOP_TRADING_EQUITIES existed. With the fix the broker
+    substitutes the ROOT-anchored equities KillSwitch, so the emergency stop is
+    honored. Revert either half (restore the None early-return, or drop the
+    default) and this submits -- failing on place_calls / the missing raise."""
+    import src.robinhood_equity_broker as rh_broker
+
+    # Point the fail-closed default at a tmp ROOT so the test owns the stop file
+    # rather than the real repo tree; this must happen BEFORE the broker is built.
+    monkeypatch.setattr(rh_broker, "ROOT", tmp_path)
+    (tmp_path / "STOP_TRADING_EQUITIES").write_text("stop", encoding="utf-8")
+    connector = FakeConnector()
+
+    # No kill_switch is passed -- __init__ substitutes the ROOT-anchored default.
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True)
+    assert broker.kill_switch is not None
 
     with pytest.raises(RuntimeError, match="kill switch"):
         broker.place_limit_order(order())
@@ -852,6 +892,51 @@ def test_a_buy_beyond_settled_cash_is_refused_as_margin(tmp_path: Path) -> None:
 
     assert connector.place_calls == []
     assert "no margin" in logger.get_last_decision()["reason"]
+
+
+def test_a_buy_omitting_notional_is_recomputed_and_rejected_against_near_zero_cash(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """MUTATION TEST for fix #4: the anti-margin/good-faith guard must derive
+    notional from the AUTHORITATIVE fields (quantity * limit_price), never trust
+    a caller-supplied `notional` that defaults to 0.0. Here the caller OMITS
+    notional entirely against a ~$1 settled-cash account. The old code read
+    notional as 0.0, so the guard saw 0 <= 1 and let the order through; the fix
+    recomputes it as 0.25 * 100 = $25 and the good-faith guard rejects it."""
+    import src.robinhood_equity_broker as rh_broker
+
+    monkeypatch.setattr(rh_broker, "ROOT", tmp_path)  # hermetic: no stray equities stop file
+    connector = FakeConnector(positions=[])
+    connector.get_accounts = lambda: {  # cash-poor account, well under the $25 order
+        "accounts": [{**AGENT_ACCOUNT, "cash_available_for_trading": "1.00"}, DEFAULT_ACCOUNT]
+    }
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+
+    payload = order(side="buy", quantity=0.25, limit_price=100.0)
+    payload.pop("notional")  # the caller supplies nothing for the guard to trust
+
+    with pytest.raises(RuntimeError, match="good-faith guard"):
+        broker.place_limit_order(payload)
+
+    assert connector.place_calls == []
+    assert "no margin" in logger.get_last_decision()["reason"]
+
+
+def test_a_buy_with_a_non_positive_computed_notional_is_rejected(monkeypatch, tmp_path: Path) -> None:
+    """A zero/absent quantity cannot slip through as a $0 order either: the
+    authoritative recompute RAISES on a non-positive notional."""
+    import src.robinhood_equity_broker as rh_broker
+
+    monkeypatch.setattr(rh_broker, "ROOT", tmp_path)
+    connector = FakeConnector(positions=[])
+    logger = SQLiteLogger(tmp_path / "agent.db")
+    broker = make_broker(connector, dry_run=False, confirm_live_order=True, logger=logger)
+
+    with pytest.raises(ValueError, match="notional must be positive"):
+        broker.place_limit_order(order(side="buy", quantity=0, limit_price=100.0))
+
+    assert connector.place_calls == []
 
 
 def test_a_buy_that_would_spend_same_day_unsettled_sale_proceeds_is_refused(tmp_path: Path) -> None:

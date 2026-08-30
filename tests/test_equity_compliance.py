@@ -17,12 +17,14 @@ tests/test_robinhood_equity_broker.py.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from src.equity_compliance import (
     PDT_EQUITY_THRESHOLD_USD,
+    PDT_WINDOW_BUSINESS_DAYS,
     PatternDayTraderGuard,
     SettlementGuard,
+    _business_days_back,
     assert_long_only,
 )
 
@@ -236,3 +238,38 @@ def test_a_buy_is_never_touched_by_the_long_only_guard() -> None:
     decision = assert_long_only(SYMBOL, "buy", order_quantity=1_000_000.0, held_quantity=0.0)
 
     assert decision.allowed
+
+
+# --- the trailing PDT window spans REAL trading days, not calendar weekdays ---
+
+# Christmas 2026-12-25 is a Friday full-market closure. Anchored on Wed
+# 2026-12-30, the trailing five TRADING days reach back to Wed 2026-12-23 --
+# NOT to Thu 2026-12-24, where a naive calendar-weekday count (that treated the
+# holiday as a session) would have stopped one day short.
+_ANCHOR = date(2026, 12, 30)
+_CHRISTMAS = date(2026, 12, 25)
+_FIFTH_TRADING_DAY = date(2026, 12, 23)
+
+
+def test_business_days_back_skips_a_market_holiday_in_the_window() -> None:
+    window = _business_days_back(_ANCHOR, PDT_WINDOW_BUSINESS_DAYS)
+
+    assert len(window) == PDT_WINDOW_BUSINESS_DAYS
+    # The holiday is a calendar weekday but NOT a trading day, so it is skipped.
+    assert _CHRISTMAS not in window
+    # Skipping it makes the window reach one genuine session further back --
+    # the far edge a calendar-weekday count would have missed.
+    assert _FIFTH_TRADING_DAY in window
+
+
+def test_pdt_window_counts_a_day_trade_on_the_far_side_of_a_holiday() -> None:
+    # One completed day trade sitting on the 5th real trading day back. A
+    # calendar-weekday window (the bug) stops at 2026-12-24 and never counts
+    # it; the holiday-aware window includes it, so the PDT tally is correct.
+    history = [
+        {"symbol": SYMBOL, "side": "buy", "status": "filled", "timestamp": f"{_FIFTH_TRADING_DAY}T10:00:00"},
+        {"symbol": SYMBOL, "side": "sell", "status": "filled", "timestamp": f"{_FIFTH_TRADING_DAY}T14:00:00"},
+    ]
+    guard = PatternDayTraderGuard(history)
+
+    assert guard.count_day_trades_in_window(SYMBOL, datetime(2026, 12, 30, 10, 0)) == 1

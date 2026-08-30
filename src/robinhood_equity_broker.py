@@ -4,6 +4,7 @@ import re
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from . import market_hours
@@ -16,6 +17,22 @@ from .robinhood_equity_client import AgentAccountMismatchError, RobinhoodEquityC
 from .strategy_engine import TradeSignal
 
 VENUE = "robinhood_equities"
+
+# The lane repo root, so a fail-closed default kill switch resolves to the SAME
+# STOP_TRADING_EQUITIES file the runtime wires explicitly, regardless of CWD.
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _default_equities_kill_switch() -> KillSwitch:
+    """Fail-closed default for a broker built without an explicit kill switch.
+
+    A missing kill_switch must NEVER turn the broker into an unguarded submit
+    path. Rather than skip the check (the old, wrong behavior), fall back to
+    the equities lane's OWN ROOT-anchored switch -- STOP_TRADING_EQUITIES plus
+    TRADING_ENABLED -- the same file equity_runtime.equity_kill_switch wires in
+    production, so the emergency stop is honored no matter where the process
+    was launched from. Never the crypto lane's STOP_TRADING (a different file)."""
+    return KillSwitch(stop_file=str(ROOT / "STOP_TRADING_EQUITIES"), env_var="TRADING_ENABLED")
 
 # Long-only plain equities. A ticker is 1-6 letters with an optional dot or
 # dash class suffix; a 21-character OCC option symbol can never match it. That
@@ -114,7 +131,10 @@ class RobinhoodEquityBroker:
         self.client = client
         self.dry_run = dry_run
         self.confirm_live_order = confirm_live_order
-        self.kill_switch = kill_switch
+        # Fail closed: a broker built with no kill switch still gets one -- the
+        # ROOT-anchored equities switch -- so the irreversible-moment re-check
+        # below can never be silently skipped.
+        self.kill_switch = kill_switch if kill_switch is not None else _default_equities_kill_switch()
         self.logger = logger
         self.allow_extended_hours = allow_extended_hours
         self._clock = clock or (lambda: datetime.now(market_hours.EASTERN))
@@ -189,9 +209,33 @@ class RobinhoodEquityBroker:
     def time_in_force(value: str | None) -> str:
         return _TIME_IN_FORCE.get(str(value or "gfd").lower(), "gfd")
 
+    @staticmethod
+    def _order_notional(order: dict[str, Any]) -> float:
+        """The order's notional, recomputed from the AUTHORITATIVE fields
+        (quantity * limit_price) rather than trusted from a caller-supplied
+        `notional` key. The anti-margin / good-faith guard leans on this to
+        decide whether a buy fits inside settled cash; a caller that omits
+        notional (or passes 0) must not be able to slip an order past that
+        guard, so a missing or non-positive value RAISES here instead of
+        defaulting to 0.0."""
+        try:
+            quantity = float(order["quantity"])
+            limit_price = float(order["limit_price"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "cannot compute order notional: both quantity and limit_price are required"
+            ) from exc
+        notional = quantity * limit_price
+        if notional <= 0:
+            raise ValueError(
+                f"order notional must be positive; got quantity={quantity} limit_price={limit_price}"
+            )
+        return notional
+
     def _assert_kill_switch_open(self, symbol: str | None, side: str | None) -> None:
-        if self.kill_switch is None:
-            return
+        # No fail-open path: self.kill_switch is guaranteed non-None by __init__
+        # (a fail-closed default is substituted when none is wired), so the
+        # emergency stop is always consulted at the irreversible moment.
         halts = self.kill_switch.halt_reasons()
         if halts:
             reason = "kill switch is engaged: " + "; ".join(halts)
@@ -318,7 +362,9 @@ class RobinhoodEquityBroker:
         as_of = self._clock()
         history = self._order_history(as_of)
         portfolio_snapshot = self.get_portfolio()
-        notional = float(order.get("notional") or 0.0)
+        # Authoritative notional -- never the caller's own `notional` field --
+        # so the settlement/anti-margin guard cannot be defeated by omitting it.
+        notional = self._order_notional(order)
         self._assert_long_only(symbol, side, float(order["quantity"]), portfolio_snapshot)
         self._assert_pdt_guard(symbol, side, portfolio_snapshot, history, as_of)
         self._assert_settlement_guard(symbol, side, notional, portfolio_snapshot, history, as_of)

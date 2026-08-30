@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from . import market_hours
+
 # FINRA's pattern-day-trader threshold and window. Not a lane risk cap the
 # operator tunes in trading_rules.yaml -- a regulatory constant.
 PDT_EQUITY_THRESHOLD_USD = 25_000.0
@@ -40,12 +42,18 @@ def _add_business_days(start: date, business_days: int) -> date:
 
 
 def _business_days_back(anchor: date, count: int) -> set[date]:
-    """The `count` business days ending at `anchor`, inclusive of `anchor`
-    itself when it is a business day."""
+    """The `count` REAL trading days ending at `anchor`, inclusive of `anchor`
+    itself when it is a trading day.
+
+    A market holiday is not a trading day even though it is a calendar weekday,
+    so it is skipped here: counting it would shorten the trailing PDT window by
+    a full session, letting a day trade that happened 5 trading days back fall
+    outside the window and go uncounted. Skipping holidays makes the window
+    span 5 genuine sessions."""
     days: set[date] = set()
     cursor = anchor
     while len(days) < count:
-        if cursor.weekday() < 5:
+        if cursor.weekday() < 5 and not market_hours.is_market_holiday(cursor):
             days.add(cursor)
         cursor -= timedelta(days=1)
     return days

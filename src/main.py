@@ -23,6 +23,7 @@ from .intelligence import (
     score_all_symbols as score_all_symbols_layer,
     score_symbol as score_symbol_layer,
 )
+from .equity_readiness import equity_live_readiness, readiness_markdown
 from .kill_switch import KillSwitch
 from .live_broker import LiveBroker
 from .logger import SQLiteLogger
@@ -165,10 +166,9 @@ def init_project() -> None:
 
 
 def stop_trading(rules: dict[str, Any]) -> None:
-    kill = KillSwitch(
-        stop_file=rules.get("kill_switch", {}).get("stop_file", "STOP_TRADING"),
-        env_var=rules.get("kill_switch", {}).get("env_var", "TRADING_ENABLED"),
-    )
+    # ROOT-anchored so the stop file is CREATED at the same fixed location every
+    # loop CHECKS it, regardless of the CWD the CLI was invoked from.
+    kill = _project_kill_switch(rules)
     path = kill.create_stop_file()
     print(f"Created {path}. New orders are halted.")
 
@@ -1587,6 +1587,33 @@ def live_launch_readiness(run_tests: bool = False, check_connection: bool = Fals
     return _scrub_sensitive(report)
 
 
+def equity_live_readiness_command(output_format: str = "json", output_path: str | None = None) -> dict[str, Any]:
+    """The equities lane's live-readiness gate (src/equity_readiness.py).
+
+    Runs the full test suite, evaluates every equities gate against it, reads
+    the audit log and config for the evidence no test can speak to, and writes
+    the verdict to the audit log. Read-only -- it never reaches the connector
+    and never changes a posture.
+
+    Exits non-zero when the verdict is ready:false, so this can gate a script
+    without anyone having to remember to read the JSON.
+    """
+    report = equity_live_readiness(ROOT, logger=SQLiteLogger(ROOT / "data" / "trading_agent.db"))
+    rendered = readiness_markdown(report) if output_format == "markdown" else json.dumps(report, indent=2)
+    if output_path:
+        path = Path(output_path)
+        if not path.is_absolute():
+            path = ROOT / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(rendered + "\n", encoding="utf-8")
+        print(f"wrote {path}")
+    else:
+        print(rendered)
+    if not report["ready"]:
+        raise SystemExit(1)
+    return report
+
+
 def collect_intelligence() -> None:
     rules, _ = load_settings()
     symbols = symbol_lists(rules)["live_allowed_symbols"]
@@ -1747,10 +1774,9 @@ def run_cycle(mode: str, rules: dict[str, Any], strategy_config: dict[str, Any])
     effective_rules["trading"] = dict(rules.get("trading", {}))
     effective_rules["trading"]["allowed_symbols"] = allowed_symbols_for_mode(mode, rules)
     logger = SQLiteLogger(ROOT / "data" / "trading_agent.db")
-    kill = KillSwitch(
-        stop_file=effective_rules.get("kill_switch", {}).get("stop_file", "STOP_TRADING"),
-        env_var=effective_rules.get("kill_switch", {}).get("env_var", "TRADING_ENABLED"),
-    )
+    # ROOT-anchored: a STOP_TRADING created by the CLI (or anywhere) halts this
+    # cycle no matter what CWD the loop is running from.
+    kill = _project_kill_switch(effective_rules)
     kill_reasons = kill.halt_reasons()
     if kill_reasons:
         logger.log_decision(None, "halted", "; ".join(kill_reasons))
@@ -1851,10 +1877,9 @@ def run_paper_loop(iterations: int | None = None, hours: float | None = None) ->
     rules, strategy_config = load_settings()
     mode = runtime_mode("paper", rules)
     interval = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
-    kill = KillSwitch(
-        stop_file=rules.get("kill_switch", {}).get("stop_file", "STOP_TRADING"),
-        env_var=rules.get("kill_switch", {}).get("env_var", "TRADING_ENABLED"),
-    )
+    # ROOT-anchored so the loop's stop-file check resolves the same path the CLI
+    # writes, whatever the CWD.
+    kill = _project_kill_switch(rules)
     completed = 0
     deadline = time.monotonic() + (hours * 60 * 60) if hours is not None else None
     print(f"Starting paper loop mode={mode}. Press Ctrl+C to stop.")
@@ -1902,10 +1927,9 @@ def submitted_true_count(logger: SQLiteLogger) -> int:
 def run_dry_loop(iterations: int) -> None:
     rules, strategy_config = load_settings()
     logger = SQLiteLogger(ROOT / "data" / "trading_agent.db")
-    kill = KillSwitch(
-        stop_file=rules.get("kill_switch", {}).get("stop_file", "STOP_TRADING"),
-        env_var=rules.get("kill_switch", {}).get("env_var", "TRADING_ENABLED"),
-    )
+    # ROOT-anchored so a STOP_TRADING created by the CLI halts this loop
+    # regardless of the CWD it was launched from.
+    kill = _project_kill_switch(rules)
     preview_start = decision_count(logger, "dry_run_order_preview")
     blocked_start = decision_count(logger, "dry_run_blocked")
     submitted_true_start = submitted_true_count(logger)
@@ -2034,6 +2058,12 @@ def build_parser() -> argparse.ArgumentParser:
     live_readiness_parser = sub.add_parser("live-readiness")
     live_readiness_parser.add_argument("--run-tests", action="store_true")
     live_readiness_parser.add_argument("--check-connection", action="store_true")
+    # The equities analog. It always runs the full suite -- an equities gate is
+    # only "proven" by tests that just ran, so there is no --run-tests flag to
+    # leave off. Read-only: it never touches the connector or a posture.
+    equity_readiness_parser = sub.add_parser("equity-live-readiness")
+    equity_readiness_parser.add_argument("--format", choices=["json", "markdown"], default="json")
+    equity_readiness_parser.add_argument("--output", default=None, help="write the report to this path instead of stdout")
     sub.add_parser("validate-symbols")
     sub.add_parser("collect-intelligence")
     sub.add_parser("intelligence-status")
@@ -2123,6 +2153,8 @@ def main(argv: list[str] | None = None) -> int:
             run_live_loop(args.hours, args.confirm_unattended_live)
     elif args.command == "live-readiness":
         print(json.dumps(live_launch_readiness(args.run_tests, args.check_connection), indent=2))
+    elif args.command == "equity-live-readiness":
+        equity_live_readiness_command(args.format, args.output)
     elif args.command == "validate-symbols":
         validate_symbols()
     elif args.command == "collect-intelligence":
