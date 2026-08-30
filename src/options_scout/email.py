@@ -219,10 +219,18 @@ def send_or_preview(
     message.attach(MIMEText("This is an HTML email; enable HTML to read the Options Scout report.", "plain", "utf-8"))
     message.attach(MIMEText(body, "html", "utf-8"))
 
-    factory = smtp_factory or (lambda: smtplib.SMTP(host, port, timeout=30))
-    server = factory()
+    # Port 465 uses implicit SSL (SMTP_SSL, no STARTTLS); 587 uses STARTTLS.
+    # Many networks block 587 while leaving 465 open, so 465 is the safer default.
+    use_ssl = port == 465
+    if smtp_factory is not None:
+        server = smtp_factory()
+    elif use_ssl:
+        server = smtplib.SMTP_SSL(host, port, timeout=30)
+    else:
+        server = smtplib.SMTP(host, port, timeout=30)
     try:
-        server.starttls()
+        if not use_ssl:
+            server.starttls()
         server.login(from_addr, password)
         server.sendmail(from_addr, [to_addr], message.as_string())
     finally:

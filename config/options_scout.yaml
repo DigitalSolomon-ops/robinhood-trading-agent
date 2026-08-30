@@ -102,4 +102,4 @@ email:
   from_addr: "digitalsolomon.com@gmail.com"
   to_addr: "digitalsolomon.com@gmail.com"
   smtp_host: "smtp.gmail.com"
-  smtp_port: 587
+  smtp_port: 465   # implicit SSL; 587/STARTTLS is blocked on many networks
