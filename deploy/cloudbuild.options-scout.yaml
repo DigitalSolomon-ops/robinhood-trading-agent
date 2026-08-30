@@ -1,0 +1,6 @@
+# Cloud Build config for the Options Scout image (non-default Dockerfile name).
+# Invoked by deploy/deploy-options-scout.sh with --substitutions=_IMAGE=...
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "Dockerfile.options-scout", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]

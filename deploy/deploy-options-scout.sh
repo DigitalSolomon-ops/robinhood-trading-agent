@@ -32,13 +32,9 @@ gcloud artifacts repositories describe "$REPO" --location="$REGION" --project="$
        --location="$REGION" --project="$PROJECT" --description="Daily scout jobs"
 
 echo "==> Build + push image (Cloud Build)"
-gcloud builds submit --project="$PROJECT" --tag "$IMAGE" \
-  --config=/dev/stdin . <<CFG
-steps:
-  - name: gcr.io/cloud-builders/docker
-    args: ["build","-f","Dockerfile.options-scout","-t","$IMAGE","."]
-images: ["$IMAGE"]
-CFG
+gcloud builds submit --project="$PROJECT" \
+  --config=deploy/cloudbuild.options-scout.yaml \
+  --substitutions=_IMAGE="$IMAGE" .
 
 echo "==> Runtime service account + secret access"
 gcloud iam service-accounts describe "$SA" --project="$PROJECT" >/dev/null 2>&1 \
