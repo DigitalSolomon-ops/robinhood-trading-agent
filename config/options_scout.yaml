@@ -1,0 +1,105 @@
+# Options Scout -- ANALYSIS ONLY.
+#
+# This routine reads public market data (Massive / formerly Polygon.io) and
+# composes a ranked email of CANDIDATE options plays. It NEVER trades, never
+# places, reviews, or cancels an order, and never touches a trading gate. Every
+# tunable lives here so nothing is hardcoded in the analyzer.
+#
+# The FREE Massive tier authorizes: underlying daily bars, indicators, news +
+# sentiment, grouped-daily breadth, and the options-contracts REFERENCE list.
+# It does NOT authorize option quotes, greeks, or IV -- so every price level
+# below is on the UNDERLYING, which the reader maps onto the listed contract.
+
+# Liquid, deeply-optionable names. Override freely.
+universe:
+  - AAPL
+  - MSFT
+  - NVDA
+  - AMZN
+  - GOOGL
+  - META
+  - TSLA
+  - SPY
+  - QQQ
+
+# How many ranked plays to email.
+top_n: 5
+
+# Trading-day horizon the setup is judged over (target-reach window) and the
+# minimum days-to-expiry used when picking a contract.
+horizon_days: 10
+
+# Below this many historical occurrences a backtested hit-rate is labelled
+# LOW-CONFIDENCE (too small a sample to lean on).
+min_occurrences: 10
+
+# History depth pulled per symbol for the backtest (calendar days ~= 2yr).
+history_days: 730
+
+# --- level math (on the underlying) -----------------------------------------
+levels:
+  # Realized-vol lookback (trading days) for the expected-move estimate.
+  vol_lookback: 20
+  # Expected move = last_close * daily_return_stdev * sqrt(horizon_days).
+  # The target (ceiling for a call / floor for a put) sits one expected move
+  # out. The stop sits stop_fraction of an expected move the other way.
+  stop_fraction: 0.6
+  # Entry zone half-width as a fraction of one ATR(14).
+  entry_band_atr_fraction: 0.25
+
+# --- conviction factor weights (must be > 0; normalized internally) ---------
+weights:
+  trend: 0.40      # EMA20 vs EMA50, and close vs SMA200
+  momentum: 0.30   # MACD histogram
+  rsi: 0.30        # RSI(14) posture around 50
+  # Context multipliers -- how much news sentiment and market breadth are
+  # allowed to nudge (never dominate) conviction. 0 disables the adjustment.
+  news_adjust: 0.15
+  regime_adjust: 0.15
+
+# --- indicator windows / thresholds -----------------------------------------
+indicators:
+  ema_fast: 20
+  ema_slow: 50
+  sma_long: 200
+  rsi_window: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  atr_window: 14
+  # A directional read weaker than this (|score| in 0..1) is treated as "no
+  # clean setup" and the symbol is dropped from the day's candidates.
+  min_abs_score: 0.15
+
+# --- backtest trigger --------------------------------------------------------
+backtest:
+  # Only count a fresh rising-edge trigger (setup became active that day) as a
+  # distinct occurrence, so overlapping days do not inflate the sample.
+  fresh_edge_only: true
+  # A day counts as a trigger when the historical directional score clears this.
+  trigger_min_abs_score: 0.15
+
+# --- news sentiment (reuses equity_intelligence.summarize_news) -------------
+news:
+  enabled: true
+  recency_hours: 72
+  max_articles: 20
+  negative_labels: ["negative"]
+  positive_labels: ["positive"]
+
+# --- market regime (reuses equity_intelligence.summarize_breadth) -----------
+regime:
+  enabled: true
+  min_close_price: 1.0
+
+# --- email -------------------------------------------------------------------
+email:
+  # Defaults to digitalsolomon.com@gmail.com when GMAIL_USER / OPTIONS_SCOUT_TO
+  # are unset. The app password is read env-first (GMAIL_APP_PASSWORD) then
+  # Secret Manager secret `gmail-app-password` -- never hardcoded here.
+  from_addr: "digitalsolomon.com@gmail.com"
+  to_addr: "digitalsolomon.com@gmail.com"
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 587

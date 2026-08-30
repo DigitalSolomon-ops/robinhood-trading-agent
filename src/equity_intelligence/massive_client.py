@@ -120,6 +120,23 @@ class Bar:
 
 
 @dataclass(frozen=True)
+class OptionContract:
+    """One row from the options-contracts REFERENCE endpoint.
+
+    This is reference metadata only -- ticker, strike, expiry, type. The free
+    tier does NOT authorize option quotes, greeks, or IV, so nothing here is a
+    price. The scout maps the level math it does on the UNDERLYING onto whichever
+    of these contracts sits nearest the target; it never prices the contract.
+    """
+
+    ticker: str  # e.g. O:AAPL260831C00205000
+    underlying_ticker: str
+    contract_type: str  # "call" | "put"
+    strike_price: float
+    expiration_date: str  # YYYY-MM-DD
+
+
+@dataclass(frozen=True)
 class NewsInsight:
     """Per-ticker sentiment attached to a news item."""
 
@@ -364,3 +381,51 @@ class MassiveClient:
                 )
             )
         return items
+
+    # --- options contracts REFERENCE (metadata only, no price/greeks/IV) ------
+
+    def get_option_contracts(
+        self,
+        underlying: str,
+        contract_type: str | None = None,
+        expiration_gte: str | None = None,
+        expiration_lte: str | None = None,
+        strike_gte: float | None = None,
+        strike_lte: float | None = None,
+        limit: int = 250,
+    ) -> list[OptionContract]:
+        """List listed option contracts for an underlying from the v3 reference
+        endpoint (GET /v3/reference/options/contracts).
+
+        Reference metadata ONLY -- returns ticker (O:...), strike_price,
+        expiration_date and contract_type. This endpoint IS authorized on the
+        free tier; option quotes/greeks/IV are NOT, so this client never fetches
+        those. Cached and rate-limit-aware like every other read here.
+        """
+        params: dict[str, Any] = {
+            "underlying_ticker": underlying,
+            "contract_type": contract_type,
+            "expiration_date.gte": expiration_gte,
+            "expiration_date.lte": expiration_lte,
+            "strike_price.gte": strike_gte,
+            "strike_price.lte": strike_lte,
+            "limit": limit,
+        }
+        payload = self._get("/v3/reference/options/contracts", params)
+        contracts: list[OptionContract] = []
+        for row in payload.get("results", []) or []:
+            if not isinstance(row, dict):
+                continue
+            strike = row.get("strike_price")
+            if strike is None:
+                continue
+            contracts.append(
+                OptionContract(
+                    ticker=str(row.get("ticker", "")),
+                    underlying_ticker=str(row.get("underlying_ticker", underlying)),
+                    contract_type=str(row.get("contract_type", "")),
+                    strike_price=float(strike),
+                    expiration_date=str(row.get("expiration_date", "")),
+                )
+            )
+        return contracts

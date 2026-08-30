@@ -2122,6 +2122,15 @@ def build_parser() -> argparse.ArgumentParser:
     live_single_parser.add_argument("side", choices=["buy", "sell"])
     live_single_parser.add_argument("amount_usd", type=float)
     live_single_parser.add_argument("--confirm-live", action="store_true")
+    # ANALYSIS-ONLY daily options screener. Reads market data and composes/sends
+    # a ranked email of CANDIDATE plays. It never trades -- no order path.
+    scout_parser = sub.add_parser(
+        "options-scout-email",
+        help="ANALYSIS ONLY: email a ranked list of candidate options plays (never trades).",
+    )
+    scout_parser.add_argument("--dry-run", action="store_true", help="compose and print the email; do not send")
+    scout_parser.add_argument("--top", type=int, default=None, help="how many ranked plays to include")
+    scout_parser.add_argument("--out", default=None, help="write the composed HTML to this path")
     return parser
 
 
@@ -2196,6 +2205,12 @@ def main(argv: list[str] | None = None) -> int:
         cancel_open_live_orders(args.confirm_cancel_live)
     elif args.command == "live-single-trade":
         live_single_trade(args.symbol.upper(), args.side, args.amount_usd, args.confirm_live)
+    elif args.command == "options-scout-email":
+        from src.options_scout import run_options_scout_email
+
+        result = run_options_scout_email(dry_run=args.dry_run, top_n=args.top, out_path=args.out)
+        if not args.dry_run:
+            print(result.detail)
     elif args.command == "run-paper":
         run_mode("paper", args.once)
     elif args.command == "run-paper-loop":

@@ -25,6 +25,7 @@ from .massive_client import (
     MassiveRateLimitError,
     NewsInsight,
     NewsItem,
+    OptionContract,
     resolve_massive_api_key,
 )
 from .news_sentiment import (
@@ -52,6 +53,7 @@ __all__ = [
     "MassiveRateLimitError",
     "NewsInsight",
     "NewsItem",
+    "OptionContract",
     "RegimeSnapshot",
     "RegimeVerdict",
     "SentimentFilterResult",
