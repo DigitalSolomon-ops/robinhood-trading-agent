@@ -88,7 +88,10 @@ class OrderManager:
             if not self.live_broker:
                 result = {**order, "submitted": False, "status": "dry_run_order_preview"}
             else:
-                result = self.live_broker.place_limit_order(order)
+                # Pass the mode through so a broker that happens to be armed
+                # cannot turn a preview run into a real order when this path is
+                # reached directly (bypassing the broker's forced_preview).
+                result = self.live_broker.place_limit_order(order, mode="live-dry-run")
             self.logger.log_order(result)
             self.logger.log_decision(signal.symbol, "dry_run_order_preview", signal.reason, result)
             return result
@@ -96,7 +99,7 @@ class OrderManager:
         if mode == "live":
             if not self.live_broker:
                 raise RuntimeError("Live broker is required for live mode")
-            result = self.live_broker.place_limit_order(order)
+            result = self.live_broker.place_limit_order(order, mode="live")
             self.logger.log_order(result)
             self.logger.increment_trade_count()
             self.logger.log_decision(signal.symbol, "live_order_submitted", signal.reason, result)

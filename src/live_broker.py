@@ -21,7 +21,12 @@ class LiveBroker:
     def get_portfolio(self) -> Portfolio:
         return Portfolio.from_robinhood(self.get_account_payload(), self.get_holdings_payload())
 
-    def place_limit_order(self, order: dict[str, Any]) -> dict[str, Any]:
+    def place_limit_order(self, order: dict[str, Any], mode: str | None = None) -> dict[str, Any]:
+        # `mode` is accepted for interface parity with the equities broker (so
+        # OrderManager can hand every broker the run mode uniformly). The crypto
+        # lane's live posture is unchanged: submission stays governed by this
+        # broker's own dry_run flag, exactly as before.
+        del mode
         order_config = {
             "asset_quantity": str(order["quantity"]),
             "limit_price": str(order["limit_price"]),

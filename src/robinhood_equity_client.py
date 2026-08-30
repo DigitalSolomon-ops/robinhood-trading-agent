@@ -222,7 +222,12 @@ class RobinhoodEquityClient:
         """
         target = self._assert_agent_account(account_number)
         payload = self._order_payload(target, symbol, side, quantity, order_type, limit_price, time_in_force)
-        if dry_run or not confirm_live_order:
+        # Identity, not truthiness: submit ONLY when dry_run is exactly False AND
+        # confirm_live_order is exactly True. A truthy non-boolean confirm
+        # ("yes") or a falsy non-boolean dry_run (0) must NOT arm the lane --
+        # `if dry_run or not confirm_live_order` would let (dry_run=0,
+        # confirm="yes") slip through to a live submit; this does not.
+        if not (dry_run is False and confirm_live_order is True):
             return {
                 "submitted": False,
                 "status": "dry_run_order_preview",
@@ -246,6 +251,7 @@ class RobinhoodEquityClient:
         confirm_live_order: bool = False,
     ) -> Any:
         target = self._assert_agent_account(account_number)
-        if dry_run or not confirm_live_order:
+        # Same identity gate as place_order: only exact booleans arm the cancel.
+        if not (dry_run is False and confirm_live_order is True):
             return {"id": order_id, "account_number": target, "status": "dry_run_cancel_prepared"}
         return self._connector.cancel_equity_order(order_id=order_id, account_number=target)

@@ -636,6 +636,35 @@ def test_an_armed_broker_still_previews_in_live_dry_run_mode(monkeypatch, tmp_pa
     assert broker.will_submit is True
 
 
+def test_process_signal_live_dry_run_cannot_submit_from_an_armed_broker(monkeypatch, tmp_path: Path) -> None:
+    """MUTATION TEST for fix #3: call OrderManager.process_signal(mode='live-dry-run')
+    DIRECTLY on an armed broker, bypassing submit_signal's forced_preview. The
+    only remaining brake is the mode passed into place_limit_order. If that
+    brake is reverted (place_limit_order ignores mode and honors will_submit),
+    the armed broker submits a REAL order and this fails on place_calls."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    connector = FakeConnector()
+    broker, order_manager, _, logger, _ = build_lane(tmp_path, connector, dry_run=False, confirm_live_order=True)
+
+    # The broker is genuinely armed -- forced_preview is NOT applied here.
+    assert broker.will_submit is True
+
+    result = order_manager.process_signal(
+        signal=signal(),
+        limit_price=100.0,
+        mode="live-dry-run",
+        portfolio=Portfolio(cash_usd=1000.0),
+        daily_summary={"realized_pnl": 0, "trade_count": 0},
+        has_api_credentials=True,
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "dry_run_order_preview"
+    assert connector.place_calls == []
+    # Arming is untouched: the mode brake, not a flag change, stopped it.
+    assert broker.will_submit is True
+
+
 # --- cancel mirrors the same gates -------------------------------------------
 
 

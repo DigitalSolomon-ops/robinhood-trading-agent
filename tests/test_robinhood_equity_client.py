@@ -281,6 +281,23 @@ def test_place_order_submits_only_when_dry_run_false_and_confirm_true():
     assert connector.place_calls[0]["account_number"] == AGENT_ACCOUNT["account_number"]
 
 
+def test_truthy_nonboolean_flags_do_not_arm_the_lane():
+    """MUTATION TEST: the gate is identity, not truthiness. A caller that passes
+    dry_run=0 (falsy, not False) and confirm_live_order='yes' (truthy, not True)
+    must NOT submit. The old `if dry_run or not confirm_live_order` guard would
+    evaluate `0 or not 'yes'` -> False and slip a LIVE order through; the
+    identity guard `dry_run is False and confirm_live_order is True` refuses it.
+    Reverting fix #2 makes connector.place_calls non-empty and fails here."""
+    connector = FakeConnector()
+    client = make_client(connector)
+
+    result = client.place_order(**order_kwargs(), dry_run=0, confirm_live_order="yes")
+
+    assert result["submitted"] is False
+    assert result["status"] == "dry_run_order_preview"
+    assert connector.place_calls == []
+
+
 def test_inverted_confirm_caller_still_cannot_submit():
     """A caller with an inverted-if bug (`if not confirm: place(...)`) must not
     be able to trick the client into submitting -- the gate is enforced inside

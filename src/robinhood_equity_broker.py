@@ -264,11 +264,19 @@ class RobinhoodEquityBroker:
 
     # --- orders ------------------------------------------------------------
 
-    def place_limit_order(self, order: dict[str, Any]) -> dict[str, Any]:
+    def place_limit_order(self, order: dict[str, Any], mode: str | None = None) -> dict[str, Any]:
         """Place an equity limit order. `order` is the OrderManager payload.
 
-        Identical in shape to AlpacaBroker.place_limit_order so OrderManager
-        drives this lane with no special-casing.
+        Kept shape-compatible with the crypto LiveBroker so OrderManager drives
+        this lane with no special-casing.
+
+        `mode` is the run mode OrderManager is in. It is a SECOND, independent
+        brake on top of the dry_run/confirm_live_order flags: a real order is
+        submitted only when the run is genuinely live (mode is "live" or
+        unspecified). Any non-live mode -- "live-dry-run" above all -- forces a
+        preview even on an armed broker, so reaching this method directly via
+        process_signal(mode="live-dry-run") (bypassing forced_preview) can
+        never place a real order.
         """
         symbol = self.assert_equity_symbol(order["symbol"])
         account_number = self.assert_agent_account(order.get("account_number"))
@@ -286,14 +294,19 @@ class RobinhoodEquityBroker:
             "time_in_force": self.time_in_force(order.get("time_in_force")),
         }
 
-        if not self.will_submit:
+        # A non-live mode forces a preview regardless of how the flags are set.
+        live_mode = mode is None or mode == "live"
+        if not (self.will_submit and live_mode):
+            human_gate = self.gate_reason()
+            if self.will_submit and not live_mode:
+                human_gate = f"forced preview: run mode is {mode!r}, not a genuine live run"
             return {
                 **order,
                 "submitted": False,
                 "status": "dry_run_order_preview",
                 "venue": VENUE,
                 "account_number": account_number,
-                "human_gate": self.gate_reason(),
+                "human_gate": human_gate,
                 "order_payload": order_payload,
             }
 

@@ -205,7 +205,9 @@ class FakeLiveBroker:
     def __init__(self) -> None:
         self.calls = 0
 
-    def place_limit_order(self, order: dict):
+    def place_limit_order(self, order: dict, mode: str | None = None):
+        # `mode` mirrors the real brokers' interface (OrderManager now hands the
+        # run mode to place_limit_order); this stub records the call regardless.
         self.calls += 1
         return {
             **order,
