@@ -19,8 +19,10 @@ from src.equity_runtime import (
     run_equity_cycle,
     run_equity_paper_loop,
 )
+from src.equity_market_data import EquityMarketDataService
 from src.logger import SQLiteLogger
 from src.paper_broker import PaperBroker
+from src.robinhood_equity_client import RobinhoodEquityClient
 
 AGENT_ACCOUNT = {
     "account_number": "RH-EQ-AGENTIC-2092",
@@ -219,3 +221,81 @@ def test_run_equity_cycle_skips_with_readable_rationale_when_quote_is_missing(mo
     audit = logger.recent_audit_rows(limit=50)
     msft_rows = [row for row in audit["decisions"] if row["symbol"] == "MSFT"]
     assert any("no quote available" in row["reason"] for row in msft_rows)
+
+
+def test_a_halted_symbol_is_skipped_with_a_rationale_and_never_priced(monkeypatch, tmp_path: Path) -> None:
+    """A halted/delisted quote must be dropped before the trade path, with an
+    audit rationale -- this is the formerly-dead validate_equity_symbols
+    _quote_is_active gate now running on live quotes. Reverting the gate (so a
+    halted-but-priced symbol is priced and evaluated like any other) removes the
+    equity_symbol_unavailable rationale and fails this test."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    write_config(tmp_path, universe=["AAPL", "HALT"])
+
+    class HaltedSymbolConnector(FakeConnector):
+        def get_equity_quotes(self, symbols):
+            quotes = []
+            for symbol in symbols:
+                if symbol == "HALT":
+                    # A positive price AND an inactive state: only the state
+                    # check keeps it out of the trade path.
+                    quotes.append({"symbol": "HALT", "price": "42.00", "state": "halted"})
+                    continue
+                series = self.prices_by_symbol[symbol]
+                index = min(self._index[symbol], len(series) - 1)
+                self._index[symbol] += 1
+                quotes.append({"symbol": symbol, "price": str(series[index])})
+            return {"quotes": quotes}
+
+    connector = HaltedSymbolConnector({"AAPL": uptrend_prices(5), "HALT": [42.0] * 5})
+
+    result = run_equity_cycle(connector, tmp_path)
+
+    assert result["halted"] is False
+    logger = SQLiteLogger(tmp_path / "data" / "trading_agent.db")
+    audit = logger.recent_audit_rows(limit=50)
+    halt_rows = [row for row in audit["decisions"] if row["symbol"] == "HALT"]
+    assert any(row["action"] == "equity_symbol_unavailable" for row in halt_rows), (
+        "a halted symbol must write a skip rationale, not be priced silently"
+    )
+    # It never reached the market-data ledger, so the strategy never saw it.
+    market_db = tmp_path / "data" / "equity_market_data.db"
+    if market_db.exists():
+        history = EquityMarketDataService(
+            RobinhoodEquityClient(connector), market_db
+        ).history_count("HALT")
+        assert history == 0, "a halted symbol's price must never be saved"
+    assert connector.place_calls == []
+
+
+def test_a_midcycle_kill_switch_trip_logs_the_remaining_symbols(monkeypatch, tmp_path: Path) -> None:
+    """A kill-switch trip AFTER the pre-loop check must not leave the rest of the
+    universe silently unevaluated. Reverting the per-symbol loop to a bare
+    `continue` (no logged decision) removes the equity_halted rationale and
+    fails this test."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    write_config(tmp_path, universe=["AAPL", "MSFT"])
+    stop_path = tmp_path / "STOP_TRADING_EQUITIES"
+
+    class StopMidCycleConnector(FakeConnector):
+        def get_equity_quotes(self, symbols):
+            payload = super().get_equity_quotes(symbols)
+            # The pre-loop halt check has already passed; drop the stop file now
+            # so the per-symbol loop sees the switch tripped mid-cycle.
+            stop_path.write_text("stop", encoding="utf-8")
+            return payload
+
+    connector = StopMidCycleConnector({"AAPL": uptrend_prices(5), "MSFT": uptrend_prices(5)})
+
+    result = run_equity_cycle(connector, tmp_path)
+
+    # The pre-loop check was clean, so the cycle did not report a top-level halt;
+    # the trip happened inside the loop and must be its own logged decision.
+    assert result["halted"] is False
+    logger = SQLiteLogger(tmp_path / "data" / "trading_agent.db")
+    audit = logger.recent_audit_rows(limit=50)
+    halted = [row for row in audit["decisions"] if row["action"] == "equity_halted"]
+    assert halted, "a mid-cycle kill-switch trip must write a rationale"
+    assert "not evaluated" in halted[-1]["reason"]
+    assert "STOP_TRADING_EQUITIES" in halted[-1]["reason"]
+    assert connector.place_calls == []

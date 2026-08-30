@@ -892,9 +892,13 @@ def test_git_hygiene_fails_when_a_database_is_tracked(tree: Path) -> None:
 
 
 def test_git_hygiene_fails_when_a_runtime_artifact_is_not_ignored(tree: Path) -> None:
-    """Drop the logs/ rule: the audit exports become stageable by `git add -A`."""
+    """Drop the logs/ rule: the audit exports become stageable by `git add -A`.
+    The weakened .gitignore is COMMITTED, because the gate reads HEAD -- an
+    uncommitted weakening trips the separate porcelain guard first."""
     remaining = [line for line in FIXTURE_GITIGNORE.splitlines() if line != "logs/"]
     (tree / ".gitignore").write_text("\n".join(remaining) + "\n", encoding="utf-8")
+    git(tree, "add", ".gitignore")
+    git(tree, "commit", "-qm", "weaken ignore rules")
 
     evidence = git_hygiene_evidence(tree, RULES)
 
@@ -907,12 +911,79 @@ def test_git_hygiene_fails_when_an_ignore_rule_is_too_wide(tree: Path) -> None:
     """The opposite failure: an ignore rule so broad it swallows the documented
     placeholder file. Silently un-committing .env.example is a defect too."""
     (tree / ".gitignore").write_text(FIXTURE_GITIGNORE + "\n.env*\n", encoding="utf-8")
+    git(tree, "add", ".gitignore")
+    git(tree, "commit", "-qm", "over-broad ignore rule")
 
     evidence = git_hygiene_evidence(tree, RULES)
 
     assert not evidence.passed
     assert ".env.example" in evidence.data["over_ignored_committed_paths"]
     assert "must stay committed" in evidence.detail
+
+
+# A weak, HEAD-like .gitignore from before the hardening: it ignores .env, logs
+# and the database itself, but NOT the SQLite sidecars or the extra sqlite
+# extensions. Committing this is exactly the regression the hardening prevents.
+WEAK_GITIGNORE = """.env
+.env.*
+!.env.example
+logs/
+data/*.db
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+"""
+
+
+def test_git_hygiene_fails_when_the_gitignore_edit_is_not_committed(tree: Path) -> None:
+    """The porcelain guard itself: a working-copy edit that is not committed is
+    not protection, because a clone and CI read HEAD, not the operator's disk.
+    Reverting the HEAD/porcelain check lets an uncommitted .gitignore pass."""
+    # A perfectly correct edit -- but left uncommitted.
+    (tree / ".gitignore").write_text(FIXTURE_GITIGNORE + "\ndata/extra/\n", encoding="utf-8")
+
+    evidence = git_hygiene_evidence(tree, RULES)
+
+    assert not evidence.passed
+    assert "uncommitted changes" in evidence.detail
+    assert evidence.data["porcelain"]
+
+
+def test_git_hygiene_fails_when_gitignore_is_reverted_to_a_weak_head_version(tree: Path) -> None:
+    """Revert the committed .gitignore to the weak, pre-hardening HEAD shape and
+    the gate must FAIL: the SQLite sidecars become stageable by `git add -A`
+    again. This is the mutation test for the hardened ignore rules -- undo them
+    at HEAD and this test goes red."""
+    (tree / ".gitignore").write_text(WEAK_GITIGNORE, encoding="utf-8")
+    git(tree, "add", ".gitignore")
+    git(tree, "commit", "-qm", "revert to weak ignore rules")
+
+    evidence = git_hygiene_evidence(tree, RULES)
+
+    assert not evidence.passed
+    unignored = evidence.data["unignored_runtime_artifacts"]
+    assert "data/trading_agent.db-journal" in unignored
+    assert "data/trading_agent.db-wal" in unignored
+    assert "data/trading_agent.db-shm" in unignored
+
+
+def test_committed_gitignore_is_a_superset_of_the_required_rules() -> None:
+    """The real repo's COMMITTED .gitignore (HEAD, not the working copy) must
+    contain every rule the fixture pins as required. A hardening that only lands
+    in the working copy, or that drops one of the required rules, fails here."""
+    head = subprocess.run(
+        ["git", "show", "HEAD:.gitignore"],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert head.returncode == 0, ".gitignore must be committed at HEAD"
+    committed = {line.strip() for line in head.stdout.splitlines() if line.strip()}
+    required = {line.strip() for line in FIXTURE_GITIGNORE.splitlines() if line.strip()}
+    missing = required - committed
+    assert not missing, f"committed .gitignore is missing required rules: {sorted(missing)}"
 
 
 @pytest.mark.parametrize("sidecar", ["-journal", "-wal", "-shm"])

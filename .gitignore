@@ -21,3 +21,11 @@ __pycache__/
 # ds-build-agent handoff artifacts (in-place build)
 BLOCKERS.md
 GHL-SETUP.md
+
+# The equities lane's operator halt marker -- an operator drops this file to
+# stop the equities lane. It is transient operational state, not source, so it
+# must never ride into git via `git add -A`. (The crypto lane's STOP_TRADING is
+# the opposite case: it is a COMMITTED disarm marker that must reach every
+# clone, so it is deliberately NOT ignored -- git_hygiene's _MUST_NOT_BE_IGNORED
+# pins that.)
+STOP_TRADING_EQUITIES

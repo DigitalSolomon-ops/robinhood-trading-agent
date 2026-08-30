@@ -98,7 +98,7 @@ def run_equity_cycle(connector: EquityConnector, root: Path, logger: SQLiteLogge
     symbols = effective_rules["trading"]["allowed_symbols"]
 
     try:
-        prices = market_data.get_latest_prices(symbols)
+        prices = market_data.get_latest_prices(symbols, logger=logger)
         logger.log_decision(
             None,
             "equity_market_data_loaded",
@@ -111,9 +111,22 @@ def run_equity_cycle(connector: EquityConnector, root: Path, logger: SQLiteLogge
         logger.log_decision(None, "equity_market_data_failed", str(exc), {"venue": VENUE})
 
     results: dict[str, Any] = {}
-    for symbol in symbols:
-        if kill.halt_reasons():
-            continue
+    for position, symbol in enumerate(symbols):
+        halt_reasons = kill.halt_reasons()
+        if halt_reasons:
+            # A kill-switch trip between the pre-loop check and here (or partway
+            # through the loop) must not leave the remaining symbols silently
+            # unevaluated: 'every decision writes a rationale' means the halt is
+            # itself a logged decision naming what it stopped.
+            remaining = symbols[position:]
+            logger.log_decision(
+                None,
+                "equity_halted",
+                f"kill switch tripped mid-cycle ({'; '.join(halt_reasons)}); "
+                f"{len(remaining)} symbol(s) not evaluated: {', '.join(remaining)}",
+                {"venue": VENUE, "remaining_symbols": remaining},
+            )
+            break
         price = prices.get(symbol)
         if price is None:
             logger.log_decision(

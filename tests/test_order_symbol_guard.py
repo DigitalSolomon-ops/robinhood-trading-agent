@@ -84,7 +84,7 @@ KNOWN_TICKERS = frozenset(
     CAT UNP LOW SPGI IBM GE BA HON RTX QCOM NOW AMAT BKNG SBUX GS ELV DE
     BLK MDT ADP PLD LMT SYK TJX MMC CVS MO ISRG REGN VRTX ZTS CI SO PANW
     MU LRCX ADI KLAC SNPS CDNS ORCL CRWD SHOP UBER ABNB PYPL SQ COIN PLTR
-    SOFI RIVN LCID NIO F GM DAL UAL AAL CCL NCLH MARA RIOT HOOD SNAP PINS
+    SOFI RIVN LCID NIO F GM DAL UAL AAL CCL NCLH MARA RIOT HOOD SNAP PINS RBLX
     ROKU DKNG CVNA GME AMC BBBY NOK BB SPCE TLRY
     SPY QQQ IWM DIA VOO VTI VEA VWO AGG BND TLT IEF GLD SLV USO XLF XLE
     XLK XLV XLY XLP XLI XLU XLB XLRE SMH SOXL TQQQ SQQQ ARKK VIX UVXY
@@ -104,11 +104,35 @@ NON_TICKER_WORDS = frozenset(
     USD UTC VALUE WHERE WILL WITH YES ALL API CLI IAP ROOT ID GMT DELETE
     TRACE HTTP HTTPS USER PASS NAME TYPE SIDE QTY OPTS ARGS SELF NONE INIT
     MAIN TEST DEBUG INFO WARN
+    SELECT INSERT UPDATE VALUES CREATE EXISTS TABLE INDEX
+    PASSED FAILED ABSENT CRYPTO A-Z
     """.split()
 )
 
-_TICKER_SHAPE = re.compile(r"^[A-Z]{1,5}$")
+# Tier-2 shape, widened to the broker's own character grammar
+# (robinhood_equity_broker.py:_EQUITY_SYMBOL is `^[A-Za-z][A-Za-z.\-]{0,5}$`):
+# the old `^[A-Z]{1,5}$` missed a SIX-letter symbol ('GEVITY') and a
+# class-share dot ('BRK.B') purely on length and punctuation. The shape tier
+# stays anchored to UPPER-case, though -- a bare, context-free lowercase token
+# ('rblx' but also 'must', 'both', 'agent') cannot be told apart from English
+# prose by shape alone, so lowercase tickers are caught by the case-insensitive
+# tier-1 vocabulary below (where 'rblx' now lives), never by a shape guess that
+# would flag every short word in the tree.
+_TICKER_SHAPE = re.compile(r"^[A-Z][A-Z.\-]{0,5}$")
 _CONFIG_TICKER_SHAPE = re.compile(r"^[A-Za-z][A-Za-z.\-]{0,5}$")
+
+# Punctuation a ticker carries that its vocabulary entry does not: BRK.B and
+# BRK-B both normalize to the curated 'BRKB'. Stripped, and the token
+# upper-cased, before a tier-1 lookup -- that is what makes tier 1
+# case-insensitive: 'brk.b', 'BRK-B' and 'rblx' all resolve to a vocabulary key.
+_TICKER_PUNCT = re.compile(r"[.\-/]")
+
+
+def _vocab_key(token: str) -> str:
+    """A token normalized for a tier-1 vocabulary lookup: punctuation stripped
+    and upper-cased, so 'brk.b' and 'BRK-B' both resolve to 'BRKB' and 'rblx'
+    resolves to 'RBLX'."""
+    return _TICKER_PUNCT.sub("", token).upper()
 
 
 # --- findings ---------------------------------------------------------------
@@ -221,12 +245,53 @@ def has_filename_hint(relative_path: str) -> bool:
     return any(FILENAME_HINTS.search(token) for token in tokens if token)
 
 
+def _fold_concat(node: ast.AST) -> str | None:
+    """The folded value of a constant string concatenation, or None.
+
+    `"place_equity" + "_order"` is a single tool name split across two
+    literals so that no `\\bplace_equity_order\\b` appears in the raw source --
+    folding the `+` recovers it. Handles arbitrarily nested `+` of literals.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _fold_concat(node.left)
+        right = _fold_concat(node.right)
+        if left is not None and right is not None:
+            return left + right
+    return None
+
+
 def _string_constants(node: ast.AST) -> list[str]:
-    return [
+    """Every string literal in a subtree, plus the folded value of any
+    constant string concatenation, so a tool name assembled from `+`-joined
+    fragments is seen as the whole name it forms."""
+    values = [
         child.value
         for child in ast.walk(node)
         if isinstance(child, ast.Constant) and isinstance(child.value, str)
     ]
+    for child in ast.walk(node):
+        if isinstance(child, ast.BinOp) and isinstance(child.op, ast.Add):
+            folded = _fold_concat(child)
+            if folded is not None:
+                values.append(folded)
+    return values
+
+
+# A thin dispatch wrapper: a module that routes a call through one of these is
+# executing SOMETHING against the connector, so it is scanned even when it
+# never spells an order-tool name and carries no equity filename hint.
+_WRAPPER_METHODS = frozenset({"_call", "_invoke", "dispatch"})
+
+
+def invokes_generic_wrapper(tree: ast.AST) -> bool:
+    """True if the module calls a generic `_call`/`_invoke`/`dispatch` method."""
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in _WRAPPER_METHODS:
+                return True
+    return False
 
 
 def _referenced_names(tree: ast.AST) -> set[str]:
@@ -318,6 +383,7 @@ def discover_execution_modules(root: Path) -> tuple[dict[str, ast.Module], set[s
             if _referenced_names(tree) & tainted:
                 in_scope.add(relative)
     in_scope |= {relative for relative in sources if has_filename_hint(relative)}
+    in_scope |= {relative for relative, tree in parsed.items() if invokes_generic_wrapper(tree)}
     in_scope &= set(parsed)
 
     return parsed, in_scope, direct | (unparsable & direct)
@@ -358,7 +424,7 @@ def hardcoded_symbols(
             token = part.strip("\"'`()[]{}").rstrip(".")
             if not token:
                 continue
-            if token.upper() in vocabulary:
+            if _CONFIG_TICKER_SHAPE.match(token) and _vocab_key(token) in vocabulary:
                 violations.append(Violation(module, token, node.lineno, "known ticker"))
             elif _TICKER_SHAPE.match(token) and token.upper() not in NON_TICKER_WORDS:
                 violations.append(Violation(module, token, node.lineno, "ticker-shaped literal"))
@@ -453,6 +519,35 @@ def universe():
     return DEFAULT_UNIVERSE
 '''
 
+# The three shapes a real ticker used to slip past `^[A-Z]{1,5}$`: a lowercase
+# spelling, a six-letter symbol, and a class-share dot.
+EVASIVE_TICKER_SHAPES = '''
+def submit(connector):
+    connector.place_equity_order(symbol="rblx")
+    connector.place_equity_order(symbol="GEVITY")
+    connector.place_equity_order(symbol="BRK.B")
+'''
+
+# A tool name split across two literals so `\\bplace_equity_order\\b` never
+# appears in the raw source; the module dispatches through a plain method (not a
+# wrapper) and its filename carries no equity hint, so ONLY constant folding of
+# the `+` can taint it and pull it into scope.
+SPLIT_LITERAL_TOOL_NAME = '''
+ORDER = "place_equity" + "_order"
+
+
+def submit(connector):
+    return connector.route(ORDER, {"symbol": "brk.b", "quantity": 1})
+'''
+
+# A module that never names an order tool, is not tainted, and has no equity
+# filename hint -- it is in scope solely because it routes through a generic
+# `_call` wrapper.
+GENERIC_WRAPPER_INVOCATION = '''
+def submit(connector, tool):
+    return connector._call(tool, {"symbol": "GEVITY", "quantity": 1})
+'''
+
 # A correct module: the symbol arrives as an argument, never as a literal.
 CLEAN_EXECUTION_MODULE = '''
 """Places equity orders for AAPL-style tickers -- docstrings are not orders."""
@@ -527,6 +622,37 @@ def test_case_insensitive_detection_covers_both_cases(tmp_path: Path) -> None:
     )
 
     assert {violation.module for violation in report.violations} == {"upper.py", "lower.py"}
+
+
+def test_evasive_ticker_shapes_are_flagged(tmp_path: Path) -> None:
+    """The three shapes that evaded `^[A-Z]{1,5}$`: a lowercase ticker, a
+    six-letter ticker, and a class-share dot. BRK.B normalizes to the curated
+    'BRKB' (tier 1); 'rblx' and 'GEVITY' are caught by the broker-grammar shape
+    (tier 2). Reverting the matcher to the all-caps 1-5 form fails this."""
+    report = scan_tree(write_tree(tmp_path, {"equity_exec.py": EVASIVE_TICKER_SHAPES}))
+
+    assert "equity_exec.py" in report.scanned
+    assert report.symbols() == {"RBLX", "GEVITY", "BRK.B"}
+
+
+def test_a_split_literal_tool_name_taints_the_module(tmp_path: Path) -> None:
+    """`"place_equity" + "_order"` forms an order-tool name no substring search
+    sees. Only folding the concatenation taints ORDER and pulls this module --
+    which dispatches through a plain `.route`, not a wrapper -- into scope."""
+    report = scan_tree(write_tree(tmp_path, {"router_x.py": SPLIT_LITERAL_TOOL_NAME}))
+
+    assert "router_x.py" in report.scanned
+    assert report.symbols() == {"BRK.B"}
+
+
+def test_a_generic_call_wrapper_pulls_a_module_into_scope(tmp_path: Path) -> None:
+    """No order-tool name, no taint, no filename hint -- in scope solely because
+    it routes a call through a generic `_call` wrapper. Reverting the wrapper
+    rule drops it from the scan and 'GEVITY' goes unflagged."""
+    report = scan_tree(write_tree(tmp_path, {"generic.py": GENERIC_WRAPPER_INVOCATION}))
+
+    assert "generic.py" in report.scanned
+    assert report.symbols() == {"GEVITY"}
 
 
 def test_config_listed_equity_symbols_extend_the_vocabulary(tmp_path: Path) -> None:

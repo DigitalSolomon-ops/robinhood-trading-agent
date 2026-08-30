@@ -763,6 +763,22 @@ def git_hygiene_evidence(root: Path, rules: dict[str, Any]) -> Evidence:
     if not (root / ".git").exists():
         return Evidence(False, "no .git directory; git hygiene cannot be verified from this tree")
 
+    # The protection lives at HEAD, not in the working copy: a clone and CI read
+    # `git show HEAD:.gitignore`, never the file an operator edited but did not
+    # commit. So the gate reads HEAD's .gitignore, and fails if the working
+    # .gitignore has any uncommitted change -- an edit that is not committed is
+    # not protection, even if it looks right on disk right now.
+    head_gitignore = _git(root, "show", "HEAD:.gitignore")
+    if head_gitignore.returncode != 0:
+        return Evidence(False, ".gitignore is not committed at HEAD; the ignore rules a clone would read do not exist")
+    dirty = _git(root, "status", "--porcelain", ".gitignore")
+    if dirty.stdout.strip():
+        return Evidence(
+            False,
+            ".gitignore has uncommitted changes; a working-copy edit does not protect a clone -- commit it to HEAD",
+            {"porcelain": dirty.stdout.strip()},
+        )
+
     tracked = tracked_files(root)
     if not tracked:
         return Evidence(False, "`git ls-files` returned nothing; the hygiene check could not be trusted")
