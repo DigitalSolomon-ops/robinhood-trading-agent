@@ -87,7 +87,7 @@ The designated account is nickname "Agentic", ending 2092.
 """
 
 
-def log_decision(db: Path, action: str, details: dict) -> None:
+def log_decision(db: Path, action: str, details: dict, symbol: str | None = None, reason: str = "fixture") -> None:
     with sqlite3.connect(db) as conn:
         conn.execute(
             """
@@ -100,12 +100,32 @@ def log_decision(db: Path, action: str, details: dict) -> None:
         )
         conn.execute(
             "INSERT INTO decisions(timestamp, symbol, action, reason, details) VALUES(?, ?, ?, ?, ?)",
-            ("2026-08-29T00:00:00+00:00", None, action, "fixture", json.dumps(details)),
+            ("2026-08-29T00:00:00+00:00", symbol, action, reason, json.dumps(details)),
         )
 
 
-def clean_paper_run(db: Path, iterations: int = 12) -> None:
-    """One unattended bounded loop that finished, then a clean reconcile."""
+# The rationale a real fill carries -- the strategy conditions that fired, the
+# same shape run_equity_cycle logs. A counted run must show a real one.
+FILL_RATIONALE = "ema20_above_ema50+rsi_between_35_and_70+momentum_5_positive"
+
+
+def paper_fill(db: Path, symbol: str = "AAPL", notional: float = 100.0) -> None:
+    """A single simulated paper fill, with the non-empty rationale a genuine
+    decision carries and a notional that moves the ledger."""
+    log_decision(
+        db,
+        "paper_order_filled",
+        {"symbol": symbol, "side": "buy", "quantity": notional / 100.0, "price": 100.0, "notional": notional},
+        symbol=symbol,
+        reason=FILL_RATIONALE,
+    )
+
+
+def clean_paper_run(db: Path, iterations: int = 12, symbol: str = "AAPL", fills: int = 3) -> None:
+    """One GENUINE unattended bounded loop: real fills, the loop that finished,
+    then a clean reconcile. A run with no fills is not a clean run."""
+    for _ in range(fills):
+        paper_fill(db, symbol=symbol)
     log_decision(db, "equity_paper_loop_completed", {"iterations_completed": iterations})
     log_decision(db, "equity_paper_reconcile", {"adjusted": [], "errors": []})
 
@@ -425,6 +445,9 @@ def test_a_run_whose_reconcile_reported_errors_is_not_clean(tmp_path: Path) -> N
     (tmp_path / "data").mkdir()
     database = tmp_path / "data" / "trading_agent.db"
     clean_paper_run(database)
+    # A second run that DID trade, so the only thing keeping it from clean is
+    # that its reconcile reported errors -- isolates the errors path.
+    paper_fill(database, symbol="MSFT")
     log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 12})
     log_decision(database, "equity_paper_reconcile", {"adjusted": ["AAA"], "errors": ["negative position"]})
 
@@ -438,6 +461,9 @@ def test_a_completed_run_with_no_reconcile_after_it_is_not_clean(tmp_path: Path)
     (tmp_path / "data").mkdir()
     database = tmp_path / "data" / "trading_agent.db"
     clean_paper_run(database)
+    # A second run that traded but has no reconcile -- isolates the missing
+    # reconcile as the sole reason it is not clean.
+    paper_fill(database, symbol="MSFT")
     log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 12})
 
     runs = paper_proving_runs(tmp_path)
@@ -446,18 +472,69 @@ def test_a_completed_run_with_no_reconcile_after_it_is_not_clean(tmp_path: Path)
     assert runs[-1]["clean"] is False
 
 
-def test_a_reconcile_is_paired_with_the_run_it_followed(tmp_path: Path) -> None:
-    """A single reconcile cannot vouch for two runs -- pairing is by order."""
+def test_a_zero_trade_run_is_not_clean(tmp_path: Path) -> None:
+    """A loop that filled nothing and reconciled clean must NOT count -- it
+    proves the loop can idle, not that the lane can trade and reconcile. This
+    is the tautology the old evidence let through."""
     (tmp_path / "data").mkdir()
     database = tmp_path / "data" / "trading_agent.db"
-    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 5})
-    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 5})
+    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 80})
     log_decision(database, "equity_paper_reconcile", {"adjusted": [], "errors": []})
 
     runs = paper_proving_runs(tmp_path)
 
-    assert [run["clean"] for run in runs] == [True, True]
-    assert runs[0]["reconcile_at"] == runs[1]["reconcile_at"]
+    assert runs[-1]["reconciled"] is True
+    assert runs[-1]["reconcile_errors"] == []
+    assert runs[-1]["fills"] == 0
+    assert runs[-1]["clean"] is False
+    assert paper_runs_evidence(tmp_path, RULES).passed is False
+
+
+def test_a_run_preceded_by_a_manual_counter_reset_is_not_independent(tmp_path: Path) -> None:
+    """A manual state mutation inside a run's window -- the daily-counter reset
+    this repo's own run 3 needed to be able to trade again -- means the run was
+    not left unattended, so it cannot count however clean the reconcile looks."""
+    (tmp_path / "data").mkdir()
+    database = tmp_path / "data" / "trading_agent.db"
+    clean_paper_run(database)  # a genuine first run
+    # Second run: someone resets the daily counter, THEN it trades and reconciles.
+    log_decision(database, "equity_paper_run2_daily_counter_reset", {"before": {"trade_count": 5}, "after": {"trade_count": 0}})
+    paper_fill(database, symbol="MSFT")
+    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 80})
+    log_decision(database, "equity_paper_reconcile", {"adjusted": [], "errors": []})
+
+    runs = paper_proving_runs(tmp_path)
+
+    assert runs[1]["fills"] >= 1
+    assert runs[1]["reconcile_errors"] == []
+    assert runs[1]["manual_mutation_in_window"] is True
+    assert runs[1]["clean"] is False
+    # Only the first, genuinely unattended run stands.
+    assert [run["clean"] for run in runs] == [True, False]
+
+
+def test_a_single_reconcile_cannot_vouch_for_two_runs(tmp_path: Path) -> None:
+    """The reconcile is matched to the run in whose window it falls, and is
+    consumed at most once. A first run that traded and reconciled is clean; a
+    second run with a real fill but NO reconcile of its own is not."""
+    (tmp_path / "data").mkdir()
+    database = tmp_path / "data" / "trading_agent.db"
+    # Run 1: fill, loop, reconcile.
+    paper_fill(database, symbol="AAPL")
+    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 5})
+    log_decision(database, "equity_paper_reconcile", {"adjusted": [], "errors": []})
+    # Run 2: fill, loop -- but no reconcile follows it.
+    paper_fill(database, symbol="MSFT")
+    log_decision(database, "equity_paper_loop_completed", {"iterations_completed": 5})
+
+    runs = paper_proving_runs(tmp_path)
+
+    assert [run["clean"] for run in runs] == [True, False]
+    assert runs[0]["reconciled"] is True
+    assert runs[1]["reconciled"] is False
+    # The one reconcile belongs to run 1 only -- run 2 never borrows it.
+    assert runs[0]["reconcile_at"] is not None
+    assert runs[1]["reconcile_at"] is None
 
 
 def test_no_audit_database_means_no_proven_runs(tmp_path: Path) -> None:
@@ -465,12 +542,54 @@ def test_no_audit_database_means_no_proven_runs(tmp_path: Path) -> None:
     assert paper_runs_evidence(tmp_path, RULES).passed is False
 
 
-def test_the_repos_own_audit_log_records_two_clean_runs() -> None:
-    """Pinned against the real audit log: the lane really did run twice."""
+@pytest.mark.skipif(
+    not (REPO_ROOT / "data" / "trading_agent.db").exists(),
+    reason="the machine-local runtime audit db is absent (a fresh checkout); nothing to pin against",
+)
+def test_the_repos_own_audit_log_is_counted_honestly() -> None:
+    """Pinned against the real audit log, counted the GENUINE way.
+
+    Making the paper-proving evidence real turns up what the tautological count
+    hid: the recorded runs do NOT amount to two clean unattended runs. Run 1 is
+    genuine (real fills, a clean reconcile of its own). Run 2 filled nothing --
+    the daily cap was already spent, so 'clean' there only ever meant 'the loop
+    idled'. Run 3 traded only after a manual daily-counter reset landed in its
+    window, so it was not left unattended. Exactly ONE genuine clean run stands.
+
+    This asserts the honest count -- and that each rejected run is rejected for
+    a real reason, and the one counted run carries a real fill, a real
+    rationale and its own distinct reconcile -- rather than pinning a number
+    that was never true. A second genuine unattended run (a separate trading
+    day, no manual reset) is owed before this gate can pass for real.
+    """
+    runs = paper_proving_runs(REPO_ROOT)
+    clean = [run for run in runs if run["clean"]]
     evidence = paper_runs_evidence(REPO_ROOT, {})
 
-    assert evidence.passed is True, evidence.detail
-    assert evidence.data["clean_run_count"] >= REQUIRED_CLEAN_PAPER_RUNS
+    # Genuine counting: exactly one clean run, so the gate is honestly NOT met.
+    assert evidence.passed is False, evidence.detail
+    assert evidence.data["clean_run_count"] == 1
+    assert len(clean) == 1
+
+    # The one counted run is real: a fill that moved the ledger, and its own
+    # reconcile with no errors -- not a tautological count.
+    the_run = clean[0]
+    assert the_run["fills"] >= 1
+    assert the_run["ledger_delta"] > 0
+    assert the_run["reconciled"] is True
+    assert the_run["reconcile_errors"] == []
+
+    # ...and a real, non-empty rationale on the fills that make it up.
+    with sqlite3.connect(REPO_ROOT / "data" / "trading_agent.db") as conn:
+        reasons = [
+            row[0]
+            for row in conn.execute("SELECT reason FROM decisions WHERE action = 'paper_order_filled'").fetchall()
+        ]
+    assert reasons and all(reason and reason.strip() for reason in reasons)
+
+    # The rejected runs are rejected for the right, distinct reasons.
+    assert any(run["fills"] == 0 and not run["clean"] for run in runs), "the zero-trade run must be rejected"
+    assert any(run["manual_mutation_in_window"] and not run["clean"] for run in runs), "the reset-tainted run must be rejected"
 
 
 # --- the agentic-account and crypto-lane checks -----------------------------
@@ -666,6 +785,20 @@ def test_the_verdict_is_written_to_the_audit_log(tree: Path) -> None:
     assert "ready=True" in reason
     assert details["venue"] == "robinhood_equities"
     assert set(details["gates"]) == {gate.key for gate in GATES}
+
+
+def test_the_posture_states_the_paper_quote_source_honestly(tree: Path) -> None:
+    """The proving runs read a synthetic feed, not live quotes (the recorded
+    run-1 candles are exactly uptrend_prices()). The posture must say so, and
+    must not claim 'real' quotes. Reverting the string to the old
+    'real read-only quotes' claim fails this test -- that is the point."""
+    report = report_for(tree)
+    paper = report["posture"]["paper_broker"].lower()
+
+    assert report["posture"]["quote_source"] == "synthetic"
+    assert "synthetic" in paper
+    assert "real read-only quotes" not in paper
+    assert "against real" not in paper
 
 
 def test_the_report_does_not_change_any_posture(tree: Path) -> None:

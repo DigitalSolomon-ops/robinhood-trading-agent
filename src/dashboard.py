@@ -816,8 +816,9 @@ def recent_equity_decisions(root: Path, limit: int = 25) -> list[dict[str, Any]]
 
 def equities_positions(root: Path) -> dict[str, Any]:
     """The equities paper broker's own ledger -- the lane's only fill source
-    for this build (paper_broker simulating fills against real read-only
-    quotes; see docs/rh-equities-binding.md). This dashboard process holds no
+    for this build (paper_broker simulating fills against a deterministic
+    synthetic quote feed, NOT live market quotes; see
+    docs/rh-equities-binding.md). This dashboard process holds no
     live Robinhood connector (the connector is session-bound to a Claude
     agent), so live positions cannot be read from here."""
     portfolio = PaperBroker(root / "data" / "equity_paper_trades.db").get_portfolio()
@@ -1400,7 +1401,7 @@ def equities_html(root: Path) -> str:
     <table>{posture_table}</table>
     {section("Agentic Account", "Robinhood confines all agent trading to exactly one designated account. The agent never targets the default account, whatever the rules would otherwise allow.")}
     <table>{account_table}</table>
-    {section("Equities Positions (paper)", "Simulated fills from the local paper broker, priced against real read-only Robinhood quotes. This is the lane's only fill source in this build.")}
+    {section("Equities Positions (paper)", "Simulated fills from the local paper broker, priced against a deterministic synthetic quote feed (not live Robinhood quotes). This is the lane's only fill source in this build.")}
     <p class="muted">Cash (paper): {escape(holdings["cash_usd"])}</p>
     {positions_table}
     {section("Recent Decisions & Rationale", "Every equities decision - a simulated fill, a skipped signal, or a refused order - with the human-readable reason the lane logged for it.")}

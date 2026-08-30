@@ -67,6 +67,17 @@ ORDER_SYMBOL_GUARD = "order_symbol_guard"
 # unattended and the reconcile that followed it came back clean. Two of them.
 REQUIRED_CLEAN_PAPER_RUNS = 2
 
+# A decision logged inside a run's window that is a MANUAL state mutation --
+# a daily-counter reset being the one this repo actually produced -- means the
+# run was not left alone: someone reached in and changed the lane's state, so
+# it no longer counts as an independent, unattended run. Matched by action name.
+_MANUAL_MUTATION = re.compile(r"(counter_reset|_reset|daily_reset|manual_)", re.IGNORECASE)
+
+# A run's ledger has to have actually MOVED by at least this much (summed
+# absolute fill notional in the window) to count -- a run that filled nothing
+# proves the loop can idle, not that the lane can trade and reconcile.
+_LEDGER_DELTA_EPSILON = 1e-9
+
 # --- the risk caps this lane may not exceed ---------------------------------
 # Mirrors the bounds main.py's _bounded_live_gate_reasons enforces for crypto,
 # read here as evidence rather than re-implemented as a second risk path.
@@ -338,35 +349,90 @@ def _decision_rows(db_path: Path, actions: tuple[str, ...]) -> list[dict[str, An
     return parsed
 
 
+def _all_decision_actions(db_path: Path) -> list[tuple[int, str]]:
+    """Every decision as (id, action), in id order -- used to detect a manual
+    state mutation anywhere inside a run's window, not just the two actions the
+    run itself is built from."""
+    if not db_path.exists():
+        return []
+    with sqlite3.connect(db_path) as conn:
+        return [(int(row[0]), str(row[1])) for row in conn.execute("SELECT id, action FROM decisions ORDER BY id ASC").fetchall()]
+
+
 def paper_proving_runs(root: Path) -> list[dict[str, Any]]:
     """Completed unattended paper runs, each paired with the reconcile that
-    followed it.
+    followed it and judged clean against what actually happened in its window.
 
-    `equity_paper_loop_completed` is only ever logged by
-    run_equity_paper_loop when the loop finished its own bound WITHOUT being
-    halted, so its presence is exactly the "ran unattended to completion"
-    evidence. The first `equity_paper_reconcile` logged after it is that run's
-    reconcile; the run is clean only if that reconcile reported no errors.
+    `equity_paper_loop_completed` is only ever logged by run_equity_paper_loop
+    when the loop finished its own bound WITHOUT being halted, so its presence
+    is the "ran unattended to completion" evidence. A run is clean only if ALL
+    of the following hold, so that a run being clean is a real, falsifiable
+    claim rather than a tautology:
+
+      - a reconcile falls in this run's OWN window -- after this loop and
+        before the NEXT loop_completed -- and each reconcile is consumed by at
+        most one run, so a single reconcile can never vouch for two runs;
+      - that reconcile reported no errors;
+      - the loop actually iterated;
+      - the run's activity window holds at least one paper_order_filled AND the
+        summed fill notional moved the ledger non-trivially -- a zero-trade run
+        proves nothing;
+      - no manual state mutation (a *_counter_reset and the like) appears in
+        the window, which would mean the run was not left unattended.
+
+    A run's activity window is (previous loop_completed, this loop_completed]:
+    the fills and the reset that this repo's runs produced land BEFORE the
+    loop_completed that closes the run, not after it.
     """
-    rows = _decision_rows(root / "data" / "trading_agent.db", ("equity_paper_loop_completed", "equity_paper_reconcile"))
+    db_path = root / "data" / "trading_agent.db"
+    rows = _decision_rows(db_path, ("equity_paper_loop_completed", "equity_paper_reconcile", "paper_order_filled"))
+    all_actions = _all_decision_actions(db_path)
+    loops = [row for row in rows if row["action"] == "equity_paper_loop_completed"]
     reconciles = [row for row in rows if row["action"] == "equity_paper_reconcile"]
+    fills = [row for row in rows if row["action"] == "paper_order_filled"]
+
+    consumed: set[int] = set()
     runs: list[dict[str, Any]] = []
-    for row in rows:
-        if row["action"] != "equity_paper_loop_completed":
-            continue
-        following = next((rec for rec in reconciles if rec["id"] > row["id"]), None)
-        iterations = int(row["details"].get("iterations_completed") or 0)
+    for index, loop in enumerate(loops):
+        loop_id = loop["id"]
+        lower = loops[index - 1]["id"] if index > 0 else 0
+        next_loop_id = loops[index + 1]["id"] if index + 1 < len(loops) else None
+
+        following = None
+        for rec in reconciles:
+            if rec["id"] in consumed:
+                continue
+            if rec["id"] > loop_id and (next_loop_id is None or rec["id"] < next_loop_id):
+                following = rec
+                consumed.add(rec["id"])
+                break
+
+        window_fills = [fill for fill in fills if lower < fill["id"] <= loop_id]
+        ledger_delta = sum(abs(float(fill["details"].get("notional") or 0.0)) for fill in window_fills)
+        mutated = any(lower < action_id <= loop_id and _MANUAL_MUTATION.search(action) for action_id, action in all_actions)
+
+        iterations = int(loop["details"].get("iterations_completed") or 0)
         errors = (following or {}).get("details", {}).get("errors", None)
         adjusted = (following or {}).get("details", {}).get("adjusted", [])
         runs.append(
             {
-                "completed_at": row["timestamp"],
+                "completed_at": loop["timestamp"],
                 "iterations_completed": iterations,
                 "reconciled": following is not None,
                 "reconcile_at": (following or {}).get("timestamp"),
                 "reconcile_errors": errors,
                 "reconcile_adjusted": adjusted,
-                "clean": following is not None and errors == [] and iterations > 0,
+                "fills": len(window_fills),
+                "ledger_delta": ledger_delta,
+                "manual_mutation_in_window": mutated,
+                "clean": (
+                    following is not None
+                    and errors == []
+                    and iterations > 0
+                    and len(window_fills) >= 1
+                    and ledger_delta > _LEDGER_DELTA_EPSILON
+                    and not mutated
+                ),
             }
         )
     return runs
@@ -1046,7 +1112,11 @@ def equity_live_readiness(
         "posture": {
             "execution_surface": "authorized Robinhood OAuth connector toolset (agent-hosted; no equities web service, no key to mint)",
             "auth": "the OAuth connector is itself the credential -- no vault entry, no .env key",
-            "paper_broker": "local paper_broker simulating fills against real read-only quotes",
+            "paper_broker": (
+                "local paper_broker simulating fills against a deterministic SYNTHETIC quote feed; "
+                "the recorded paper proving runs did not read live market quotes"
+            ),
+            "quote_source": "synthetic",
             "extended_hours_opt_in": bool(rules.get("equities", {}).get("allow_extended_hours", False)),
             "equities_universe": list(rules.get("equities", {}).get("universe", []) or []),
             "note": "switching paper->live is the operator's explicit call and is never a side effect of this report",

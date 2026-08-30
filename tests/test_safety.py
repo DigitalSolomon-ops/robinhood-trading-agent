@@ -224,6 +224,81 @@ def test_reconcile_zeroes_tiny_negative_residual(tmp_path: Path) -> None:
     assert abs(portfolio.quantity_for("BTC-USD")) < 1e-12
 
 
+def _buy(broker: PaperBroker, symbol: str, quantity: float, price: float, notional: float | None = None) -> None:
+    broker.place_order(
+        {
+            "symbol": symbol,
+            "side": "buy",
+            "quantity": quantity,
+            "limit_price": price,
+            "notional": notional if notional is not None else quantity * price,
+            "reason": "test",
+            "strategy_signal": "test",
+        }
+    )
+
+
+def test_reconcile_is_clean_on_a_consistent_ledger(tmp_path: Path) -> None:
+    """The honest baseline: a small buy inside starting cash reconciles with no
+    errors, so the failing cases below are meaningful and not vacuous."""
+    broker = PaperBroker(tmp_path / "paper_trades.db", starting_cash=10000.0)
+    _buy(broker, "BTC-USD", quantity=1.0, price=100.0, notional=100.0)
+
+    result = broker.reconcile_positions(epsilon=1e-6)
+
+    assert result["errors"] == []
+    assert result["cash"] < 10000.0  # cash actually moved: 10000 - 100 - fees
+
+
+def test_reconcile_reports_a_cash_discrepancy_when_a_buy_exceeds_settled_cash(tmp_path: Path) -> None:
+    """Independent-truth check: a buy larger than starting cash drives cash
+    negative, and reconcile must flag it. Reverting reconcile to the old
+    negative-quantity-only tautology makes this fail -- the cash never was
+    negative in quantity terms, only in dollars."""
+    broker = PaperBroker(tmp_path / "paper_trades.db", starting_cash=1000.0)
+    _buy(broker, "BTC-USD", quantity=100.0, price=100.0, notional=10000.0)
+
+    result = broker.reconcile_positions(epsilon=1e-6)
+
+    assert result["errors"], "an overspent cash ledger must not reconcile clean"
+    assert any(err.get("issue") == "negative_cash" for err in result["errors"])
+    assert result["cash"] < 0
+
+
+def test_reconcile_reports_a_position_discrepancy_against_an_expected_set(tmp_path: Path) -> None:
+    """A caller-supplied expected holding that does not match the ledger is a
+    discrepancy reconcile must surface -- the 'assert positions match an
+    expected set' path."""
+    broker = PaperBroker(tmp_path / "paper_trades.db", starting_cash=10000.0)
+    _buy(broker, "BTC-USD", quantity=1.0, price=100.0, notional=100.0)
+
+    result = broker.reconcile_positions(epsilon=1e-6, expected_positions={"BTC-USD": 5.0})
+
+    assert any(err.get("issue") == "expected_position_mismatch" and err.get("symbol") == "BTC-USD" for err in result["errors"])
+
+
+def test_reconcile_diffs_against_a_live_connector_in_live_mode(tmp_path: Path) -> None:
+    """The live-mode diff: when a connector is supplied, its positions must
+    match the local ledger, and a divergence is an error."""
+    broker = PaperBroker(tmp_path / "paper_trades.db", starting_cash=10000.0)
+    _buy(broker, "AAPL", quantity=2.0, price=50.0, notional=100.0)
+
+    class DivergentConnector:
+        def get_equity_positions(self, account_number=None):
+            return {"positions": [{"symbol": "AAPL", "quantity": 9.0}]}
+
+    result = broker.reconcile_positions(epsilon=1e-6, connector=DivergentConnector(), account_number="RH-EQ-AGENTIC-2092")
+
+    assert any(err.get("issue") == "live_position_mismatch" and err.get("symbol") == "AAPL" for err in result["errors"])
+
+    class MatchingConnector:
+        def get_equity_positions(self, account_number=None):
+            return {"positions": [{"symbol": "AAPL", "quantity": 2.0}]}
+
+    clean = broker.reconcile_positions(epsilon=1e-6, connector=MatchingConnector())
+    assert clean["errors"] == []
+
+
 def test_buy_duplicate_position_blocked_when_scaling_disabled(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("TRADING_ENABLED", "true")
     paper_rules = rules()
