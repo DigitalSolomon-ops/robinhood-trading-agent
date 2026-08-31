@@ -22,11 +22,14 @@ def test_connector_exposes_only_the_agentic_identity() -> None:
     assert acct["agentic_allowed"] is True
 
 
-def test_positions_are_empty_and_quotes_are_not_the_price_source() -> None:
+def test_positions_are_empty_and_quotes_only_signal_tradability() -> None:
     c = build_paper_proving_connector(ROOT)
     assert c.get_equity_positions()["positions"] == []
-    # Pricing comes from the Massive feed; the connector must not be the source.
-    assert c.get_equity_quotes(["AAPL"])["quotes"] == []
+    # The connector quote is ONLY the tradability "is-it-active" signal (present +
+    # active + positive price), never the price source -- Massive prices the run.
+    q = c.get_equity_quotes(["AAPL"])["quotes"]
+    assert len(q) == 1 and q[0]["symbol"] == "AAPL"
+    assert q[0]["state"] == "active" and float(q[0]["price"]) > 0
 
 
 @pytest.mark.parametrize("call", ["place", "review", "cancel"])

@@ -26,9 +26,14 @@ from ..market_data_fields import (
 DEFAULT_BASE_URL = "https://api.massive.com"
 SECRET_MANAGER_NAME = "massive-api"
 
-MAX_RETRIES = 5
+MAX_RETRIES = 8  # enough capped-exponential backoff (…,32,60,60) to outlast a 60s window
 INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 60.0
+# Proactive min interval between REAL requests (cache hits are free). The free
+# tier is ~5 req/min; 13s spacing keeps a SHARED client under it deterministically
+# instead of relying on reactive 429 backoff. 0 disables it (the default, so
+# existing callers/tests are unchanged); a shared loop client turns it on.
+MIN_REQUEST_INTERVAL_SECONDS = 13.0
 
 # EOD/delayed data feeds decisions and proving only -- the Robinhood connector
 # stays the sole source of execution-time price. Nothing here is a quote used
@@ -324,13 +329,32 @@ class MassiveClient:
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
         max_retries: int = MAX_RETRIES,
+        min_interval: float = 0.0,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.api_key = resolve_massive_api_key(api_key)
         self.base_url = (base_url or os.getenv("MASSIVE_BASE_URL") or DEFAULT_BASE_URL).rstrip("/")
         self._transport = transport
         self._sleep = sleep
         self._max_retries = max_retries
+        # Proactive rate-limiter for a SHARED client: keep real requests at least
+        # `min_interval` apart so many providers on one client never blow the free
+        # tier. 0 (default) leaves timing exactly as before.
+        self._min_interval = min_interval
+        self._clock = clock
+        self._last_request_at: float | None = None
         self._cache: dict[tuple[str, tuple[tuple[str, str], ...], str], dict[str, Any]] = {}
+
+    def _throttle(self) -> None:
+        """Space real requests by at least `_min_interval`. Called only on a
+        cache miss (an actual HTTP request), so cache hits stay instant."""
+        if self._min_interval <= 0:
+            return
+        if self._last_request_at is not None:
+            elapsed = self._clock() - self._last_request_at
+            if elapsed < self._min_interval:
+                self._sleep(self._min_interval - elapsed)
+        self._last_request_at = self._clock()
 
     @property
     def status(self) -> str:
@@ -360,6 +384,7 @@ class MassiveClient:
         return payload
 
     def _request_with_backoff(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
+        self._throttle()
         delay = INITIAL_BACKOFF_SECONDS
         with httpx.Client(
             base_url=self.base_url, transport=self._transport, timeout=20, headers=self._headers()

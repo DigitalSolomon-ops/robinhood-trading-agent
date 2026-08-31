@@ -33,7 +33,7 @@ from .equity_intelligence.market_regime import (
     evaluate_market_regime,
     market_regime_config,
 )
-from .equity_intelligence.massive_client import MassiveClient
+from .equity_intelligence.massive_client import MIN_REQUEST_INTERVAL_SECONDS, MassiveClient
 from .equity_intelligence.massive_history import (
     MAX_LOOKBACK_DAYS,
     QUOTE_SOURCE as MASSIVE_QUOTE_SOURCE,
@@ -497,6 +497,7 @@ def run_equity_paper_loop(
     sentiment_provider: SentimentProvider | None = None,
     liquidity_provider: LiquidityProvider | None = None,
     regime_provider: RegimeProvider | None = None,
+    massive_client: MassiveClient | None = None,
 ) -> dict[str, Any]:
     """A BOUNDED, unattended paper loop -- iterations and/or hours cap it so
     it always terminates on its own rather than needing a human Ctrl+C, and
@@ -510,18 +511,28 @@ def run_equity_paper_loop(
     """
     if iterations is None and hours is None:
         raise ValueError("run_equity_paper_loop requires iterations and/or hours -- an unbounded loop is refused")
-    rules, _ = load_equity_settings(root)
+    rules, strategy_config = load_equity_settings(root)
     logger = SQLiteLogger(root / "data" / "trading_agent.db")
     kill = equity_kill_switch(rules, root)
-    # Built ONCE for the whole loop, not per cycle. Both read end-of-day data
-    # for sessions that have already closed, so a reading cannot change part-way
-    # through a bounded same-session run -- and rebuilding them per cycle would
-    # re-poll the vendor once per symbol per iteration for numbers that are, by
-    # construction, identical every time.
+    # ONE shared, THROTTLED Massive client for the whole loop. Every provider
+    # (history, indicators, sentiment, liquidity, regime) draws from a single
+    # request budget with a shared cache, instead of each spinning its own client
+    # and collectively blowing the free tier's ~5/min limit. Built ONCE, not per
+    # cycle: the readings are end-of-day for closed sessions, identical every
+    # iteration, so re-polling per cycle would only burn the budget.
+    shared_massive = massive_client or MassiveClient(min_interval=MIN_REQUEST_INTERVAL_SECONDS)
+
+    def _massive_factory() -> MassiveClient:
+        return shared_massive
+
     if liquidity_provider is None:
-        liquidity_provider = build_liquidity_provider(rules)
+        liquidity_provider = build_liquidity_provider(rules, client_factory=_massive_factory)
     if regime_provider is None:
-        regime_provider = build_regime_provider(rules)
+        regime_provider = build_regime_provider(rules, client_factory=_massive_factory)
+    if indicator_provider is None:
+        indicator_provider = build_indicator_provider(strategy_config, client_factory=_massive_factory)
+    if sentiment_provider is None:
+        sentiment_provider = build_sentiment_provider(rules, client_factory=_massive_factory)
     source_name = getattr(quote_source, "quote_source_name", CONNECTOR_QUOTE_SOURCE)
     provenance: dict[str, Any] = {"quote_source": source_name}
     if quote_source is not None and hasattr(quote_source, "provenance"):
@@ -623,8 +634,15 @@ class PaperProvingConnector:
         return {"positions": []}
 
     def get_equity_quotes(self, symbols: list[str]) -> Any:
-        # Pricing comes from the Massive history feed, never this connector.
-        return {"quotes": []}
+        # A proving run is PRICED from the Massive history feed; the connector's
+        # only role here is the tradability gate's "is this symbol quotable and
+        # active" check (src/equity_symbols.py _quote_is_active: a non-inactive
+        # state + a positive price). Return an active, positively-priced
+        # placeholder per symbol so a headless proving run (no live connector) is
+        # not falsely marked untradable. This value NEVER prices a fill -- the
+        # quote_source (Massive) does, and the liquidity gate reads real Massive
+        # volume separately.
+        return {"quotes": [{"symbol": s, "state": "active", "price": "1.00"} for s in symbols]}
 
     def review_equity_order(self, **kwargs: Any) -> Any:
         raise RuntimeError("PaperProvingConnector: a paper proving run reviews no real order")
@@ -665,7 +683,10 @@ def run_equity_proving_run(
     but no order is placed and no connector quote is used for pricing, so the
     run is reproducible against a market that actually happened.
     """
-    quote_source = build_massive_quote_source(root, client=client, lookback_days=lookback_days)
+    # ONE shared, throttled client feeds the quote source AND every provider the
+    # loop builds, so the whole proving run stays inside the free tier.
+    shared_massive = client or MassiveClient(min_interval=MIN_REQUEST_INTERVAL_SECONDS)
+    quote_source = build_massive_quote_source(root, client=shared_massive, lookback_days=lookback_days)
     summary = run_equity_paper_loop(
         connector,
         root,
@@ -678,6 +699,7 @@ def run_equity_proving_run(
         sentiment_provider=sentiment_provider,
         liquidity_provider=liquidity_provider,
         regime_provider=regime_provider,
+        massive_client=shared_massive,
     )
     return {**summary, "quote_source": MASSIVE_QUOTE_SOURCE, "provenance": quote_source.provenance()}
 
