@@ -25,7 +25,7 @@ BUCKET="${ENTRY_ALERTS_BUCKET:-digitalsolomon-entry-alerts}"
 # Every 10 minutes, weekdays, during the US regular session (09:30-16:00 ET).
 # The in-container market-hours guard makes any off-hours firing a cheap no-op,
 # so an approximate window here is safe; this just avoids needless invocations.
-CRON="${CRON:-*/10 13-21 * * 1-5}"
+CRON="${CRON:-*/10 9-16 * * 1-5}"
 TZONE="America/New_York"
 
 echo "==> Enabling required APIs"
