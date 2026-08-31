@@ -56,6 +56,7 @@ from .order_manager import OrderManager
 from .paper_broker import PaperBroker
 from .portfolio import Portfolio
 from .risk_manager import RiskManager
+from .shared_state import build_arm_store
 from .web_security import install_security_middleware
 
 SECRET_MARKERS = ("ROBINHOOD_API_KEY", "ROBINHOOD_PRIVATE_KEY", "PRIVATE_KEY", "API_KEY")
@@ -81,8 +82,9 @@ def _lane_stop_paths(root: Path, rules: dict[str, Any]) -> dict[str, tuple[str, 
 def _arm_panel_html(root: Path, rules: dict[str, Any]) -> str:
     """Render the per-lane arm/disarm panel: current posture + the one control."""
     rows: list[str] = []
-    for lane, (label, path) in _lane_stop_paths(root, rules).items():
-        disarmed = path.exists()
+    store = build_arm_store(root, rules)
+    for lane, (label, _path) in _lane_stop_paths(root, rules).items():
+        disarmed = not store.is_armed(lane)
         if disarmed:
             state, color = "DISARMED — halted", "#166534"
             control = (
@@ -174,15 +176,13 @@ def dashboard_app(root: Path = ROOT) -> FastAPI:
 
     @app.post("/kill/{lane}/disarm")
     def lane_disarm(lane: str) -> RedirectResponse:
-        # Disarm = write the stop file = HALT the lane. Safe direction, one click.
+        # Disarm = HALT the lane. Safe direction, one click. Backend-agnostic
+        # (local stop file OR Firestore) through the shared arm store.
         rules, _ = load_dashboard_settings(app.state.root)
-        paths = _lane_stop_paths(app.state.root, rules)
-        if lane in paths:
-            label, path = paths[lane]
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(f"{label} lane DISARMED from dashboard at {datetime.now(UTC).isoformat()}\n", encoding="utf-8")
+        if lane in _lane_stop_paths(app.state.root, rules):
+            build_arm_store(app.state.root, rules).set_armed(lane, False, by="dashboard")
             SQLiteLogger(app.state.root / "data" / "trading_agent.db").log_decision(
-                None, f"dashboard_disarm_{lane}", f"{label} lane DISARMED from dashboard"
+                None, f"dashboard_disarm_{lane}", f"{lane} lane DISARMED from dashboard"
             )
         return RedirectResponse("/arm", status_code=303)
 
@@ -192,13 +192,10 @@ def dashboard_app(root: Path = ROOT) -> FastAPI:
         # only a human request through the (IAP-gated) dashboard reaches this route.
         form = await parse_form(request)
         rules, _ = load_dashboard_settings(app.state.root)
-        paths = _lane_stop_paths(app.state.root, rules)
-        if lane in paths and form.get("confirm_arm") == "on":
-            label, path = paths[lane]
-            if path.exists():
-                path.unlink()
+        if lane in _lane_stop_paths(app.state.root, rules) and form.get("confirm_arm") == "on":
+            build_arm_store(app.state.root, rules).set_armed(lane, True, by="dashboard")
             SQLiteLogger(app.state.root / "data" / "trading_agent.db").log_decision(
-                None, f"dashboard_arm_{lane}", f"{label} lane ARMED from dashboard"
+                None, f"dashboard_arm_{lane}", f"{lane} lane ARMED from dashboard"
             )
         return RedirectResponse("/arm", status_code=303)
 
