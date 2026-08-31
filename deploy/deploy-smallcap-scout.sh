@@ -21,7 +21,7 @@ SA="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 SCHED_JOB="${JOB}-daily"
 # Before the open, weekdays, 08:00 America/New_York (the prior session's data is
 # complete). This is a morning watchlist, not a live pre-market scan.
-CRON="${CRON:-0 8 * * 1-5}"
+CRON="${CRON:-30 7 * * 1-5}"
 TZONE="America/New_York"
 
 echo "==> Enabling required APIs"
@@ -60,7 +60,7 @@ gcloud run jobs deploy "$JOB" --project="$PROJECT" --region="$REGION" \
   --image="$IMAGE" --service-account="$SA" \
   --set-env-vars="DS_VAULT_NO_GCLOUD=1" \
   --set-secrets="MASSIVE_API_KEY=massive-api:latest,GMAIL_APP_PASSWORD=gmail-app-password:latest" \
-  --max-retries=1 --task-timeout=900s --memory=512Mi
+  --max-retries=1 --task-timeout=1800s --memory=512Mi
 
 echo "==> Allow the scheduler SA to run the job"
 gcloud run jobs add-iam-policy-binding "$JOB" --project="$PROJECT" --region="$REGION" \
