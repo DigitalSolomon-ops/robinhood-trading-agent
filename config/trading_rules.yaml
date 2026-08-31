@@ -88,6 +88,42 @@ exits:
 kill_switch:
   stop_file: STOP_TRADING
   env_var: TRADING_ENABLED
+options:
+  # Options-lane risk gates (src/option_risk_gates.py). These sit ALONGSIDE the
+  # shared RiskManager / kill switch / arm gate, adding the caps that only make
+  # sense for defined-risk options. Every gate is config-driven here and blocks
+  # its own violation with a named reason; nothing is hardcoded in the module.
+  # Conservative first-proving values -- raise deliberately, never in passing.
+  risk:
+    # Most net premium (debit) a single order may PAY, in dollars. For a long
+    # option or a debit spread this is the trade's max loss. price * 100 * qty.
+    max_debit_premium_per_trade_usd: 500.0
+    # Ceiling on TOTAL premium at risk across the lane -- this order's max loss
+    # plus the premium already at risk in open option positions.
+    max_total_premium_at_risk_usd: 1500.0
+    # One equity option contract controls this many shares; premium and max loss
+    # are per-share figures multiplied by it.
+    contract_multiplier: 100
+    # Days-to-expiry FLOOR. An order expiring in fewer sessions than this is
+    # refused (too little time for the thesis, gamma/assignment risk near expiry).
+    min_days_to_expiry: 2
+    # 0DTE (same-day expiry) is blocked by default regardless of the floor above;
+    # flipping this on is a deliberate opt-in, never a side effect of the floor.
+    allow_zero_dte: false
+    # Most contracts a single order may carry.
+    max_contracts_per_order: 5
+    # The account's granted Robinhood options approval LEVEL is read at runtime
+    # from get_option_level_upgrade_info; an order whose strategy needs a HIGHER
+    # level than the account was granted is refused. Long single-leg options are
+    # level 2; defined-risk (multi-leg) spreads are level 3. This lane never
+    # trades anything needing level 4 (uncovered), which the defined-risk guard
+    # already refuses outright. Keys are lane-internal strategy classes, not
+    # Robinhood strategy names, so no forbidden-strategy vocabulary appears here.
+    strategy_min_option_level:
+      reducing: 0
+      single_leg_long: 2
+      long_multi_leg: 3
+      defined_risk_spread: 3
 equities:
   # Out-of-band identity anchor for the single agent-tradable Robinhood account.
   # The connector self-declares which account is agent-tradable via the
