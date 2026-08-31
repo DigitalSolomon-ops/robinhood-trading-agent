@@ -24,12 +24,18 @@ the submit call inside place_option_order, never in a trusting caller:
      preview and never touches the connector. This matches the lane's hard rule:
      a real order requires BOTH confirm_live=True AND the options lane armed.
 
-  3. DEFINED RISK. Every order payload is validated before it is built: a
-     sell-to-open leg with no covering buy-to-open leg is refused, as is a credit
-     opening order with no long leg. Single-leg long calls/puts (buy-to-open,
-     debit) and defined-risk vertical spreads (long + short, debit or credit,
-     the short always covered by a long) are allowed; a naked / uncovered short
-     is refused at build time, so it can never reach the payload the guard scans.
+  3. DEFINED RISK. Every order payload is validated before it is built by the
+     SHARED coverage-aware validator (assert_defined_risk, used verbatim by the
+     broker too). Proving a short leg is genuinely covered -- same underlying,
+     matching option type, a bounded strike width -- needs strike-aware spread
+     support this lane does not yet have, and a presence-only "there is also a
+     buy leg" check cannot tell a real vertical from a ratio, a call 'covered'
+     by a put, or a short of one underlying 'covered' by a long of another. So
+     until that support lands, the ONLY provably-defined-risk opening shape is a
+     long (buy-to-open) leg, and ANY sell-to-open leg is refused outright at
+     build time -- before the payload exists -- so an uncovered short can never
+     reach the connector or the static order-safety guard. The automated path
+     emits single-leg longs only, so this loses no real capability.
 
 There is no API key and no base URL: the connector object IS the credential
 (session-bound OAuth), and this class only ever calls its named tool methods.
@@ -61,6 +67,7 @@ __all__ = [
     "DefinedRiskViolationError",
     "OptionConnector",
     "RobinhoodOptionClient",
+    "assert_defined_risk",
     "OPTIONS_LANE",
 ]
 
@@ -87,13 +94,50 @@ class _ArmStore(Protocol):
 
 
 class DefinedRiskViolationError(RuntimeError):
-    """An order payload would open a SELL leg with no covering BUY-to-open leg
-    (a naked / uncovered short, or a credit opening order with no long leg).
+    """An order payload would open an uncovered / undefined-risk SELL leg.
 
     DEFINED RISK is the lane's floor. This is raised at BUILD time, before the
     payload exists, so an undefined-risk order can never be handed to the
     connector or reach the static order-safety guard as a literal.
     """
+
+
+def assert_defined_risk(legs: Sequence[Mapping[str, Any]], direction: str) -> None:
+    """The ONE shared coverage-aware defined-risk validator, used verbatim by
+    BOTH the client and the broker so there is no second copy to drift.
+
+    Proving a short leg is genuinely COVERED -- a long of the same underlying,
+    matching option type, and a bounded strike width -- needs the strike /
+    underlying / expiry-aware spread support this lane does not have yet. A
+    presence-only "there is also some buy leg" check (what the earlier version
+    did) cannot tell a real 1:1 vertical from:
+
+      * a RATIO (buy 1 call, sell 3 calls) -- the extra shorts are uncovered;
+      * a short call 'covered' by a long PUT -- the put does not cover the call;
+      * a short of one underlying 'covered' by a long of ANOTHER -- unrelated.
+
+    Each of those is undefined risk, and each passed the old check and reached
+    the live connector. Until real strike-aware spread support exists, the ONLY
+    provably-defined-risk opening shape is a long (buy-to-open) leg, so ANY
+    sell-to-open leg is refused outright here. The automated path emits
+    single-leg longs only, so this closes the hole without losing capability.
+
+    A sell-to-CLOSE leg (exiting a held long) is NOT an opening short and is
+    allowed -- refusing it would trap open positions. `direction` is accepted
+    for signature parity with the caller and to keep the refusal auditable.
+    """
+    if not legs:
+        raise DefinedRiskViolationError("refusing an option order with no legs")
+    for leg in legs:
+        side = str(leg.get("side")).strip().lower()
+        effect = str(leg.get("position_effect")).strip().lower()
+        if side == "sell" and effect == "open":
+            raise DefinedRiskViolationError(
+                "refusing a sell-to-open leg: this lane is defined-risk only and does not yet "
+                "support strike-aware spreads, so any opening short -- a naked short, an "
+                "uncovered short from a ratio, or a short 'covered' by a mismatched long -- is "
+                f"refused (direction={str(direction).strip().lower()!r})"
+            )
 
 
 class RobinhoodOptionClient:
@@ -199,7 +243,15 @@ class RobinhoodOptionClient:
     @staticmethod
     def _normalize_leg(leg: Mapping[str, Any]) -> dict[str, Any]:
         """Normalize one leg to the connector's shape, lower-casing the two
-        classifying fields so the defined-risk check reads them uniformly."""
+        classifying fields so the defined-risk check reads them uniformly, and
+        RETAINING the contract-identifying fields (option_type / underlying /
+        expiration / strike) untouched when present.
+
+        The earlier version DROPPED those fields, which is precisely what made
+        every short look 'covered' by any long: with no underlying, type or
+        strike to compare, a coverage check has nothing to reason over. They are
+        carried through here so a future strike-aware validator can prove real
+        coverage -- and so the payload the connector receives is faithful."""
         side = leg.get("side")
         effect = leg.get("position_effect")
         normalized: dict[str, Any] = {
@@ -212,29 +264,26 @@ class RobinhoodOptionClient:
             if key in leg and leg[key] is not None:
                 normalized["option"] = leg[key]
                 break
+        # Retain the contract-identifying fields, untouched, when the caller
+        # supplied them -- absent fields are simply not carried.
+        for key in (
+            "option_type",
+            "underlying",
+            "underlying_symbol",
+            "expiration_date",
+            "expiry",
+            "strike_price",
+            "strike",
+        ):
+            if key in leg and leg[key] is not None:
+                normalized[key] = leg[key]
         return normalized
 
     def _assert_defined_risk(self, legs: Sequence[Mapping[str, Any]], direction: str) -> None:
-        """Refuse any leg set that opens uncovered short risk.
-
-        The runtime half of the static order-safety guard's property B: an
-        opening SELL leg is allowed ONLY when the same order also opens a BUY
-        leg to cover it (a vertical spread), and a credit OPENING order with no
-        long leg is refused outright. A covered call does NOT qualify -- the
-        cover here must be an option leg, not stock.
-        """
-        opening = [leg for leg in legs if str(leg.get("position_effect")).strip().lower() == "open"]
-        opening_sells = [leg for leg in opening if str(leg.get("side")).strip().lower() == "sell"]
-        opening_buys = [leg for leg in opening if str(leg.get("side")).strip().lower() == "buy"]
-        if opening_sells and not opening_buys:
-            raise DefinedRiskViolationError(
-                "refusing an uncovered short: a sell-to-open leg has no covering buy-to-open leg "
-                "(naked short / undefined risk); this lane is defined-risk only"
-            )
-        if str(direction).strip().lower() == "credit" and opening_sells and not opening_buys:
-            raise DefinedRiskViolationError(
-                "refusing a credit opening order with no buy-to-open leg (undefined risk)"
-            )
+        """Refuse any leg set that is not provably defined-risk, via the ONE
+        shared validator (module-level assert_defined_risk) the broker also
+        uses -- there is no second, drifting copy of the coverage rule."""
+        assert_defined_risk(legs, direction)
 
     def build_option_order(
         self,

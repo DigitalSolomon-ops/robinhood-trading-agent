@@ -94,10 +94,32 @@ def long_legs(contract: str = LONG_CALL) -> list[dict]:
 
 
 def vertical_legs() -> list[dict]:
-    """A defined-risk vertical: a long leg covering a short leg."""
+    """A long + short opening pair. Presence-only 'coverage' -- the audit's
+    starting point: this looks like a vertical but the lane cannot yet prove the
+    short is covered, so it is refused."""
     return [
         {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option": LONG_CALL},
         {"side": "sell", "position_effect": "open", "ratio_quantity": 1, "option": SHORT_CALL},
+    ]
+
+
+def ratio_legs() -> list[dict]:
+    """A 10:1 ratio: buy 1 call, SELL 10 calls. A long leg is present, but the
+    nine extra shorts are uncovered -- undefined risk that the old presence-only
+    check waved through."""
+    return [
+        {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option": LONG_CALL},
+        {"side": "sell", "position_effect": "open", "ratio_quantity": 10, "option": SHORT_CALL},
+    ]
+
+
+def sell_call_buy_put_legs() -> list[dict]:
+    """A short call 'covered' by a long PUT. A buy leg is present, but a put does
+    not cover a call -- the short call is naked. Undefined risk the old check
+    passed as a defined_risk_spread."""
+    return [
+        {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option_type": "put", "option": "OPT-AAPL-PUT"},
+        {"side": "sell", "position_effect": "open", "ratio_quantity": 1, "option_type": "call", "option": SHORT_CALL},
     ]
 
 
@@ -217,13 +239,86 @@ def test_build_single_leg_long_is_a_debit_buy_to_open():
     ]
 
 
-def test_build_defined_risk_vertical_is_allowed():
+def test_build_refuses_a_long_plus_short_opening_pair():
+    """MUTATION TEST: a long + short opening pair is refused. The lane cannot yet
+    prove the short is covered (no strike-aware spread support), so any
+    sell-to-open leg -- even accompanied by a buy -- is refused outright. Revert
+    the shared validator to the presence-only check and this builds instead."""
     client = make_client(FakeConnector())
 
-    payload = client.build_option_order(vertical_legs(), direction="debit")
+    with pytest.raises(DefinedRiskViolationError):
+        client.build_option_order(vertical_legs(), direction="debit")
 
-    sides = {leg["side"] for leg in payload["legs"]}
-    assert sides == {"buy", "sell"}
+
+def test_build_refuses_a_ten_to_one_ratio():
+    """A 10:1 ratio has a long leg but nine uncovered extra shorts. The old
+    presence-only 'there is a buy leg' check passed it; the coverage-aware
+    validator refuses any opening sell, so it cannot build."""
+    client = make_client(FakeConnector())
+
+    with pytest.raises(DefinedRiskViolationError):
+        client.build_option_order(ratio_legs(), direction="debit")
+
+
+def test_build_refuses_a_short_call_covered_by_a_long_put():
+    """A short call 'covered' by a long put is naked -- a put does not cover a
+    call. A buy leg is present, so the old check passed it; the validator refuses
+    the opening sell."""
+    client = make_client(FakeConnector())
+
+    with pytest.raises(DefinedRiskViolationError):
+        client.build_option_order(sell_call_buy_put_legs(), direction="debit")
+
+
+def test_normalize_leg_retains_the_contract_identifying_fields():
+    """MUTATION TEST: the leg fields (option_type / underlying / strike / expiry)
+    must survive normalization -- dropping them is what blinded the old coverage
+    check. A long leg carrying them keeps them in the built payload."""
+    client = make_client(FakeConnector())
+    leg = {
+        "side": "buy",
+        "position_effect": "open",
+        "ratio_quantity": 1,
+        "option": LONG_CALL,
+        "option_type": "call",
+        "underlying": "AAPL",
+        "strike_price": "190",
+        "expiration_date": "2026-09-18",
+    }
+
+    payload = client.build_option_order([leg], direction="debit")
+
+    built = payload["legs"][0]
+    assert built["option_type"] == "call"
+    assert built["underlying"] == "AAPL"
+    assert built["strike_price"] == "190"
+    assert built["expiration_date"] == "2026-09-18"
+
+
+# --- the shared coverage-aware validator (the guard), unit-tested directly -----
+
+
+def test_shared_validator_refuses_the_ratio_and_the_mismatched_cover():
+    """The ONE shared validator refuses ANY opening sell. Both undefined-risk
+    shapes the old presence-only check passed -- the 10:1 ratio and the
+    call-'covered'-by-a-put -- raise here."""
+    from src.robinhood_option_client import assert_defined_risk
+
+    with pytest.raises(DefinedRiskViolationError):
+        assert_defined_risk(ratio_legs(), "debit")
+    with pytest.raises(DefinedRiskViolationError):
+        assert_defined_risk(sell_call_buy_put_legs(), "debit")
+
+
+def test_shared_validator_allows_a_long_and_a_sell_to_close():
+    """Precision: a lone long and a sell-to-CLOSE (exiting a held long) are not
+    opening shorts and must pass, or the lane could not open or close a long."""
+    from src.robinhood_option_client import assert_defined_risk
+
+    assert_defined_risk(long_legs(), "debit")
+    assert_defined_risk(
+        [{"side": "sell", "position_effect": "close", "ratio_quantity": 1, "option": LONG_CALL}], "credit"
+    )
 
 
 def test_build_refuses_a_single_leg_sell_to_open_naked_short():
@@ -433,6 +528,34 @@ def test_place_still_refuses_a_naked_short_even_fully_gated():
             direction="credit",
             dry_run=False,
             confirm_live_order=True,
+        )
+    assert connector.place_calls == []
+
+
+def test_place_refuses_a_ten_to_one_ratio_even_fully_gated():
+    """The audit's 10:1 ratio: a long leg plus nine uncovered shorts. Fully gated
+    (dry_run False, confirm True, armed) and it STILL never reaches the connector
+    -- the coverage-aware validator refuses the opening sell before any gate.
+    Revert to the presence-only check and place_calls is non-empty."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    with pytest.raises(DefinedRiskViolationError):
+        client.place_option_order(
+            ratio_legs(), direction="debit", dry_run=False, confirm_live_order=True
+        )
+    assert connector.place_calls == []
+
+
+def test_place_refuses_a_short_call_covered_by_a_long_put_even_fully_gated():
+    """The audit's call-'covered'-by-a-put: a buy leg is present, so the old
+    check passed it to the connector. Fully gated, it must never place."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    with pytest.raises(DefinedRiskViolationError):
+        client.place_option_order(
+            sell_call_buy_put_legs(), direction="debit", dry_run=False, confirm_live_order=True
         )
     assert connector.place_calls == []
 

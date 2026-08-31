@@ -41,6 +41,19 @@ SHORT_CALL = "OPT-XYZ-CALL-SHORT"
 LONG_LEG = {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option": LONG_CALL}
 SHORT_LEG = {"side": "sell", "position_effect": "open", "ratio_quantity": 1, "option": SHORT_CALL}
 
+# A 10:1 ratio: a long leg plus nine uncovered extra shorts. The old
+# presence-only check passed it because a buy leg is present.
+RATIO_LEGS = [
+    LONG_LEG,
+    {"side": "sell", "position_effect": "open", "ratio_quantity": 10, "option": SHORT_CALL},
+]
+# A short call 'covered' by a long PUT -- a put does not cover a call, so the
+# short call is naked. A buy leg is present, so the old check waved it through.
+SELL_CALL_BUY_PUT_LEGS = [
+    {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option_type": "put", "option": "OPT-XYZ-PUT"},
+    {"side": "sell", "position_effect": "open", "ratio_quantity": 1, "option_type": "call", "option": SHORT_CALL},
+]
+
 
 class FakeArmStore:
     """Answers is_armed for the requested lane; records what it was asked."""
@@ -267,14 +280,39 @@ def test_naked_short_refused_even_on_disarmed_preview_broker(monkeypatch, tmp_pa
     assert connector.place_calls == []
 
 
-def test_defined_risk_vertical_spread_submits(monkeypatch, tmp_path):
+def test_long_plus_short_opening_pair_is_refused(monkeypatch, tmp_path):
+    """MUTATION TEST: a long + short opening pair is refused, fully gated. The
+    lane cannot prove the short is covered without strike-aware spread support,
+    so any opening sell -- even with a buy present -- is refused before any gate
+    and never reaches the connector. Revert to the presence-only check and this
+    order submits."""
     connector = FakeConnector()
     broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
-    # A long + short vertical: the short is covered by the long, so it is
-    # defined-risk and allowed.
-    result = broker.submit_option_order(legs=[LONG_LEG, SHORT_LEG], direction="debit", mode="live")
-    assert result["submitted"] is True
-    assert len(connector.place_calls) == 1
+    with pytest.raises(DefinedRiskViolationError):
+        broker.submit_option_order(legs=[LONG_LEG, SHORT_LEG], direction="debit", mode="live")
+    assert connector.place_calls == []
+
+
+def test_a_ten_to_one_ratio_is_refused(monkeypatch, tmp_path):
+    """The audit's 10:1 ratio (buy 1, sell 10). A long leg is present, but the
+    extra shorts are uncovered. Fully armed + confirmed + live, it must never
+    reach the connector."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    with pytest.raises(DefinedRiskViolationError):
+        broker.submit_option_order(legs=RATIO_LEGS, direction="debit", mode="live")
+    assert connector.place_calls == []
+
+
+def test_a_short_call_covered_by_a_long_put_is_refused(monkeypatch, tmp_path):
+    """The audit's call-'covered'-by-a-put. A buy leg is present, so the old
+    presence-only check passed it to the connector. Fully gated, it must never
+    place."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    with pytest.raises(DefinedRiskViolationError):
+        broker.submit_option_order(legs=SELL_CALL_BUY_PUT_LEGS, direction="debit", mode="live")
+    assert connector.place_calls == []
 
 
 def test_empty_legs_refused(monkeypatch, tmp_path):
@@ -307,12 +345,19 @@ def test_broker_defined_risk_guard_rejects_empty(monkeypatch, tmp_path):
         broker._assert_defined_risk([], "debit")
 
 
-def test_broker_defined_risk_guard_allows_long_and_spread(monkeypatch, tmp_path):
+def test_broker_defined_risk_guard_allows_long_but_refuses_any_opening_sell(monkeypatch, tmp_path):
+    """A lone long leg (and a sell-to-CLOSE exit) pass the guard; ANY opening
+    sell -- even the long+short pair the old check allowed -- raises. Pinning the
+    broker's own guard directly, so neutering it fails here regardless of the
+    client."""
     connector = FakeConnector()
     broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
-    # A lone long leg and a covered vertical must both pass the guard (no raise).
     broker._assert_defined_risk([LONG_LEG], "debit")
-    broker._assert_defined_risk([LONG_LEG, SHORT_LEG], "debit")
+    broker._assert_defined_risk(
+        [{"side": "sell", "position_effect": "close", "ratio_quantity": 1, "option": LONG_CALL}], "credit"
+    )
+    with pytest.raises(DefinedRiskViolationError):
+        broker._assert_defined_risk([LONG_LEG, SHORT_LEG], "debit")
 
 
 # --- account gate fires before anything else ----------------------------------

@@ -63,10 +63,14 @@ _DEFAULT_MAX_CONTRACTS = 5
 STRATEGY_REDUCING = "reducing"
 STRATEGY_SINGLE_LEG_LONG = "single_leg_long"
 STRATEGY_LONG_MULTI_LEG = "long_multi_leg"
+# Retained for config back-compat (the level map below still carries it), but
+# classify_strategy NEVER returns it any more: until strike-aware spread support
+# exists the lane cannot prove a short is covered, so every opening sell is
+# UNSUPPORTED rather than a defined-risk spread.
 STRATEGY_DEFINED_RISK_SPREAD = "defined_risk_spread"
-# A leg set the lane does not support as defined risk (an opening sell with no
-# covering opening buy). The defined-risk guard refuses it earlier; here it is
-# assigned a level the lane never grants so the level gate also fails closed.
+# A leg set the lane does not support as defined risk (ANY opening sell). The
+# shared defined-risk validator refuses it earlier; here it is assigned a level
+# the lane never grants so the level gate also fails closed.
 STRATEGY_UNSUPPORTED = "unsupported"
 
 _DEFAULT_STRATEGY_MIN_LEVEL: dict[str, int] = {
@@ -325,14 +329,17 @@ def classify_strategy(legs: Sequence[Mapping[str, Any]]) -> str:
     """Assign a leg set to a lane-internal strategy class for the level gate.
 
     Only the defined-risk shapes the lane actually places are named:
-      * an opening sell covered by an opening buy -> a defined-risk spread;
       * a single opening buy               -> a single long option;
       * several opening buys, no sells     -> a long multi-leg (e.g. a long
                                               straddle) -- still defined risk;
       * only closing legs                  -> reducing exposure.
-    Anything else -- an opening sell with no covering buy -- is UNSUPPORTED and
-    demands a level the lane never grants, so the level gate fails closed. The
-    defined-risk guard refuses that shape earlier regardless.
+    ANY opening SELL leg is UNSUPPORTED and demands a level the lane never
+    grants, so the level gate fails closed. This mirrors the shared defined-risk
+    validator (assert_defined_risk), which refuses any sell-to-open leg outright
+    until strike-aware spread support exists: without it a short cannot be shown
+    to be genuinely covered, so a ratio, a type-mismatched 'cover', and a
+    cross-underlying 'cover' are all as uncovered as a lone naked short. This
+    function therefore never returns defined_risk_spread.
     """
     if not legs:
         return STRATEGY_UNSUPPORTED
@@ -341,10 +348,8 @@ def classify_strategy(legs: Sequence[Mapping[str, Any]]) -> str:
     opening_sells = [role for role in opening if role == ("sell", "open")]
     any_opening = [role for role in opening if role[1] == "open"]
 
-    if opening_sells and not opening_buys:
+    if opening_sells:
         return STRATEGY_UNSUPPORTED
-    if opening_sells and opening_buys:
-        return STRATEGY_DEFINED_RISK_SPREAD
     if opening_buys:
         return STRATEGY_SINGLE_LEG_LONG if len(opening_buys) == 1 else STRATEGY_LONG_MULTI_LEG
     if not any_opening:

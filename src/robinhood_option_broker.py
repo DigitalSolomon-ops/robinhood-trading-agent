@@ -29,12 +29,15 @@ clock and its kill switch at the moment before the connector call:
      armed. Fail safe: an arm store that cannot answer reads as DISARMED.
 
   4. DEFINED RISK ONLY. Every leg set is validated before a gate is even
-     consulted: a sell-to-open leg with no covering buy-to-open leg is refused
-     (a naked / uncovered short), as is a credit opening order with no long leg.
-     A covered call does NOT qualify -- the cover must be an option leg, not
-     stock. This is the runtime half of the static order-safety guard's property
-     B (tests/test_option_order_safety_guard.py); a naked short is refused here
-     before it can ever reach the connector.
+     consulted, by the ONE shared coverage-aware validator the client also uses
+     (assert_defined_risk). Proving a short is genuinely covered needs
+     strike-aware spread support this lane does not have yet, so until it lands
+     ANY sell-to-open leg is refused outright -- a naked short, a ratio's
+     uncovered shorts, a call 'covered' by a put, and a short of one underlying
+     'covered' by a long of another all fail here. This is the runtime half of
+     the static order-safety guard's property B
+     (tests/test_option_order_safety_guard.py); an uncovered short is refused
+     here before it can ever reach the connector.
 
 READ-ONLY is the default posture: dry_run defaults to True, confirm_live_order
 to False, so a broker built with no order flags cannot place an order. The kill
@@ -64,6 +67,7 @@ from .robinhood_option_client import (
     AgentAccountMismatchError,
     DefinedRiskViolationError,
     RobinhoodOptionClient,
+    assert_defined_risk,
 )
 from .shared_state import build_arm_store
 from .strategy_engine import TradeSignal
@@ -225,33 +229,23 @@ class RobinhoodOptionBroker:
             return False
 
     def _assert_defined_risk(self, legs: Sequence[Mapping[str, Any]], direction: str) -> None:
-        """Refuse any leg set that opens uncovered short risk -- the runtime half
-        of the static guard's property B.
+        """Refuse any leg set that is not provably defined-risk -- the runtime
+        half of the static guard's property B.
 
-        An opening SELL leg is allowed ONLY when the same order also opens a BUY
-        leg to cover it (a vertical spread); a credit OPENING order with no long
-        leg is refused outright. Checked BEFORE any gate, so a naked short is
+        Delegates to the ONE shared validator (assert_defined_risk) the client
+        also uses, so the coverage rule lives in exactly one place: any
+        sell-to-open leg is refused outright until strike-aware spread support
+        exists (a ratio, a type-mismatched 'cover', a cross-underlying 'cover',
+        and a lone naked short all fail here). Checked BEFORE any gate, so it is
         refused even on a disarmed, preview-only broker and can never reach the
-        connector or the payload the static guard scans.
+        connector or the payload the static guard scans. The refusal is logged
+        first, then re-raised, so the audit trail keeps the reason.
         """
-        if not legs:
-            reason = "refusing an option order with no legs"
-            self._log_refusal(None, reason)
-            raise DefinedRiskViolationError(reason)
-        opening = [leg for leg in legs if str(leg.get("position_effect")).strip().lower() == "open"]
-        opening_sells = [leg for leg in opening if str(leg.get("side")).strip().lower() == "sell"]
-        opening_buys = [leg for leg in opening if str(leg.get("side")).strip().lower() == "buy"]
-        if opening_sells and not opening_buys:
-            reason = (
-                "refusing an uncovered short: a sell-to-open leg has no covering buy-to-open leg "
-                "(naked short / undefined risk); this lane is defined-risk only"
-            )
-            self._log_refusal(None, reason)
-            raise DefinedRiskViolationError(reason)
-        if str(direction).strip().lower() == "credit" and opening_sells and not opening_buys:
-            reason = "refusing a credit opening order with no buy-to-open leg (undefined risk)"
-            self._log_refusal(None, reason)
-            raise DefinedRiskViolationError(reason)
+        try:
+            assert_defined_risk(legs, direction)
+        except DefinedRiskViolationError as exc:
+            self._log_refusal(None, str(exc))
+            raise
 
     def _assert_kill_switch_open(self, symbol: str | None) -> None:
         # No fail-open path: self.kill_switch is guaranteed non-None by __init__

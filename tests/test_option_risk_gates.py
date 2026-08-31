@@ -302,12 +302,18 @@ def test_single_long_is_allowed_at_level_2() -> None:
     assert decision.allowed is True
 
 
-def test_defined_risk_spread_needs_level_3_and_is_blocked_at_level_2() -> None:
+def test_a_long_plus_short_is_unsupported_and_blocked_by_the_level_gate() -> None:
+    """MUTATION TEST: a long + short opening pair is NO LONGER a defined-risk
+    spread. The short is an opening sell the lane cannot prove covered, so it
+    classifies as UNSUPPORTED and the level gate refuses it even at level 3 --
+    the highest the lane trades. Revert classify_strategy to return
+    defined_risk_spread (min level 3, granted) and the order would be allowed,
+    failing this."""
     proposal = OptionOrderProposal(
         legs=[LONG_LEG, SHORT_LEG], net_premium_per_contract=1.00, quantity=1, days_to_expiry=10
     )
-    decision = evaluate_option_order(LOOSE, proposal, granted_level=2)
-    assert decision.strategy == STRATEGY_DEFINED_RISK_SPREAD
+    decision = evaluate_option_order(LOOSE, proposal, granted_level=3)
+    assert decision.strategy == STRATEGY_UNSUPPORTED
     assert decision.allowed is False
     assert GateName.OPTION_APPROVAL_LEVEL in decision.blocking_names
 
@@ -340,8 +346,26 @@ def test_classify_two_longs_is_multi_leg() -> None:
     assert classify_strategy([LONG_LEG, dict(LONG_LEG)]) == STRATEGY_LONG_MULTI_LEG
 
 
-def test_classify_long_plus_short_is_defined_risk_spread() -> None:
-    assert classify_strategy([LONG_LEG, SHORT_LEG]) == STRATEGY_DEFINED_RISK_SPREAD
+def test_classify_long_plus_short_is_unsupported() -> None:
+    """MUTATION TEST: a long + short is no longer a defined-risk spread. Without
+    strike-aware coverage the opening sell cannot be proven covered, so the pair
+    classifies as UNSUPPORTED. Revert classify_strategy and this fails."""
+    assert classify_strategy([LONG_LEG, SHORT_LEG]) == STRATEGY_UNSUPPORTED
+
+
+def test_classify_ratio_one_long_many_shorts_is_unsupported() -> None:
+    """A 10:1 ratio (buy 1, sell 10) has a long leg but the extra shorts are
+    uncovered. Presence of a buy no longer buys a defined-risk verdict."""
+    ratio = [LONG_LEG, {"side": "sell", "position_effect": "open", "ratio_quantity": 10, "option": "SHORT"}]
+    assert classify_strategy(ratio) == STRATEGY_UNSUPPORTED
+
+
+def test_classify_short_call_covered_by_long_put_is_unsupported() -> None:
+    """A short call 'covered' by a long put: the put does not cover the call, so
+    the opening sell is uncovered and the pair is unsupported."""
+    long_put = {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option_type": "put", "option": "P"}
+    short_call = {"side": "sell", "position_effect": "open", "ratio_quantity": 1, "option_type": "call", "option": "C"}
+    assert classify_strategy([long_put, short_call]) == STRATEGY_UNSUPPORTED
 
 
 def test_classify_closing_only_is_reducing() -> None:
