@@ -1,21 +1,19 @@
-# Keep the Cloud Build context lean and secret-free. The Dockerfile copies only
-# src/options_scout, src/equity_intelligence, src/__init__.py, and one config
-# file, so everything else is upload weight at best and a secret at worst.
-.venv/
+# Keep the Cloud Build context lean AND keep secrets/data out of it.
 .git/
+.venv/
+data/
+logs/
 __pycache__/
+**/__pycache__/
 *.pyc
+.pytest_cache/
 .env
 .env.*
 !.env.example
-data/
-logs/
 *.db
 *.db-*
 *.sqlite*
-node_modules/
 archive/
-.pytest_cache/
-builds/
-dist/
-STOP_TRADING*
+STOP_TRADING
+STOP_TRADING_EQUITIES
+STOP_TRADING_OPTIONS
