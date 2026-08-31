@@ -1,0 +1,54 @@
+# Entry-Hit Alerter -- NOTIFICATION ONLY.
+#
+# Polls a delayed underlying price per symbol during US market hours and emails
+# a ONE-TIME alert when a day's recommended scout play reaches its ENTRY level.
+# It NEVER trades: no order is placed, reviewed, or cancelled anywhere in
+# src/entry_alerts/, and it does not touch any trading gate, the crypto lane, or
+# the equities order path. Every tunable lives here.
+#
+# The current-price read uses the Massive stock MINUTE-AGGREGATE endpoint (latest
+# delayed minute bar close), which needs a PAID (Starter+) entitlement -- on the
+# free (EOD-only) tier it 403s. Minute aggregates are ~15-minutes delayed, so a
+# ~10-minute poll fits with no websocket. (The single-ticker snapshot/last-trade
+# endpoints are NOT authorized on the Options plan, hence minute aggregates.)
+
+# --- poll behaviour ----------------------------------------------------------
+poll:
+  # Fractional band around the entry level within which a near-touch counts as a
+  # hit. 0.001 = 0.1%. A bullish (call/long) play fires when the price is at or
+  # above entry*(1-tolerance); a bearish (put) play at or below entry*(1+tolerance).
+  tolerance: 0.001
+  # When true, a cycle with no new hits still sends a "nothing new" email. Off by
+  # default so the inbox only ever sees real alerts, not a 10-minute heartbeat.
+  send_on_empty: false
+
+# --- market-hours window -----------------------------------------------------
+# Regular US trading hours (09:30-16:00 ET, Mon-Fri, holidays excluded) are the
+# poll window; the guard lives in src/market_hours.py and is shared with the
+# equities lane. Extended hours stay OFF (this v1 alerts on the regular session).
+market_hours:
+  allow_extended_hours: false
+
+# --- shared day-state store --------------------------------------------------
+# Primary store is a GCS object gs://<bucket>/entry-alerts/<YYYY-MM-DD>.json,
+# holding the day's active plays and the set of ids already alerted. Env
+# ENTRY_ALERTS_BUCKET overrides this. With no bucket, a local-file dev fallback
+# (data/entry_alerts/) is used -- fine for local runs, but Cloud Run Jobs do not
+# share a filesystem across executions, so production MUST set a bucket.
+gcs:
+  bucket: "digitalsolomon-entry-alerts"
+
+# Which scout sources the alerter watches.
+enabled_sources:
+  - options
+  - smallcap
+
+# --- email -------------------------------------------------------------------
+email:
+  # Defaults to digitalsolomon.com@gmail.com when GMAIL_USER / ENTRY_ALERTS_TO
+  # are unset. The app password is read env-first (GMAIL_APP_PASSWORD) then
+  # Secret Manager (GMAIL_VAULT_NAME, default "gmail-app-password").
+  from_addr: "digitalsolomon.com@gmail.com"
+  to_addr: "digitalsolomon.com@gmail.com"
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 465   # implicit SSL; 587/STARTTLS is blocked on many networks

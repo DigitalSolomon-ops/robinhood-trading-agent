@@ -3,19 +3,26 @@
 FROM python:3.11-slim
 
 WORKDIR /app
-RUN pip install --no-cache-dir "httpx==0.28.1" "PyYAML==6.0.3"
+# google-cloud-storage lets the scout persist its ranked picks to the shared
+# entry-alert day-state (best-effort; the email never depends on it).
+RUN pip install --no-cache-dir \
+    "httpx==0.28.1" "PyYAML==6.0.3" "google-cloud-storage==2.18.2"
 
 # Only the analysis-only packages + the scout's config. Nothing from the
 # trading lanes is copied, so the image cannot place an order even in principle.
 # options_scout is included because smallcap_scout reuses its secret/address
-# helpers; it is itself analysis-only.
+# helpers; entry_alerts (+ market_hours it imports) is copied so the scout's
+# best-effort entry-alert persistence hook actually runs -- both analysis-only.
 COPY src/__init__.py ./src/__init__.py
 COPY src/market_data_fields.py ./src/market_data_fields.py
+COPY src/market_hours.py ./src/market_hours.py
 COPY src/smallcap_scout/ ./src/smallcap_scout/
 COPY src/options_scout/ ./src/options_scout/
 COPY src/equity_intelligence/ ./src/equity_intelligence/
+COPY src/entry_alerts/ ./src/entry_alerts/
 COPY config/smallcap_scout.yaml ./config/smallcap_scout.yaml
 COPY config/options_scout.yaml ./config/options_scout.yaml
+COPY config/entry_alerts.yaml ./config/entry_alerts.yaml
 
 # Secrets arrive as env (MASSIVE_API_KEY, GMAIL_APP_PASSWORD) injected by Cloud
 # Run from Secret Manager; never shell out to gcloud in-container.

@@ -35,6 +35,26 @@ def run_options_scout_email(
     today = now.date()
 
     plays = scout_plays(client, config, today=today, now=now)
+    _persist_for_alerts(plays, today.isoformat())
     return send_or_preview(
         plays, config, dry_run=dry_run, out_path=out_path, today=today, print_fn=print_fn
     )
+
+
+def _persist_for_alerts(plays: list[Any], day: str) -> None:
+    """Additive, best-effort: write the day's ranked plays to the entry-alert
+    store so the notification-only alerter can watch their entry levels. A
+    failure here MUST NOT break the scout email, so everything is swallowed --
+    persistence is a bonus, the email is the product."""
+    try:
+        from ..entry_alerts.config import load_alerts_config, resolve_bucket
+        from ..entry_alerts.store import record_from_options_play, save_plays
+
+        records = [
+            record for record in (record_from_options_play(play, day) for play in plays)
+            if record is not None
+        ]
+        if records:
+            save_plays(records, day=day, bucket=resolve_bucket(load_alerts_config()))
+    except Exception:
+        pass

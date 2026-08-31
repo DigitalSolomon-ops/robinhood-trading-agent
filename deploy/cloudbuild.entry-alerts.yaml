@@ -1,0 +1,6 @@
+# Cloud Build config for the Entry-Hit Alerter image (non-default Dockerfile name).
+# Invoked by deploy/deploy-entry-alerts.sh with --substitutions=_IMAGE=...
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "Dockerfile.entry-alerts", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]

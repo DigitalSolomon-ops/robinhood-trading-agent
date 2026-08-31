@@ -362,6 +362,49 @@ class MassiveClient:
         rows = [row for row in payload.get("results", []) or [] if isinstance(row, dict)]
         return _bar_from_row(rows[0]) if rows else None
 
+    # --- current (delayed) underlying price: minute aggregates (PAID tier) ----
+
+    def get_current_price(self, ticker: str, on_date: str | None = None) -> float | None:
+        """Latest ~15-minute-delayed price for one underlying, from the most
+        recent DELAYED MINUTE bar's close.
+
+        Fetches today's 1-minute aggregates newest-first and takes the last
+        bar's close (GET /v2/aggs/ticker/{ticker}/range/1/minute/{day}/{day}
+        ?sort=desc&limit=1). When today has no intraday bars yet (e.g. before the
+        open), falls back to the previous daily close (/v2/aggs/.../prev). Returns
+        None when neither yields a usable price. This is a price on the
+        UNDERLYING for the entry-hit ALERT only; nothing here places, sizes, or
+        times an order.
+
+        ENTITLEMENT: stock minute aggregates need a PAID (Starter+) Massive plan
+        and are ~15-minutes delayed -- which is why a ~10-minute poll fits with
+        no websocket. On the FREE tier only end-of-day data is authorized. NOTE:
+        the single-ticker snapshot and last-trade endpoints are NOT authorized on
+        the Options plan this runs under, so minute aggregates are used instead.
+
+        The minute read goes through `_request_with_backoff` directly, bypassing
+        the per-UTC-day cache in `_get`: an intraday alert must see a fresh bar
+        every poll cycle, not the first one of the day.
+        """
+        day = on_date or datetime.now(UTC).date().isoformat()
+        path = f"/v2/aggs/ticker/{ticker}/range/1/minute/{day}/{day}"
+        payload = self._request_with_backoff(
+            path, {"sort": "desc", "limit": 1, "adjusted": "true"}
+        )
+        rows = [row for row in payload.get("results", []) or [] if isinstance(row, dict)]
+        if rows:
+            try:
+                price = float(rows[0].get(FIELD_CLOSE))
+            except (TypeError, ValueError):
+                price = 0.0
+            if price > 0:
+                return price
+        # Fallback: the previous daily close (pre-open, or an empty intraday day).
+        prev = self.get_previous_close(ticker)
+        if prev is not None and prev.close > 0:
+            return prev.close
+        return None
+
     # --- breadth: grouped-daily (use D) ---------------------------------------
 
     def get_grouped_daily(
