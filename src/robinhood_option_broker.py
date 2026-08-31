@@ -187,6 +187,16 @@ class RobinhoodOptionBroker:
         rules: dict[str, Any] | None = None,
     ) -> None:
         self.client = client
+        # Pin the arm-gate lane to the POSITIVE, fail-closed options marker. A
+        # crypto/equities lane is arm-tracked by ABSENCE of a stop file (ARMED by
+        # default); consulting one from the leveraged options broker would silently
+        # restore the fail-OPEN semantics the positive marker closes. No legitimate
+        # non-options lane exists here.
+        if lane != OPTIONS_LANE:
+            raise ValueError(
+                f"RobinhoodOptionBroker arm lane must be {OPTIONS_LANE!r} (the positive, "
+                f"fail-closed marker); {lane!r} is absence-armed and would fail OPEN"
+            )
         self.lane = lane
         self.dry_run = dry_run
         self.confirm_live_order = confirm_live_order

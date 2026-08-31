@@ -250,6 +250,64 @@ def test_gate_reason_names_the_disarmed_lane(monkeypatch, tmp_path):
     assert "options lane is not armed" in broker.gate_reason()
 
 
+class _ExplodingArmStore:
+    """An arm store whose is_armed RAISES -- an unreadable store at the
+    irreversible moment (a real backend erroring under the connector call)."""
+
+    def is_armed(self, lane: str) -> bool:
+        raise RuntimeError("arm store unreadable")
+
+
+def test_unreadable_arm_store_blocks_and_never_submits(monkeypatch, tmp_path):
+    """MUTATION TEST: the broker's arm store RAISES. _is_options_lane_armed's
+    `except Exception: return False` must read that as DISARMED (fail safe) -- a
+    preview, no connector call, no propagating exception. Remove that guard and
+    submit_option_order raises instead of returning a preview, so both the
+    submitted==False assertion and the no-raise are lost."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    connector = FakeConnector()
+    # Broker wired to an exploding store; the client gets a benign ARMED store so
+    # the branch under test is the BROKER's own arm read (checked first).
+    client = RobinhoodOptionClient(
+        connector, arm_store=FakeArmStore(armed=True), expected_account=EXPECTED_ACCOUNT
+    )
+    kill = KillSwitch(stop_file=str(tmp_path / "STOP_TRADING_OPTIONS"), env_var="TRADING_ENABLED")
+    broker = RobinhoodOptionBroker(
+        client, arm_store=_ExplodingArmStore(), dry_run=False, confirm_live_order=True, kill_switch=kill
+    )
+
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="1", price="1.00", days_to_expiry=30, mode="live"
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_lane_disarmed"
+    assert connector.place_calls == []
+    assert broker._is_options_lane_armed() is False  # the guard swallowed the raise
+
+
+def test_broker_rejects_a_non_options_arm_lane(monkeypatch, tmp_path):
+    """MUTATION TEST: the leveraged options broker refuses any arm lane but
+    'options'. crypto/equities are arm-tracked by ABSENCE of a stop file (ARMED by
+    default), so consulting one here would silently fail OPEN. Drop the lane guard
+    in __init__ and construction succeeds instead of raising."""
+    connector = FakeConnector()
+    client = RobinhoodOptionClient(
+        connector, arm_store=FakeArmStore(armed=True), expected_account=EXPECTED_ACCOUNT
+    )
+    kill = KillSwitch(stop_file=str(tmp_path / "STOP_TRADING_OPTIONS"), env_var="TRADING_ENABLED")
+    for bad_lane in ("equities", "crypto", "bogus", ""):
+        with pytest.raises(ValueError, match="fail-closed"):
+            RobinhoodOptionBroker(
+                client,
+                arm_store=FakeArmStore(armed=False),
+                lane=bad_lane,
+                dry_run=False,
+                confirm_live_order=True,
+                kill_switch=kill,
+            )
+
+
 # --- property: STOP_TRADING_OPTIONS blocks at the irreversible moment ---------
 
 

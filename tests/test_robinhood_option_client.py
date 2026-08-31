@@ -526,6 +526,53 @@ def test_place_refuses_to_submit_when_no_arm_store_is_wired():
     assert connector.place_calls == []
 
 
+class _ExplodingArmStore:
+    """An arm store whose is_armed RAISES -- an unreadable store at the
+    irreversible moment (a real backend erroring under the connector call)."""
+
+    def is_armed(self, lane: str) -> bool:
+        raise RuntimeError("arm store unreadable")
+
+
+def test_place_refuses_to_submit_when_the_arm_store_raises():
+    """MUTATION TEST: a wired arm store whose is_armed() RAISES reads as DISARMED
+    (fail safe) -- the connector is never reached. Remove the `except Exception:
+    return False` guard in _is_options_lane_armed and this exception propagates
+    out of place_option_order instead of returning an unsubmitted preview; the
+    pytest.raises below then fails because no exception escapes."""
+    connector = FakeConnector()
+    client = RobinhoodOptionClient(
+        connector, arm_store=_ExplodingArmStore(), expected_account=EXPECTED_ACCOUNT
+    )
+
+    # With the guard in place: no exception escapes, nothing is submitted.
+    result = client.place_option_order(
+        long_legs(), price="1.00", days_to_expiry=30, dry_run=False, confirm_live_order=True
+    )
+    assert result["submitted"] is False
+    assert result["status"] == "options_lane_disarmed"
+    assert connector.place_calls == []
+
+    # And the guard itself swallows the raise (proves the branch is exercised).
+    assert client._is_options_lane_armed() is False
+
+
+def test_client_rejects_a_non_options_arm_lane():
+    """MUTATION TEST: the leveraged options client refuses any arm lane but
+    'options'. crypto/equities are arm-tracked by ABSENCE of a stop file (ARMED by
+    default), so consulting one here would silently fail OPEN. Drop the lane guard
+    in __init__ and this construction succeeds instead of raising."""
+    connector = FakeConnector()
+    for bad_lane in ("equities", "crypto", "bogus", ""):
+        with pytest.raises(ValueError, match="fail-closed"):
+            RobinhoodOptionClient(
+                connector,
+                arm_store=FakeArmStore(armed=False),
+                lane=bad_lane,
+                expected_account=EXPECTED_ACCOUNT,
+            )
+
+
 def test_truthy_nonboolean_flags_do_not_arm_the_lane():
     """MUTATION TEST: the gate is identity, not truthiness. dry_run=0 (falsy) and
     confirm_live_order='yes' (truthy) must NOT submit. An `if dry_run or not

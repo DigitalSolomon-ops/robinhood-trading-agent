@@ -292,6 +292,16 @@ class RobinhoodOptionClient:
         # can never fire, exactly as a disarmed lane. The store is the shared
         # ArmStore (src.shared_state.build_arm_store) in production.
         self._arm_store = arm_store
+        # Pin the arm-gate lane to the POSITIVE, fail-closed options marker. Any
+        # other lane (crypto/equities) is arm-tracked by ABSENCE of a stop file,
+        # which reads ARMED by default -- consulting one from the leveraged options
+        # client would silently restore the exact fail-OPEN semantics the positive
+        # marker exists to close. There is no legitimate non-options lane here.
+        if lane != OPTIONS_LANE:
+            raise ValueError(
+                f"RobinhoodOptionClient arm lane must be {OPTIONS_LANE!r} (the positive, "
+                f"fail-closed marker); {lane!r} is absence-armed and would fail OPEN"
+            )
         self._lane = lane
         self._config_root = config_root
         # The options risk caps, read from config lazily (only a genuine submit
