@@ -60,6 +60,53 @@ from .web_security import install_security_middleware
 
 SECRET_MARKERS = ("ROBINHOOD_API_KEY", "ROBINHOOD_PRIVATE_KEY", "PRIVATE_KEY", "API_KEY")
 
+# --- Per-lane arm / disarm toggle -------------------------------------------
+# Each lane trades only when its stop file is ABSENT (armed); the file present
+# means DISARMED (halted). Disarming is one click (the safe direction). Arming
+# requires an explicit confirm. NOTE: this enables/halts a lane's loop -- it does
+# NOT switch a lane from paper to LIVE, which stays a separate, higher gate.
+TRADING_LANES = ("crypto", "equities", "options")
+
+
+def _lane_stop_paths(root: Path, rules: dict[str, Any]) -> dict[str, tuple[str, Path]]:
+    """Each lane's stop-file path, matching the kill-switch conventions:
+    crypto = top-level kill_switch.stop_file (STOP_TRADING); equities/options =
+    their own <lane>.kill_switch.stop_file (STOP_TRADING_EQUITIES/_OPTIONS)."""
+    crypto = root / ((rules.get("kill_switch") or {}).get("stop_file", "STOP_TRADING"))
+    equities = root / (((rules.get("equities") or {}).get("kill_switch") or {}).get("stop_file", "STOP_TRADING_EQUITIES"))
+    options = root / (((rules.get("options") or {}).get("kill_switch") or {}).get("stop_file", "STOP_TRADING_OPTIONS"))
+    return {"crypto": ("Crypto", crypto), "equities": ("Equities", equities), "options": ("Options", options)}
+
+
+def _arm_panel_html(root: Path, rules: dict[str, Any]) -> str:
+    """Render the per-lane arm/disarm panel: current posture + the one control."""
+    rows: list[str] = []
+    for lane, (label, path) in _lane_stop_paths(root, rules).items():
+        disarmed = path.exists()
+        if disarmed:
+            state, color = "DISARMED — halted", "#166534"
+            control = (
+                f'<form method="post" action="/kill/{lane}/arm" style="display:inline">'
+                f'<label><input type="checkbox" name="confirm_arm"> confirm</label> '
+                f'<button type="submit">Arm {html.escape(label)}</button></form>'
+            )
+        else:
+            state, color = "ARMED — trading enabled", "#b91c1c"
+            control = (
+                f'<form method="post" action="/kill/{lane}/disarm" style="display:inline">'
+                f'<button type="submit">Disarm {html.escape(label)}</button></form>'
+            )
+        rows.append(
+            f'<tr><td><b>{html.escape(label)}</b></td>'
+            f'<td style="color:{color};font-weight:600">{state}</td><td>{control}</td></tr>'
+        )
+    note = (
+        "<p><b>This toggle enables or halts a lane's trading loop.</b> Disarming is one click "
+        "(the safe direction). Arming requires the confirm box. Switching a lane from paper to "
+        "<b>LIVE</b> is a separate, higher gate — this control does not do it.</p>"
+    )
+    return note + '<table cellpadding="8">' + "".join(rows) + "</table>"
+
 
 def dashboard_app(root: Path = ROOT) -> FastAPI:
     app = FastAPI(title="Digital Solomon Crypto Agent")
@@ -119,6 +166,41 @@ def dashboard_app(root: Path = ROOT) -> FastAPI:
                 stop_path.unlink()
             SQLiteLogger(app.state.root / "data" / "trading_agent.db").log_decision(None, "dashboard_clear_stop", "STOP_TRADING cleared from dashboard")
         return RedirectResponse("/kill", status_code=303)
+
+    @app.get("/arm", response_class=HTMLResponse)
+    def arm_panel() -> str:
+        rules, _ = load_dashboard_settings(app.state.root)
+        return page("Arm / Disarm", _arm_panel_html(app.state.root, rules))
+
+    @app.post("/kill/{lane}/disarm")
+    def lane_disarm(lane: str) -> RedirectResponse:
+        # Disarm = write the stop file = HALT the lane. Safe direction, one click.
+        rules, _ = load_dashboard_settings(app.state.root)
+        paths = _lane_stop_paths(app.state.root, rules)
+        if lane in paths:
+            label, path = paths[lane]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{label} lane DISARMED from dashboard at {datetime.now(UTC).isoformat()}\n", encoding="utf-8")
+            SQLiteLogger(app.state.root / "data" / "trading_agent.db").log_decision(
+                None, f"dashboard_disarm_{lane}", f"{label} lane DISARMED from dashboard"
+            )
+        return RedirectResponse("/arm", status_code=303)
+
+    @app.post("/kill/{lane}/arm")
+    async def lane_arm(lane: str, request: Request) -> RedirectResponse:
+        # Arm = remove the stop file = ENABLE the lane. Requires an explicit confirm;
+        # only a human request through the (IAP-gated) dashboard reaches this route.
+        form = await parse_form(request)
+        rules, _ = load_dashboard_settings(app.state.root)
+        paths = _lane_stop_paths(app.state.root, rules)
+        if lane in paths and form.get("confirm_arm") == "on":
+            label, path = paths[lane]
+            if path.exists():
+                path.unlink()
+            SQLiteLogger(app.state.root / "data" / "trading_agent.db").log_decision(
+                None, f"dashboard_arm_{lane}", f"{label} lane ARMED from dashboard"
+            )
+        return RedirectResponse("/arm", status_code=303)
 
     @app.get("/preview", response_class=HTMLResponse)
     def preview() -> str:
