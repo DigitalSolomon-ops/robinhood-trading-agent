@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,24 @@ def load_scout_config(path: Path | None = None) -> dict[str, Any]:
         return yaml.safe_load(handle) or {}
 
 
+def _gcloud_auth_alive(gcloud: str) -> bool:
+    """Fast (~6s) preflight that gcloud can actually mint a token. Stale ADC (the
+    daily Workspace expiry) makes the secret-access call HANG until its timeout;
+    checking auth first lets a stale token fail in seconds with the exact remedy
+    instead of a 30s hang. Mirrors the vault getSecretFast fail-fast pattern."""
+    try:
+        result = subprocess.run(
+            [gcloud, "auth", "application-default", "print-access-token"],
+            capture_output=True,
+            text=True,
+            timeout=6,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
 def _secret_from_manager(name: str) -> str | None:
     """Secret Manager half of the house pattern. Never raises, never logs the
     value. Disabled on Cloud Run/CI via DS_VAULT_NO_GCLOUD (ADC/SDK is the only
@@ -48,6 +67,13 @@ def _secret_from_manager(name: str) -> str | None:
     # On Windows `gcloud` is gcloud.cmd; a bare "gcloud" argv[0] raises
     # FileNotFoundError under subprocess without a shell. Resolve the real path.
     gcloud = shutil.which("gcloud") or "gcloud"
+    # Fail FAST on stale auth rather than hanging on the secret-access call.
+    if not _gcloud_auth_alive(gcloud):
+        sys.stderr.write(
+            "[vault] gcloud auth is stale/unavailable -- run: "
+            "gcloud auth application-default login\n"
+        )
+        return None
     try:
         result = subprocess.run(
             [gcloud, "secrets", "versions", "access", "latest", f"--secret={name}"],
