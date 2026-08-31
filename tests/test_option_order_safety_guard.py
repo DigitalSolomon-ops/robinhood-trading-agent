@@ -1708,10 +1708,14 @@ def test_soundness_check_passes_a_real_non_empty_scan(tmp_path: Path) -> None:
 
 
 def test_repo_src_has_no_ungated_option_submit_and_no_naked_short_path() -> None:
-    """The build gate. The execution lane has no modules yet, so today this
-    proves the analysis-only options_scout contains no order path and no
-    undefined-risk play; the moment an execution module lands -- under src/ OR
-    scripts/ -- it is discovered by content and held to both properties."""
+    """The build gate. The options execution modules now EXIST -- the client, the
+    broker and the runtime that reach place_option_order -- and this proves each
+    one submits only behind a confirm+arm gate and frames only defined-risk legs,
+    alongside the analysis-only options_scout which carries no order path. The
+    guard is a STATIC leg-shape and gate check: it verifies confirm + arm dominate
+    every submit and that no naked-short / undefined-risk leg shape is written into
+    src/ or scripts/; the numeric risk CAPS (debit, total-at-risk, DTE, contracts,
+    approval level) are enforced at submit time by option_risk_gates, not here."""
     report = scan_repo()
 
     assert_scan_is_sound(report)

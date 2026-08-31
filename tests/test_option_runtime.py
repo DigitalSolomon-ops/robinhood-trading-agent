@@ -34,9 +34,14 @@ from src.option_strategy import OptionOrderCandidate
 from src.option_runtime import (
     BASIS_CONNECTOR_QUOTE,
     BASIS_EXPECTED_MOVE,
+    ConnectorOptionQuotePlaySource,
+    ConnectorQuoteTarget,
     OptionPlay,
     PaperProvingOptionConnector,
+    _expected_positions_from_audit,
     _fill_candidate,
+    _open_premium_at_risk,
+    _provenance_supports_basis,
     build_option_paper_proving_connector,
     option_kill_switch,
     option_paper_proving_runs,
@@ -443,3 +448,192 @@ def test_the_headless_proving_connector_refuses_every_order_path(tmp_path: Path)
     ):
         with pytest.raises(RuntimeError):
             call()
+
+
+# --- provenance must SUBSTANTIATE the declared basis (proving honesty) ---------
+
+
+def _tighten_total_at_risk_cap(root: Path, cap_usd: float) -> None:
+    path = root / "config" / "trading_rules.yaml"
+    rules = yaml.safe_load(path.read_text(encoding="utf-8"))
+    rules["options"]["risk"]["max_total_premium_at_risk_usd"] = cap_usd
+    path.write_text(yaml.safe_dump(rules, sort_keys=False), encoding="utf-8")
+
+
+def test_provenance_gate_accepts_a_real_massive_window_and_a_real_connector_quote() -> None:
+    """The two real bases are accepted when their provenance backs them."""
+    assert _provenance_supports_basis(
+        BASIS_EXPECTED_MOVE,
+        {"basis": BASIS_EXPECTED_MOVE, "underlying_source": {"quote_source": "massive", "total_bars": 40, "from_date": "2024-01-01", "to_date": "2024-03-01"}},
+    )
+    assert _provenance_supports_basis(
+        BASIS_CONNECTOR_QUOTE,
+        {"basis": BASIS_CONNECTOR_QUOTE, "recorded_quotes": [{"contract": "AAPL-C-1", "premium": 2.5}]},
+    )
+    # And it REJECTS a basis whose provenance does not substantiate it.
+    assert not _provenance_supports_basis(BASIS_EXPECTED_MOVE, {"underlying_source": {"quote_source": "fabricated", "total_bars": 0}})
+    assert not _provenance_supports_basis(BASIS_CONNECTOR_QUOTE, {"recorded_quotes": []})
+    assert not _provenance_supports_basis(BASIS_EXPECTED_MOVE, None)
+
+
+def test_an_expected_move_run_with_unsubstantiated_provenance_is_not_counted(monkeypatch, tmp_path: Path) -> None:
+    """MUTATION TEST. A run that DECLARES the real expected-move basis but records
+    provenance that does not back it (no massive underlying window) must not
+    count. Drop the provenance check in the counting logic and this scans clean --
+    a self-declared 'real basis' would be taken verbatim again."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    write_config(tmp_path)
+
+    class BogusExpectedMoveSource(FixedPlaySource):
+        basis_name = BASIS_EXPECTED_MOVE
+
+        def provenance(self):
+            # Names the real basis, but the underlying series is fabricated.
+            return {"basis": BASIS_EXPECTED_MOVE, "underlying_source": {"quote_source": "fabricated", "total_bars": 0}}
+
+    run_option_paper_loop(
+        FakeOptionConnector(), tmp_path, play_source=BogusExpectedMoveSource(), iterations=4, poll_interval_seconds=0, sleep=lambda _s: None
+    )
+    reconcile_option_paper(tmp_path)
+
+    runs = option_paper_proving_runs(tmp_path)
+    assert runs and runs[-1]["fills"] >= 1
+    assert runs[-1]["basis_is_real"] is True
+    assert runs[-1]["basis_substantiated"] is False
+    assert runs[-1]["clean"] is False, "a basis the provenance does not substantiate must not count"
+
+
+def test_a_connector_quote_run_records_its_real_quotes_and_counts(monkeypatch, tmp_path: Path) -> None:
+    """The connector-quote basis records the REAL quotes it read, and a run priced
+    on it counts when those quotes are present and it reconciles clean."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    write_config(tmp_path)
+    connector = FakeOptionConnector()  # get_option_quotes returns a real mark of 2.50
+    client = RobinhoodOptionClient(connector, config_root=tmp_path)
+    source = ConnectorOptionQuotePlaySource(
+        client,
+        [ConnectorQuoteTarget(symbol=SYMBOL, contract_ticker="AAPL-C-1", strike=100.0, expiry_date="2099-01-15", reference_close=100.0)],
+    )
+
+    run_option_paper_loop(
+        connector, tmp_path, play_source=source, iterations=3, poll_interval_seconds=0, sleep=lambda _s: None
+    )
+    reconcile_option_paper(tmp_path)
+
+    assert source.provenance()["recorded_quotes"], "the basis must record the real quotes it read"
+    runs = option_paper_proving_runs(tmp_path)
+    assert runs and runs[-1]["quote_basis"] == BASIS_CONNECTOR_QUOTE
+    assert runs[-1]["basis_substantiated"] is True
+    assert runs[-1]["clean"] is True
+
+
+def test_a_connector_quote_run_with_no_recorded_quote_is_not_counted(monkeypatch, tmp_path: Path) -> None:
+    """MUTATION TEST. FixedPlaySource declares the connector-quote basis but its
+    provenance records no real quote. The run fills and reconciles clean, yet must
+    not count -- revert the provenance check and it counts, which is the exact
+    self-declared-basis dishonesty this slice closes."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    write_config(tmp_path)
+
+    run_option_paper_loop(
+        FakeOptionConnector(), tmp_path, play_source=FixedPlaySource(), iterations=3, poll_interval_seconds=0, sleep=lambda _s: None
+    )
+    reconcile_option_paper(tmp_path)
+
+    runs = option_paper_proving_runs(tmp_path)
+    assert runs and runs[-1]["quote_basis"] == BASIS_CONNECTOR_QUOTE
+    assert runs[-1]["basis_is_real"] is True
+    assert runs[-1]["basis_substantiated"] is False
+    assert runs[-1]["clean"] is False
+
+
+# --- the at-risk cap must carry OPEN exposure across cycles --------------------
+
+
+def test_open_premium_at_risk_is_read_from_the_ledger_and_capped_across_cycles(monkeypatch, tmp_path: Path) -> None:
+    """MUTATION TEST. With the total-at-risk cap set so exactly ONE 200-at-risk
+    fill fits, only the first cycle may fill: the second cycle must see the first
+    cycle's open premium-at-risk (200) and be blocked (200 open + 200 new > 250).
+    Leave open_premium_at_risk at 0.0 each cycle and every cycle fills again."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    write_config(tmp_path)
+    _tighten_total_at_risk_cap(tmp_path, 250.0)  # one 200 fill fits; a second does not
+
+    summary = run_option_paper_loop(
+        FakeOptionConnector(), tmp_path, play_source=FixedPlaySource(premium=2.0), iterations=4, poll_interval_seconds=0, sleep=lambda _s: None
+    )
+
+    assert summary["fills"] == 1, "the open at-risk from cycle 1 must block later cycles"
+    blocked = [
+        row for row in decisions(tmp_path)
+        if row["action"] == "option_play_skipped" and "at risk" in (row["reason"] or "")
+    ]
+    assert blocked, "the later cycles must be blocked by the total-at-risk gate, not silently dropped"
+
+
+def test_open_premium_at_risk_helper_sums_open_long_positions(tmp_path: Path) -> None:
+    """The helper reads open premium-at-risk straight off the ledger: contracts x
+    average premium x the 100x multiplier."""
+    write_config(tmp_path)
+    paper = PaperBroker(tmp_path / "data" / "option_paper_trades.db")
+    assert _open_premium_at_risk(paper, 100) == 0.0
+    paper.place_order({"symbol": "AAPL-C-1", "side": "buy", "quantity": 2.0, "limit_price": 3.0, "notional": 600.0, "strategy_signal": "option_single_leg_long"})
+    assert _open_premium_at_risk(paper, 100) == 600.0  # 2 contracts x 3.00 x 100
+
+
+# --- reconcile has an INDEPENDENT expected-position source ---------------------
+
+
+def test_reconcile_flags_a_ledger_that_disagrees_with_the_audit_trail(monkeypatch, tmp_path: Path) -> None:
+    """MUTATION TEST. A position booked into the paper ledger with NO matching
+    ACTION_FILLED audit row is a ledger that disagrees with the independent record
+    of what filled. Reconcile must report an expected_position_mismatch. Revert to
+    reconciling the ledger only against a recomputation of itself and the phantom
+    position passes clean."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    write_config(tmp_path)
+    paper = PaperBroker(tmp_path / "data" / "option_paper_trades.db")
+    # Book a position the audit trail never recorded a fill for.
+    paper.place_order({"symbol": "AAPL-C-PHANTOM", "side": "buy", "quantity": 1.0, "limit_price": 2.0, "notional": 200.0, "strategy_signal": "option_single_leg_long"})
+
+    result = reconcile_option_paper(tmp_path)
+
+    issues = {error["issue"] for error in result["errors"]}
+    assert "expected_position_mismatch" in issues, "a ledger the audit trail does not back must not reconcile clean"
+
+
+def test_expected_positions_scope_to_fills_after_the_last_reconcile(tmp_path: Path) -> None:
+    """MUTATION TEST for the scoping. The reconstruction counts only ACTION_FILLED
+    rows AFTER the most recent reconcile, so a prior run's (archived-ledger) fills
+    do not bleed into the current reconcile. Drop the id-boundary guard and the
+    earlier run's fill is counted too."""
+    write_config(tmp_path)
+    db = tmp_path / "data" / "trading_agent.db"
+    logger = SQLiteLogger(db)
+    logger.log_decision("AAPL", "option_paper_order_filled", "run 1 fill", {"contract": "AAPL-C-1", "quantity": 1})
+    logger.log_decision(None, "option_paper_reconcile", "run 1 reconciled", {"errors": []})
+    logger.log_decision("AAPL", "option_paper_order_filled", "run 2 fill", {"contract": "AAPL-C-2", "quantity": 2})
+
+    assert _expected_positions_from_audit(db) == {"AAPL-C-2": 2.0}
+
+
+def test_two_proving_runs_back_to_back_both_reconcile_clean(monkeypatch, tmp_path: Path) -> None:
+    """The scoping is load-bearing end to end: because the second run archives and
+    resets the ledger but the audit trail keeps every fill, an unscoped
+    reconstruction would double-count the shared contracts and fail the second
+    reconcile. Both reconciles being clean proves the boundary holds."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    write_config(tmp_path)
+    connector = build_option_paper_proving_connector(tmp_path)
+
+    first = run_option_proving_run(
+        connector, tmp_path, iterations=6, poll_interval_seconds=0, sleep=lambda _s: None,
+        client=FakeMassiveClient({SYMBOL: uptrend_closes()}),
+    )
+    second = run_option_proving_run(
+        connector, tmp_path, iterations=6, poll_interval_seconds=0, sleep=lambda _s: None,
+        client=FakeMassiveClient({SYMBOL: uptrend_closes()}),
+    )
+
+    assert first["reconcile"]["errors"] == [] and second["reconcile"]["errors"] == []
+    assert first["counts"] is True and second["counts"] is True

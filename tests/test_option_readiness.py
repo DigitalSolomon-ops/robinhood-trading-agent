@@ -149,14 +149,28 @@ def clean_option_run(
     quote_basis: str | None = BASIS_EXPECTED_MOVE,
 ) -> None:
     """One GENUINE unattended bounded options loop: real defined-risk fills,
-    priced on a REAL basis, the loop that finished, then a clean reconcile. A run
-    with no fills is not clean; nor is one priced on anything but a real basis
-    (which `quote_basis=None` / a made-up string models)."""
+    priced on a REAL basis, the loop that finished recording provenance that
+    SUBSTANTIATES that basis, then a clean reconcile. A run with no fills is not
+    clean; nor is one priced on anything but a real basis (`quote_basis=None` / a
+    made-up string models that); nor is one whose provenance does not back its
+    declared basis (which a real basis with no `basis_provenance` would model)."""
     for _ in range(fills):
         option_fill(db, symbol=symbol)
     details: dict = {"iterations_completed": iterations, "fills": fills}
     if quote_basis is not None:
         details["quote_basis"] = quote_basis
+        if quote_basis == BASIS_EXPECTED_MOVE:
+            # What a genuine expected-move run writes: the real Massive underlying
+            # window behind the premiums, which the counting logic validates.
+            details["basis_provenance"] = {
+                "basis": quote_basis,
+                "underlying_source": {
+                    "quote_source": "massive",
+                    "total_bars": iterations,
+                    "from_date": "2024-01-01",
+                    "to_date": "2024-06-30",
+                },
+            }
     log_decision(db, ACTION_COMPLETED, details)
     log_decision(db, ACTION_RECONCILE, {"errors": []})
 

@@ -51,7 +51,7 @@ from typing import Any, Iterable, Protocol, Sequence
 from dotenv import load_dotenv
 
 from .equity_intelligence.massive_client import MIN_REQUEST_INTERVAL_SECONDS, MassiveClient
-from .equity_intelligence.massive_history import MAX_LOOKBACK_DAYS, MassiveHistoryFeed
+from .equity_intelligence.massive_history import MAX_LOOKBACK_DAYS, QUOTE_SOURCE, MassiveHistoryFeed
 from .kill_switch import KillSwitch
 from .logger import SQLiteLogger
 from .option_risk_gates import OptionRiskConfig, resolve_granted_level
@@ -81,6 +81,50 @@ REAL_OPTION_BASES: tuple[str, ...] = (BASIS_CONNECTOR_QUOTE, BASIS_EXPECTED_MOVE
 # What a run records when it never said what it was priced on. Reported by name
 # so the counting logic can say why an unrecorded run does not count.
 UNRECORDED_BASIS = "unrecorded"
+
+
+def _provenance_supports_basis(basis: str, provenance: Any) -> bool:
+    """Does the recorded provenance actually SUBSTANTIATE the declared basis?
+
+    The basis name is self-declared by the play source; a run that merely names a
+    real basis while recording provenance that does not back it is not evidence
+    about a real market. This checks the two real bases structurally:
+
+      - underlying_expected_move: the underlying series must be REAL Massive
+        history -- an `underlying_source` whose quote_source is 'massive', with a
+        non-empty bar window (total_bars > 0 across a from/to date range);
+      - connector_option_quote: at least one REAL option quote must have been
+        recorded -- a positive premium actually read from the connector.
+
+    Anything else (a made-up basis, a missing or fabricated provenance) fails.
+    """
+    if not isinstance(provenance, dict):
+        return False
+    if basis == BASIS_EXPECTED_MOVE:
+        underlying = provenance.get("underlying_source")
+        if not isinstance(underlying, dict):
+            return False
+        if str(underlying.get("quote_source", "")).strip().lower() != QUOTE_SOURCE:
+            return False
+        try:
+            total_bars = int(underlying.get("total_bars") or 0)
+        except (TypeError, ValueError):
+            return False
+        return total_bars > 0 and bool(underlying.get("from_date")) and bool(underlying.get("to_date"))
+    if basis == BASIS_CONNECTOR_QUOTE:
+        quotes = provenance.get("recorded_quotes")
+        if not isinstance(quotes, list) or not quotes:
+            return False
+        for quote in quotes:
+            if not isinstance(quote, dict):
+                continue
+            try:
+                if float(quote.get("premium")) > 0:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
+    return False
 
 # Audit-log action names, kept distinct so act/fill/completion/reconcile are
 # trivially separable by a reader (and by the counting logic below).
@@ -324,12 +368,18 @@ class ConnectorOptionQuotePlaySource:
     def __init__(self, client: RobinhoodOptionClient, targets: Sequence[ConnectorQuoteTarget]) -> None:
         self.client = client
         self.targets = list(targets)
+        # The REAL quotes this basis actually read, recorded as it prices each
+        # cycle. The counting logic validates the connector-quote basis against
+        # this: a run that claims the execution basis but recorded no real quote
+        # is not evidence about a real market and does not count.
+        self._recorded_quotes: list[dict[str, Any]] = []
 
     def provenance(self) -> dict[str, Any]:
         return {
             "basis": self.basis_name,
             "vendor": "Robinhood options OAuth connector",
             "contracts": [target.contract_ticker for target in self.targets],
+            "recorded_quotes": list(self._recorded_quotes),
             "note": "premium = the live Robinhood option quote read at cycle time (the execution basis)",
         }
 
@@ -365,6 +415,9 @@ class ConnectorOptionQuotePlaySource:
             premium = self._premium_from_quote(self.client.get_option_quotes(target.contract_ticker))
             if premium is None:
                 continue
+            self._recorded_quotes.append(
+                {"contract": target.contract_ticker, "premium": float(premium), "read_at": datetime.now(UTC).isoformat()}
+            )
             plays.append(
                 OptionPlay(
                     symbol=target.symbol.upper(),
@@ -444,6 +497,25 @@ def _fill_candidate(
     return fill
 
 
+def _open_premium_at_risk(paper: PaperBroker, multiplier: int) -> float:
+    """The premium-at-risk currently OPEN in the paper ledger, in dollars.
+
+    Every fill in this lane is a single-leg long (max loss = debit paid), so a
+    position's dollars-at-risk is its contract count x average premium x the
+    contract multiplier. Summed over the ledger's open (net long) positions this
+    is what the total-at-risk cap must see at the top of each cycle -- without it
+    the cap resets to zero every cycle and a run could open unbounded cumulative
+    risk one cycle at a time.
+    """
+    total = 0.0
+    for position in paper.get_portfolio().positions.values():
+        quantity = float(position.quantity)
+        if quantity <= 0:
+            continue
+        total += quantity * float(position.average_price) * multiplier
+    return round(total, 2)
+
+
 def run_option_paper_loop(
     connector: OptionConnector,
     root: Path,
@@ -503,7 +575,14 @@ def run_option_paper_loop(
             break
 
         plays = play_source.plays(symbols, today)
-        decisions = plan_from_rules(plays, rules, granted_level, logger=logger, today=today)
+        # Compute the premium-at-risk already OPEN in the ledger at the top of the
+        # cycle and thread it into the RiskManager, so the total-at-risk cap sees
+        # exposure this run's prior cycles committed to -- not a fresh zero each
+        # cycle (which would let cumulative risk grow unbounded one cycle at a time).
+        open_at_risk = _open_premium_at_risk(paper, multiplier)
+        decisions = plan_from_rules(
+            plays, rules, granted_level, logger=logger, open_premium_at_risk_usd=open_at_risk, today=today
+        )
         # Refresh the paper cash at the top of the cycle and decrement it as fills
         # book, so the loop never spends cash it does not have -- a cash account,
         # settled funds only. Without this the loop would drive cash negative over
@@ -547,6 +626,11 @@ def run_option_paper_loop(
         sleep(poll_interval_seconds)
 
     if not halted:
+        # Re-read the provenance at completion (not the top-of-loop snapshot) so
+        # what the basis ACTUALLY recorded while it priced -- the real connector
+        # quotes it read, the underlying bars it loaded -- is what the counting
+        # logic audits against the declared basis name.
+        final_provenance = play_source.provenance() if hasattr(play_source, "provenance") else {"basis": basis_name}
         logger.log_decision(
             None,
             ACTION_COMPLETED,
@@ -557,9 +641,10 @@ def run_option_paper_loop(
                 "iterations_completed": completed,
                 "fills": fills,
                 # The claim the counting logic audits. A run priced on anything
-                # but a real basis says so here, and is not counted.
+                # but a real basis -- or one whose provenance does not substantiate
+                # the declared basis -- says so here, and is not counted.
                 "quote_basis": basis_name,
-                "basis_provenance": provenance,
+                "basis_provenance": final_provenance,
             },
         )
     return {"iterations_completed": completed, "halted": halted, "quote_basis": basis_name, "fills": fills}
@@ -570,15 +655,51 @@ def run_option_paper_loop(
 # ---------------------------------------------------------------------------
 
 
+def _expected_positions_from_audit(db_path: Path) -> dict[str, float]:
+    """Reconstruct the options ledger's expected open positions from an
+    INDEPENDENT source -- the ACTION_FILLED decision rows in trading_agent.db,
+    a separate store from the paper ledger the reconcile is checking.
+
+    Only fills SINCE the most recent reconcile are counted, so the reconstruction
+    is scoped to the current, freshly-reset ledger and does not carry a prior
+    run's (archived) fills. This is what lets the reconcile be falsifiable: if
+    the ledger and the audit trail disagree about what is open, that is an error,
+    rather than the ledger being checked only against a recomputation of itself.
+    """
+    rows = _decision_rows(db_path, (ACTION_FILLED, ACTION_RECONCILE))
+    last_reconcile_id = max((row["id"] for row in rows if row["action"] == ACTION_RECONCILE), default=0)
+    expected: dict[str, float] = {}
+    for row in rows:
+        if row["action"] != ACTION_FILLED or row["id"] <= last_reconcile_id:
+            continue
+        contract = row["details"].get("contract")
+        if not contract:
+            continue
+        try:
+            quantity = float(row["details"].get("quantity") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        expected[str(contract)] = expected.get(str(contract), 0.0) + quantity
+    return expected
+
+
 def reconcile_option_paper(root: Path, epsilon: float = 0.000001) -> dict[str, Any]:
-    """Read-only-safe reconciliation of the options paper ledger -- mirrors
-    reconcile_equity_paper over data/option_paper_trades.db. Honest: it asserts
-    cash conservation and position consistency and reports errors on any mismatch,
-    so 'reconciled clean' (errors == []) is a real, falsifiable claim."""
+    """Reconcile the options paper ledger against an INDEPENDENT expected-position
+    source -- the ACTION_FILLED audit trail -- not just a recomputation of the
+    same ledger. Mirrors reconcile_equity_paper over data/option_paper_trades.db,
+    and asserts cash conservation and position consistency on top; 'reconciled
+    clean' (errors == []) is a real, falsifiable claim because a ledger that
+    disagrees with what the audit says was filled reports an error."""
     logger = SQLiteLogger(root / "data" / "trading_agent.db")
     broker = PaperBroker(root / OPTION_PAPER_LEDGER)
-    result = broker.reconcile_positions(epsilon=epsilon)
-    logger.log_decision(None, ACTION_RECONCILE, "options paper positions reconciled", {**result, "venue": VENUE})
+    expected_positions = _expected_positions_from_audit(root / "data" / "trading_agent.db")
+    result = broker.reconcile_positions(epsilon=epsilon, expected_positions=expected_positions)
+    logger.log_decision(
+        None,
+        ACTION_RECONCILE,
+        "options paper positions reconciled against the ACTION_FILLED audit trail",
+        {**result, "venue": VENUE, "expected_positions": expected_positions},
+    )
     return result
 
 
@@ -703,6 +824,7 @@ def run_option_proving_run(
     reconcile = reconcile_option_paper(root)
     counts = (
         summary["quote_basis"] in REAL_OPTION_BASES
+        and _provenance_supports_basis(summary["quote_basis"], play_source.provenance())
         and not summary["halted"]
         and int(summary["iterations_completed"]) > 0
         and int(summary["fills"]) >= 1
@@ -748,8 +870,11 @@ def option_paper_proving_runs(root: Path) -> list[dict[str, Any]]:
     A run is `clean` only if ALL of the following hold, so that a run being clean
     is a real, falsifiable claim rather than a tautology:
 
-      - the run recorded its basis, and that basis is one of the REAL bases
-        (a made-up or unrecorded basis is not evidence about a real market);
+      - the run recorded its basis, that basis is one of the REAL bases, AND the
+        provenance it recorded substantiates that basis (expected-move must carry
+        a real Massive underlying window; connector-quote must carry a real
+        recorded quote) -- a made-up, unrecorded, or unsubstantiated basis is not
+        evidence about a real market;
       - a reconcile falls in this run's OWN window (after this completion and
         before the next), consumed by at most one run, and it reported no errors;
       - the loop actually iterated;
@@ -782,12 +907,15 @@ def option_paper_proving_runs(root: Path) -> list[dict[str, Any]]:
         ledger_delta = sum(abs(float(fill["details"].get("notional") or 0.0)) for fill in window_fills)
         iterations = int(completion["details"].get("iterations_completed") or 0)
         basis = str(completion["details"].get("quote_basis") or UNRECORDED_BASIS)
+        provenance = completion["details"].get("basis_provenance")
+        basis_substantiated = _provenance_supports_basis(basis, provenance)
         errors = (following or {}).get("details", {}).get("errors", None)
         runs.append(
             {
                 "completed_at": completion["timestamp"],
                 "quote_basis": basis,
                 "basis_is_real": basis in REAL_OPTION_BASES,
+                "basis_substantiated": basis_substantiated,
                 "iterations_completed": iterations,
                 "reconciled": following is not None,
                 "reconcile_errors": errors,
@@ -795,6 +923,7 @@ def option_paper_proving_runs(root: Path) -> list[dict[str, Any]]:
                 "ledger_delta": ledger_delta,
                 "clean": (
                     basis in REAL_OPTION_BASES
+                    and basis_substantiated
                     and following is not None
                     and errors == []
                     and iterations > 0
