@@ -325,6 +325,33 @@ def _leg_role(leg: Mapping[str, Any]) -> tuple[str, str]:
     return side, effect
 
 
+def caps_direction(legs: Sequence[Mapping[str, Any]], direction: str) -> str:
+    """The direction the per-trade DEBIT cap must be evaluated under at the
+    irreversible submit -- derived from the leg polarity, NOT trusted from the
+    caller's label.
+
+    `debit_premium_usd` returns $0 for a `credit` order (a real credit spread
+    collects premium, so the debit cap does not apply). But BUYING a leg PAYS
+    premium: an order that contains any BUY leg is a net debit. At the submit
+    path the shared defined-risk validator has ALREADY refused every opening
+    short, so a real credit spread (long + covering short) cannot reach the caps
+    at all -- which means an order that reaches the caps while carrying a BUY leg
+    is a long, and a `credit` label on it is a mislabel that would otherwise void
+    the per-trade debit cap (letting a long submit at up to the looser
+    total-at-risk cap). So: any BUY leg forces `debit`; only an all-sell
+    (reducing / sell-to-close) order, which genuinely collects, keeps `credit`.
+
+    This lives beside the submit path deliberately: the standalone
+    evaluate_option_order still honors a caller's `credit` for a genuine credit
+    spread (used in the gate unit tests), because those never carry an opening
+    short past defined-risk in production.
+    """
+    for leg in legs or []:
+        if isinstance(leg, Mapping) and str(leg.get("side")).strip().lower() == "buy":
+            return "debit"
+    return str(direction).strip().lower()
+
+
 def classify_strategy(legs: Sequence[Mapping[str, Any]]) -> str:
     """Assign a leg set to a lane-internal strategy class for the level gate.
 

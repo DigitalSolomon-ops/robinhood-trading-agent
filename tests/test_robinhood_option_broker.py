@@ -1006,3 +1006,29 @@ def test_submit_signal_within_budget_submits_true_contract_count(monkeypatch, tm
     assert result["submitted"] is True
     assert len(connector.place_calls) == 1
     assert connector.place_calls[0]["quantity"] == "2"
+
+
+# --- caps-at-submit: the DEBIT cap keys off leg polarity, not the caller's label
+# A long (buy-to-open) mislabeled direction='credit' must not escape the per-trade
+# debit cap: debit_premium_usd returns $0 for a credit order, and defined risk has
+# already refused every opening short at the submit path, so any buy leg is a real
+# debit and the cap must fire on it.
+
+
+def test_broker_refuses_a_long_mislabeled_credit_over_the_debit_cap(monkeypatch, tmp_path):
+    """MUTATION TEST: fully armed + confirmed live, a single buy-to-open leg at
+    $6.00 (= $600 debit, over the $500 cap) labeled direction='credit'. The debit
+    cap must still fire (status 'options_risk_gate_blocked', human_gate naming the
+    debit cap) and the connector must never be reached. Revert caps_direction and
+    the 'credit' label voids the debit cap and the $600 long submits."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="credit", quantity="1", price="6.00", days_to_expiry=30, mode="live"
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_debit_premium_per_trade" in result["human_gate"]
+    assert connector.place_calls == []

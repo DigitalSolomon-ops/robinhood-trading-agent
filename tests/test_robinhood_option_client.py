@@ -959,3 +959,55 @@ def test_cancel_submits_only_when_dry_run_false_and_confirm_true():
     assert connector.cancel_calls == [
         {"order_id": "opt-order-1", "account_number": AGENT_ACCOUNT["account_number"]}
     ]
+
+
+# --- caps-at-submit: the DEBIT cap keys off leg polarity, not the caller's label
+# debit_premium_usd returns $0 for a 'credit' order, so trusting the caller's
+# direction label would let a long (buy-to-open) mislabeled 'credit' escape the
+# per-trade debit cap and submit at up to the looser total-at-risk cap. At the
+# submit path defined risk has already refused every opening short, so any buy
+# leg reaching the caps is a real debit and must be capped as one.
+
+
+def test_place_refuses_a_long_mislabeled_credit_over_the_debit_cap():
+    """MUTATION TEST: a single buy-to-open leg at $6.00 (= $600 debit, over the
+    $500 per-trade cap) labeled direction='credit', fully gated + armed. It must
+    be blocked with status 'options_risk_gate_blocked' naming the debit cap, and
+    the connector never called. Revert caps_direction (trust the 'credit' label)
+    and debit_premium_usd reads $0, the debit cap is voided, and the $600 long
+    submits."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), direction="credit", quantity="1", price="6.00", days_to_expiry=30,
+        dry_run=False, confirm_live_order=True,
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_debit_premium_per_trade" in result["risk_gate"]
+    assert connector.place_calls == []
+
+
+def test_caps_direction_forces_debit_for_a_buy_leg_but_spares_a_sell_to_close():
+    """Pin caps_direction directly: any BUY leg forces 'debit' (the debit cap must
+    see the real premium); an all-sell reducing order keeps 'credit' (a close
+    genuinely collects, so the debit cap stays off). Revert it to return the
+    caller's label and the buy leg keeps 'credit', voiding the debit cap."""
+    from src.option_risk_gates import caps_direction
+
+    assert caps_direction(long_legs(), "credit") == "debit"
+    sell_to_close = [{"side": "sell", "position_effect": "close", "ratio_quantity": 1, "option": LONG_CALL}]
+    assert caps_direction(sell_to_close, "credit") == "credit"
+
+
+def test_client_caps_spare_a_genuine_sell_to_close_credit_from_the_debit_cap():
+    """Precision: the polarity correction must NOT over-block a real close. A
+    sell-to-close at $6.00 collects premium, so the debit cap must stay off and
+    the caps pass (None)."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+    sell_to_close = [{"side": "sell", "position_effect": "close", "ratio_quantity": 1, "option": LONG_CALL}]
+
+    assert client._option_caps_block(sell_to_close, "credit", "1", "6.00", 30, 0.0, None) is None

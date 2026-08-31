@@ -65,6 +65,7 @@ from .option_risk_gates import (
     GateName,
     OptionOrderProposal,
     OptionRiskConfig,
+    caps_direction,
     evaluate_option_order,
     resolve_granted_level,
 )
@@ -346,7 +347,13 @@ class RobinhoodOptionBroker:
             net_premium_per_contract=premium,
             quantity=qty_int,
             days_to_expiry=dte,
-            direction=str(direction).strip().lower(),
+            # Cap under a direction derived from the leg polarity, never trusted
+            # from the caller's label: a 'credit' tag on an order that BUYS a leg
+            # would otherwise void the per-trade debit cap (debit_premium_usd
+            # returns $0 for credit). Defined risk has already refused every
+            # opening short here, so any buy leg is a real debit. Defense in
+            # depth with the client, which applies the same correction.
+            direction=caps_direction(legs, direction),
             max_loss_per_contract_usd=max_loss_per_contract_usd,
         )
         decision = evaluate_option_order(
