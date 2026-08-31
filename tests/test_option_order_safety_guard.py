@@ -85,6 +85,13 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC = REPO_ROOT / "src"
 
+# The tree is scanned across BOTH source roots. An options execution module can
+# just as easily land under scripts/ as under src/ -- a standalone runner, a
+# one-off submit helper -- and a guard that only ever looked at src/ would wave
+# it straight through. The subdir list is the single knob: drop "scripts" and
+# the scripts-lane fixture below goes red.
+SCAN_SUBDIRS = ("src", "scripts")
+
 # The connector's option ORDER toolset. place is the only one that can create
 # or close a position; review is a non-committal preview and cancel reduces
 # exposure (see the module docstring).
@@ -321,9 +328,40 @@ def _expr_text(node: ast.AST) -> str:
     return ""
 
 
-def _constant_str(node: ast.AST | None) -> str | None:
-    folded = _fold_concat(node) if node is not None else None
+def _constant_str(node: ast.AST | None, consts: dict[str, str] | None = None) -> str | None:
+    """The lower-cased string value of a node, folding constants.
+
+    A bare Name is resolved through `consts` -- the module/class-level string
+    bindings -- so a leg written `{"side": SIDE_SELL}` with `SIDE_SELL = "sell"`
+    classifies exactly as the literal `{"side": "sell"}` would. This is the same
+    constant fold the discovery half already does for tool names; property B was
+    blind to it, letting a naked short hide its `side` behind a module constant.
+    """
+    if node is None:
+        return None
+    if isinstance(node, ast.Name) and consts and node.id in consts:
+        return consts[node.id].strip().lower()
+    folded = _fold_concat(node)
     return folded.strip().lower() if isinstance(folded, str) else None
+
+
+def _module_string_constants(tree: ast.Module) -> dict[str, str]:
+    """Module-level and class-level names bound to a constant string.
+
+    Only literal / folded-`+` string values are captured, so a name is resolved
+    to a side or effect token only when its value is statically knowable.
+    """
+    consts: dict[str, str] = {}
+    for node in _module_assignments(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        if node.value is None:
+            continue
+        folded = _fold_concat(node.value)
+        if isinstance(folded, str):
+            for target in _assignment_targets(node):
+                consts[target] = folded
+    return consts
 
 
 # --- discovery ----------------------------------------------------------------
@@ -392,15 +430,27 @@ def _tainted_assignments(tree: ast.Module, tainted: dict[str, frozenset[str]]) -
     return found
 
 
-def discover_execution_modules(root: Path) -> tuple[dict[str, ast.Module], set[str], set[str], dict[str, frozenset[str]]]:
+def _collect_sources(root: Path, base: Path | None = None) -> dict[str, str]:
+    """Every Python module under `root`, keyed by its path relative to `base`.
+
+    `base` defaults to `root` (bare filenames, as the tmp_path fixtures expect);
+    the real scan passes REPO_ROOT so `src/...` and `scripts/...` stay distinct
+    when both trees are merged into one scan.
+    """
+    base = base or root
+    sources: dict[str, str] = {}
+    for path in python_modules(root):
+        sources[path.relative_to(base).as_posix()] = path.read_text(encoding="utf-8")
+    return sources
+
+
+def discover_execution_modules(
+    sources: dict[str, str],
+) -> tuple[dict[str, ast.Module], set[str], set[str], dict[str, frozenset[str]]]:
     """Return (parsed modules, in-scope paths, direct order-tool modules, taint map)."""
     parsed: dict[str, ast.Module] = {}
-    sources: dict[str, str] = {}
 
-    for path in python_modules(root):
-        relative = _rel(path, root)
-        source = path.read_text(encoding="utf-8")
-        sources[relative] = source
+    for relative, source in sources.items():
         try:
             parsed[relative] = ast.parse(source, filename=relative)
         except SyntaxError:
@@ -570,22 +620,50 @@ class _GateScanner:
     # -- expression level
 
     def _expression(self, node: ast.AST, established: frozenset[str]) -> None:
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call) and is_submit_call(child, self.tainted):
-                self.submit_sites += 1
-                missing = REQUIRED_FACTS - established
-                if missing:
-                    self.violations.append(
-                        Violation(
-                            module=self.module,
-                            line=child.lineno,
-                            kind="ungated_submit",
-                            detail=(
-                                f"{_expr_text(child.func) or 'dispatch'}(...) can submit a live option "
-                                f"order without {' and '.join(sorted(missing))}"
-                            ),
-                        )
+        """Walk an expression tracking the facts that hold at each sub-node.
+
+        Plain descent carries `established` unchanged, but three expression
+        forms establish facts for the sub-tree they short-circuit into, exactly
+        as an enclosing `if` would:
+
+          * a ternary `submit() if gate else preview` -- the `body` sees the
+            test true, the `orelse` sees it false;
+          * `gate and submit()` -- the tail runs only when the head is true;
+          * `not gate or submit()` -- the tail runs only when the head is false.
+
+        Without this a fully-gated ternary submit is read as ungated and
+        (allowlist-riskily) flagged; with it the gate is honoured, and the
+        polarity handling keeps an INVERTED ternary flagged.
+        """
+        if isinstance(node, ast.IfExp):
+            self._expression(node.test, established)
+            self._expression(node.body, established | gate_facts(node.test, True))
+            self._expression(node.orelse, established | gate_facts(node.test, False))
+            return
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, (ast.And, ast.Or)):
+            want_true = isinstance(node.op, ast.And)
+            accumulated = established
+            for value in node.values:
+                self._expression(value, accumulated)
+                accumulated = accumulated | gate_facts(value, want_true)
+            return
+        if isinstance(node, ast.Call) and is_submit_call(node, self.tainted):
+            self.submit_sites += 1
+            missing = REQUIRED_FACTS - established
+            if missing:
+                self.violations.append(
+                    Violation(
+                        module=self.module,
+                        line=node.lineno,
+                        kind="ungated_submit",
+                        detail=(
+                            f"{_expr_text(node.func) or 'dispatch'}(...) can submit a live option "
+                            f"order without {' and '.join(sorted(missing))}"
+                        ),
                     )
+                )
+        for child in ast.iter_child_nodes(node):
+            self._expression(child, established)
 
     # -- statement level
 
@@ -658,19 +736,19 @@ def _dict_entries(node: ast.Dict) -> dict[str, ast.expr]:
     return entries
 
 
-def _leg_from_dict(node: ast.Dict) -> Leg | None:
+def _leg_from_dict(node: ast.Dict, consts: dict[str, str] | None = None) -> Leg | None:
     entries = _dict_entries(node)
     if _SIDE_KEY not in entries and _EFFECT_KEY not in entries:
         return None
     return Leg(
         node=node,
-        side=_constant_str(entries.get(_SIDE_KEY)),
-        effect=_constant_str(entries.get(_EFFECT_KEY)),
+        side=_constant_str(entries.get(_SIDE_KEY), consts),
+        effect=_constant_str(entries.get(_EFFECT_KEY), consts),
         line=node.lineno,
     )
 
 
-def _leg_from_call(call: ast.Call) -> Leg | None:
+def _leg_from_call(call: ast.Call, consts: dict[str, str] | None = None) -> Leg | None:
     """A single-leg order spelled as keyword arguments:
     `place_option_order(side="sell", position_effect="open", ...)`."""
     keywords = {keyword.arg: keyword.value for keyword in call.keywords if keyword.arg}
@@ -678,8 +756,8 @@ def _leg_from_call(call: ast.Call) -> Leg | None:
         return None
     return Leg(
         node=call,
-        side=_constant_str(keywords.get(_SIDE_KEY)),
-        effect=_constant_str(keywords.get(_EFFECT_KEY)),
+        side=_constant_str(keywords.get(_SIDE_KEY), consts),
+        effect=_constant_str(keywords.get(_EFFECT_KEY), consts),
         line=call.lineno,
     )
 
@@ -692,35 +770,80 @@ def _parent_map(tree: ast.AST) -> dict[int, ast.AST]:
     return parents
 
 
-def _direction_of(node: ast.AST) -> str | None:
+def _direction_of(node: ast.AST, consts: dict[str, str] | None = None) -> str | None:
     """The literal `direction` ("debit" / "credit") declared ON this node."""
     if isinstance(node, ast.Dict):
-        return _constant_str(_dict_entries(node).get(_DIRECTION_KEY))
+        return _constant_str(_dict_entries(node).get(_DIRECTION_KEY), consts)
     if isinstance(node, ast.Call):
         for keyword in node.keywords:
             if keyword.arg == _DIRECTION_KEY:
-                return _constant_str(keyword.value)
+                return _constant_str(keyword.value, consts)
         for argument in node.args:
             for child in ast.walk(argument):
                 if isinstance(child, ast.Dict):
-                    found = _constant_str(_dict_entries(child).get(_DIRECTION_KEY))
+                    found = _constant_str(_dict_entries(child).get(_DIRECTION_KEY), consts)
                     if found is not None:
                         return found
     return None
 
 
-def _enclosing_direction(node: ast.AST, parents: dict[int, ast.AST]) -> str | None:
+def _enclosing_direction(
+    node: ast.AST, parents: dict[int, ast.AST], consts: dict[str, str] | None = None
+) -> str | None:
     """The order's `direction`, read from the payload node or any node
     enclosing it. A legs LIST is the tightest group, but `direction` lives one
     level out on the payload dict that carries the list -- so the lookup climbs.
     """
     current: ast.AST | None = node
     while current is not None:
-        found = _direction_of(current)
+        found = _direction_of(current, consts)
         if found is not None:
             return found
         current = parents.get(id(current))
     return None
+
+
+def _enclosing_function(node: ast.AST, parents: dict[int, ast.AST]) -> ast.AST | None:
+    """The nearest enclosing function/module node -- the scope a local `legs`
+    list lives in."""
+    current: ast.AST | None = parents.get(id(node))
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)):
+            return current
+        current = parents.get(id(current))
+    return None
+
+
+def _append_leg_groups(
+    tree: ast.AST, parents: dict[int, ast.AST], consts: dict[str, str] | None
+) -> tuple[dict[int, tuple[int, str]], dict[tuple[int, str], ast.AST]]:
+    """Leg dicts appended to a list, keyed by (enclosing scope, list name).
+
+    A defined-risk spread is often assembled imperatively --
+    `legs = []; legs.append({buy...}); legs.append({sell...})` -- so the legs
+    never share a literal payload node. Without this, each appended dict is its
+    own group and the covered short reads as a lone naked short. Grouping the
+    appends to one list re-unites them into a single payload.
+    """
+    member_of: dict[int, tuple[int, str]] = {}
+    group_root: dict[tuple[int, str], ast.AST] = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+            continue
+        if node.func.attr != "append" or not node.args:
+            continue
+        arg = node.args[0]
+        if not (isinstance(arg, ast.Dict) and _leg_from_dict(arg, consts)):
+            continue
+        list_name = _expr_text(node.func.value)
+        if not list_name:
+            continue
+        scope = _enclosing_function(node, parents)
+        key = (id(scope) if scope is not None else 0, list_name)
+        member_of[id(arg)] = key
+        # The scope node is a stable anchor for the group's line / direction climb.
+        group_root.setdefault(key, scope if scope is not None else arg)
+    return member_of, group_root
 
 
 def naked_short_violations(module: str, tree: ast.Module, tainted: dict[str, frozenset[str]]) -> list[Violation]:
@@ -729,9 +852,12 @@ def naked_short_violations(module: str, tree: ast.Module, tainted: dict[str, fro
     Legs are grouped by their nearest enclosing PAYLOAD node -- an order call, a
     literal list of legs, or a dict carrying a `legs` key -- so the two legs of a
     vertical spread are read as one defined-risk payload, and a lone sell-to-open
-    is read as the naked short it is.
+    is read as the naked short it is. Legs assembled by `legs.append({...})` are
+    grouped by their target list, the same way.
     """
+    consts = _module_string_constants(tree)
     parents = _parent_map(tree)
+    append_member, append_root = _append_leg_groups(tree, parents, consts)
 
     group_nodes: set[int] = set()
     for node in ast.walk(tree):
@@ -740,7 +866,7 @@ def naked_short_violations(module: str, tree: ast.Module, tainted: dict[str, fro
         ):
             group_nodes.add(id(node))
         elif isinstance(node, (ast.List, ast.Tuple, ast.Set)):
-            if any(isinstance(element, ast.Dict) and _leg_from_dict(element) for element in node.elts):
+            if any(isinstance(element, ast.Dict) and _leg_from_dict(element, consts) for element in node.elts):
                 group_nodes.add(id(node))
         elif isinstance(node, ast.Dict) and "legs" in _dict_entries(node):
             group_nodes.add(id(node))
@@ -748,9 +874,9 @@ def naked_short_violations(module: str, tree: ast.Module, tainted: dict[str, fro
     legs: list[Leg] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Dict):
-            leg = _leg_from_dict(node)
+            leg = _leg_from_dict(node, consts)
         elif isinstance(node, ast.Call):
-            leg = _leg_from_call(node)
+            leg = _leg_from_call(node, consts)
         else:
             leg = None
         if leg is not None:
@@ -767,9 +893,14 @@ def naked_short_violations(module: str, tree: ast.Module, tainted: dict[str, fro
             node = parents.get(id(node))
         return leg.node
 
-    grouped: dict[int, list[Leg]] = {}
-    roots: dict[int, ast.AST] = {}
+    grouped: dict[object, list[Leg]] = {}
+    roots: dict[object, ast.AST] = {}
     for leg in legs:
+        append_key = append_member.get(id(leg.node))
+        if append_key is not None:
+            grouped.setdefault(append_key, []).append(leg)
+            roots[append_key] = append_root[append_key]
+            continue
         root = group_of(leg)
         grouped.setdefault(id(root), []).append(leg)
         roots[id(root)] = root
@@ -791,9 +922,15 @@ def naked_short_violations(module: str, tree: ast.Module, tainted: dict[str, fro
             )
         if naked_legs:
             continue
-        # The dynamic case: sides computed at runtime, but the payload declares
-        # itself a CREDIT opening order -- premium collected with no long leg.
-        if _enclosing_direction(roots[key], parents) == "credit" and any(leg.effect == "open" for leg in members):
+        # The dynamic case: a CREDIT opening order with no long leg is collecting
+        # premium against undefined risk. A leg counts as a possible opening sell
+        # when neither of its two classifying fields RULES that out -- effect is
+        # not a known "close" and side is not a known "buy". That catches both a
+        # dynamic side over a literal `open` effect AND a dynamic position_effect
+        # under a literal `sell` side; only a leg proven to be a close or a buy
+        # (e.g. a sell-to-close exit) clears it.
+        opening_sell = [leg for leg in members if leg.effect != "close" and leg.side != "buy"]
+        if _enclosing_direction(roots[key], parents, consts) == "credit" and opening_sell:
             violations.append(
                 Violation(
                     module=module,
@@ -863,10 +1000,10 @@ def _strategy_value_violations(module: str, value: ast.AST, skip: set[int]) -> l
 # --- the scan -----------------------------------------------------------------
 
 
-def scan_tree(root: Path) -> GuardReport:
-    """Scan a source tree for ungated option submits and naked-short paths."""
-    parsed, in_scope, direct, tainted = discover_execution_modules(root)
-    unparsable = [_rel(path, root) for path in python_modules(root) if _rel(path, root) not in parsed]
+def scan_sources(sources: dict[str, str]) -> GuardReport:
+    """Scan a map of {relative_path: source} for ungated submits and naked shorts."""
+    parsed, in_scope, direct, tainted = discover_execution_modules(sources)
+    unparsable = [relative for relative in sources if relative not in parsed]
 
     report = GuardReport(
         scanned=set(in_scope),
@@ -882,6 +1019,26 @@ def scan_tree(root: Path) -> GuardReport:
         report.naked.extend(naked_short_violations(relative, tree, tainted))
         report.naked.extend(forbidden_strategy_violations(relative, tree))
     return report
+
+
+def scan_tree(root: Path) -> GuardReport:
+    """Scan a single source tree (bare filenames, relative to `root`)."""
+    return scan_sources(_collect_sources(root))
+
+
+def scan_repo(base: Path = REPO_ROOT) -> GuardReport:
+    """Scan every configured source root under `base` as ONE merged tree.
+
+    This is the real build gate: an options execution module is held to both
+    properties whether it lands in src/ or scripts/. Paths are kept relative to
+    `base`, so a module reads as `src/...` or `scripts/...`.
+    """
+    sources: dict[str, str] = {}
+    for subdir in SCAN_SUBDIRS:
+        root = base / subdir
+        if root.exists():
+            sources.update(_collect_sources(root, base=base))
+    return scan_sources(sources)
 
 
 # --- fixtures -----------------------------------------------------------------
@@ -1118,6 +1275,66 @@ def is_covered_call(legs):
     return False
 '''
 
+# HARDENING FIXTURE (gap 1): the naked leg's `side` is a module constant, not a
+# literal. No `direction` at all, and a literal `open` effect, so ONLY the
+# side-classification path can catch it -- fold the constant or it scans clean.
+SIDE_CONSTANT_NAKED = '''
+SIDE_SELL = "sell"
+
+
+def build_order():
+    return {
+        "legs": [{"side": SIDE_SELL, "position_effect": "open", "ratio_quantity": 1}],
+    }
+'''
+
+# HARDENING FIXTURE (gap 3): a dynamic position_effect under a LITERAL sell side,
+# in a credit opening order. No leg can be classified as sell-to-open (effect is
+# unknown), and the old credit fallback demanded a literal `open` effect -- so
+# this collected-premium-with-no-long-leg order scanned clean.
+DYNAMIC_EFFECT_CREDIT = '''
+def build_order(effect):
+    return {
+        "direction": "credit",
+        "legs": [{"side": "sell", "position_effect": effect, "ratio_quantity": 1}],
+    }
+'''
+
+# HARDENING FIXTURE (gap 4, PASS): a gated ternary submit. Both facts gate the
+# true branch; the guard must read the IfExp test as a gate, not flag the call.
+GATED_TERNARY_SUBMIT = '''
+def submit(connector, payload, confirm_live_order, armed):
+    return connector.place_option_order(**payload) if confirm_live_order and armed else None
+'''
+
+# HARDENING FIXTURE (gap 4, FLAG): the same ternary read BACKWARDS -- the submit
+# is the ELSE branch, reached only when the gate is false. Polarity must survive
+# into the IfExp, or this inverted shape passes.
+INVERTED_TERNARY_SUBMIT = '''
+def submit(connector, payload, confirm_live_order, armed):
+    return None if confirm_live_order and armed else connector.place_option_order(**payload)
+'''
+
+# HARDENING FIXTURE (gap 5): a defined-risk vertical whose legs are assembled by
+# two `legs.append({...})` calls. The long and short legs never share a literal
+# payload node; group the appends to one list or the short reads as naked.
+DEFINED_RISK_VERTICAL_APPEND = '''
+def build_order():
+    legs = []
+    legs.append({"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option": "long"})
+    legs.append({"side": "sell", "position_effect": "open", "ratio_quantity": 1, "option": "short"})
+    return {"direction": "debit", "legs": legs}
+'''
+
+# HARDENING FIXTURE (gap 5, still FLAG): appends to one list that are a LONE
+# sell-to-open -- grouping must not become a blanket amnesty for appended legs.
+NAKED_SHORT_APPEND = '''
+def build_order():
+    legs = []
+    legs.append({"side": "sell", "position_effect": "open", "ratio_quantity": 1, "option": "short"})
+    return {"direction": "credit", "legs": legs}
+'''
+
 
 # --- property A tests: no submit without confirm AND armed --------------------
 
@@ -1168,6 +1385,26 @@ def test_a_disjunctive_gate_is_flagged(tmp_path: Path) -> None:
 def test_a_module_level_submit_is_flagged(tmp_path: Path) -> None:
     """An import-time order is gated by nothing at all."""
     report = scan_tree(write_tree(tmp_path, {"options_boot.py": MODULE_LEVEL_SUBMIT}))
+
+    assert [violation.kind for violation in report.ungated] == ["ungated_submit"]
+
+
+def test_a_gated_ternary_submit_passes(tmp_path: Path) -> None:
+    """HARDENING (gap 4). `submit(...) if confirm and armed else None` is fully
+    gated -- the IfExp test dominates the true branch. Delete the IfExp handling
+    in _expression and this clean, idiomatic shape is (wrongly) flagged."""
+    report = scan_tree(write_tree(tmp_path, {"options_broker.py": GATED_TERNARY_SUBMIT}))
+
+    assert "options_broker.py" in report.scanned
+    assert report.submit_sites == 1
+    assert report.violations == []
+
+
+def test_an_inverted_ternary_submit_is_flagged(tmp_path: Path) -> None:
+    """HARDENING (gap 4, polarity). The submit is the ELSE branch: it runs only
+    when the gate is FALSE. Reading the IfExp without carrying polarity would
+    clear it; it must stay flagged."""
+    report = scan_tree(write_tree(tmp_path, {"options_broker.py": INVERTED_TERNARY_SUBMIT}))
 
     assert [violation.kind for violation in report.ungated] == ["ungated_submit"]
 
@@ -1288,6 +1525,54 @@ def test_a_credit_opening_order_with_a_dynamic_side_is_flagged(tmp_path: Path) -
     assert "credit opening order" in report.naked[0].detail
 
 
+def test_a_naked_leg_whose_side_is_a_module_constant_is_flagged(tmp_path: Path) -> None:
+    """HARDENING (gap 1). `{"side": SIDE_SELL, "position_effect": "open"}` with
+    `SIDE_SELL = "sell"`. There is no `direction`, so ONLY side classification
+    can catch it -- stop folding the side constant and this scans clean."""
+    report = scan_tree(write_tree(tmp_path, {"options_legs.py": SIDE_CONSTANT_NAKED}))
+
+    assert "options_legs.py" in report.scanned
+    assert [violation.kind for violation in report.naked] == ["naked_short"]
+
+
+def test_a_credit_order_with_a_dynamic_effect_and_literal_sell_is_flagged(tmp_path: Path) -> None:
+    """HARDENING (gap 3). Side is a literal `sell`, position_effect is computed.
+    No leg classifies as sell-to-open, but a CREDIT opening order whose only leg
+    is not provably a close or a buy is collecting premium naked."""
+    report = scan_tree(write_tree(tmp_path, {"options_legs.py": DYNAMIC_EFFECT_CREDIT}))
+
+    assert [violation.kind for violation in report.naked] == ["naked_short"]
+    assert "credit opening order" in report.naked[0].detail
+
+
+def test_a_selling_to_close_credit_order_still_passes(tmp_path: Path) -> None:
+    """HARDENING (gap 3, precision). The broadened credit rule must NOT swallow a
+    legitimate exit: a leg with a literal `close` effect is proven not-opening."""
+    report = scan_tree(write_tree(tmp_path, {"options_legs.py": SELL_TO_CLOSE}))
+
+    assert "options_legs.py" in report.scanned
+    assert report.violations == []
+
+
+def test_a_defined_risk_vertical_built_by_append_passes(tmp_path: Path) -> None:
+    """HARDENING (gap 5). Legs assembled by `legs.append({...})` are one payload;
+    the covered short must not read as naked. Drop the append grouping and the
+    sell leg is flagged."""
+    report = scan_tree(write_tree(tmp_path, {"options_legs.py": DEFINED_RISK_VERTICAL_APPEND}))
+
+    assert "options_legs.py" in report.scanned
+    assert report.submit_sites == 0
+    assert report.violations == []
+
+
+def test_a_lone_appended_sell_to_open_is_still_flagged(tmp_path: Path) -> None:
+    """HARDENING (gap 5, precision). Append grouping re-unites legs; it does not
+    excuse them. A lone appended sell-to-open is still a naked short."""
+    report = scan_tree(write_tree(tmp_path, {"options_legs.py": NAKED_SHORT_APPEND}))
+
+    assert [violation.kind for violation in report.naked] == ["naked_short"]
+
+
 def test_a_defined_risk_vertical_spread_passes(tmp_path: Path) -> None:
     """A short leg is allowed when a long leg covers it -- that IS a defined-risk
     spread, and the lane exists to trade them."""
@@ -1365,6 +1650,29 @@ def test_every_order_tool_reference_puts_a_module_in_scope(tmp_path: Path, tool:
     assert "lane_exec.py" in report.scanned
 
 
+def test_an_options_execution_module_under_scripts_is_scanned(tmp_path: Path) -> None:
+    """HARDENING (gap 2). The real scan spans src/ AND scripts/. A naked short in
+    a scripts/ options module is discovered and flagged exactly as in src/; drop
+    "scripts" from SCAN_SUBDIRS and it goes unseen."""
+    write_tree(
+        tmp_path,
+        {
+            "src/placeholder.py": 'VALUE = 1\n',
+            "scripts/options_exec.py": NAKED_SHORT_LEGS,
+        },
+    )
+    report = scan_repo(tmp_path)
+
+    assert "scripts/options_exec.py" in report.scanned
+    assert [violation.module for violation in report.naked] == ["scripts/options_exec.py"]
+    assert [violation.kind for violation in report.naked] == ["naked_short"]
+
+
+def test_scripts_is_one_of_the_scanned_source_roots() -> None:
+    """A blunt guard on the knob itself, so the intent survives a refactor."""
+    assert "scripts" in SCAN_SUBDIRS
+
+
 # --- non-vacuity --------------------------------------------------------------
 
 
@@ -1402,9 +1710,9 @@ def test_soundness_check_passes_a_real_non_empty_scan(tmp_path: Path) -> None:
 def test_repo_src_has_no_ungated_option_submit_and_no_naked_short_path() -> None:
     """The build gate. The execution lane has no modules yet, so today this
     proves the analysis-only options_scout contains no order path and no
-    undefined-risk play; the moment an execution module lands it is discovered
-    by content and held to both properties."""
-    report = scan_tree(SRC)
+    undefined-risk play; the moment an execution module lands -- under src/ OR
+    scripts/ -- it is discovered by content and held to both properties."""
+    report = scan_repo()
 
     assert_scan_is_sound(report)
     assert report.violations == [], "\n".join(str(violation) for violation in report.violations)
@@ -1413,15 +1721,15 @@ def test_repo_src_has_no_ungated_option_submit_and_no_naked_short_path() -> None
 def test_the_real_scan_is_not_empty() -> None:
     """Non-vacuity against the real tree: src/options_scout is in scope, so a
     clean report above is a fact about code that was actually read."""
-    report = scan_tree(SRC)
+    report = scan_repo()
 
-    assert any(module.startswith("options_scout/") for module in report.scanned)
+    assert any(module.startswith("src/options_scout/") for module in report.scanned)
 
 
 def test_the_equities_and_crypto_lanes_are_out_of_scope() -> None:
     """This guard is the options lane's. It must not start policing -- or
     failing on -- the two lanes it was told not to touch."""
-    report = scan_tree(SRC)
+    report = scan_repo()
 
-    assert "robinhood_equity_broker.py" not in report.scanned
-    assert "robinhood_crypto_client.py" not in report.scanned
+    assert "src/robinhood_equity_broker.py" not in report.scanned
+    assert "src/robinhood_crypto_client.py" not in report.scanned
