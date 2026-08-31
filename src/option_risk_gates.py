@@ -344,12 +344,15 @@ def classify_strategy(legs: Sequence[Mapping[str, Any]]) -> str:
     if not legs:
         return STRATEGY_UNSUPPORTED
     opening = [(_leg_role(leg)) for leg in legs]
+    # FAIL-CLOSED polarity, mirroring assert_defined_risk: a SELL leg is safe ONLY
+    # when provably sell-to-close. Any sell whose effect is opening, MISSING, blank,
+    # or unknown is an uncovered short this lane cannot support -- matching only
+    # ("sell","open") let an effect-less short fall through to STRATEGY_REDUCING.
+    if any(side == "sell" and effect != "close" for side, effect in opening):
+        return STRATEGY_UNSUPPORTED
     opening_buys = [role for role in opening if role == ("buy", "open")]
-    opening_sells = [role for role in opening if role == ("sell", "open")]
     any_opening = [role for role in opening if role[1] == "open"]
 
-    if opening_sells:
-        return STRATEGY_UNSUPPORTED
     if opening_buys:
         return STRATEGY_SINGLE_LEG_LONG if len(opening_buys) == 1 else STRATEGY_LONG_MULTI_LEG
     if not any_opening:

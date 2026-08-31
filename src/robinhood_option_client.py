@@ -155,12 +155,18 @@ def assert_defined_risk(legs: Sequence[Mapping[str, Any]], direction: str) -> No
     for leg in legs:
         side = str(leg.get("side")).strip().lower()
         effect = str(leg.get("position_effect")).strip().lower()
-        if side == "sell" and effect == "open":
+        # FAIL-CLOSED polarity: a SELL leg is permitted ONLY when it is provably
+        # sell-to-CLOSE (exiting a held long). Any sell whose position_effect is
+        # opening, MISSING, blank, or unknown ("none") is refused -- checking only
+        # for effect=="open" let a naked short with an absent effect slip through.
+        # This lane places no opening short until strike-aware spread support exists.
+        if side == "sell" and effect != "close":
             raise DefinedRiskViolationError(
-                "refusing a sell-to-open leg: this lane is defined-risk only and does not yet "
-                "support strike-aware spreads, so any opening short -- a naked short, an "
-                "uncovered short from a ratio, or a short 'covered' by a mismatched long -- is "
-                f"refused (direction={str(direction).strip().lower()!r})"
+                "refusing a sell leg that is not provably sell-to-close "
+                f"(side={side!r}, position_effect={effect!r}, direction="
+                f"{str(direction).strip().lower()!r}): this lane is defined-risk only and "
+                "places no opening short, so any such sell is an uncovered short -- naked, "
+                "a ratio, or a mismatched 'cover' -- and is refused"
             )
 
 
