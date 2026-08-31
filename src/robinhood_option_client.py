@@ -43,7 +43,9 @@ There is no API key and no base URL: the connector object IS the credential
 
 from __future__ import annotations
 
+import json
 import math
+import uuid
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -182,6 +184,38 @@ _CONNECTOR_LEG_KEYS = ("option_id", "side", "position_effect", "ratio_quantity")
 def _connector_leg(leg: Mapping[str, Any]) -> dict[str, Any]:
     """Project one normalized leg down to only the connector's allowed key set."""
     return {key: leg[key] for key in _CONNECTOR_LEG_KEYS if key in leg}
+
+
+# A fixed namespace so the derived ref_id is a stable function of the order's
+# content (and of nothing else -- no wall clock, no randomness). Two processes
+# building the SAME order therefore mint the SAME key.
+_REF_ID_NAMESPACE = uuid.UUID("6f2a9d3e-8b41-5c76-9a0e-4d7f1c2b3e58")
+
+
+def _deterministic_ref_id(payload: Mapping[str, Any]) -> str:
+    """A stable client-order-id (`ref_id`) derived ONLY from the order's
+    identifying content, so a RETRY of the same logical order carries the SAME
+    key and the venue de-dupes it instead of double-filling. Any change to the
+    account, legs, quantity, type, price, time-in-force, or direction yields a
+    different key, so distinct orders never collide.
+
+    Derived from the connector-facing leg projection (the same keys the wire
+    carries), so it does not shift when the extra contract-identifying fields are
+    stripped at the wire."""
+    material = json.dumps(
+        {
+            "account_number": payload.get("account_number"),
+            "direction": payload.get("direction"),
+            "legs": [_connector_leg(leg) for leg in payload.get("legs", [])],
+            "quantity": payload.get("quantity"),
+            "type": payload.get("type"),
+            "time_in_force": payload.get("time_in_force"),
+            "price": payload.get("price"),
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return str(uuid.uuid5(_REF_ID_NAMESPACE, material))
 
 
 def _positive_limit_price(price: Any) -> float | None:
@@ -461,6 +495,7 @@ class RobinhoodOptionClient:
         price: str | None = None,
         time_in_force: str = "gtc",
         account_number: str | None = None,
+        ref_id: str | None = None,
     ) -> dict[str, Any]:
         """Validate + assemble an option order payload WITHOUT submitting it.
 
@@ -468,6 +503,11 @@ class RobinhoodOptionClient:
         undefined-risk leg set, and returns the connector-shaped payload. Callers
         that only want a preview use this or review_order; nothing here can reach
         place_option_order.
+
+        The payload carries a `ref_id` idempotency key: an explicit one when the
+        caller supplies it, otherwise one derived deterministically from the
+        order's content. A retried submit therefore reuses the SAME key, so the
+        venue de-dupes it and a retry cannot double-submit.
         """
         target = self._assert_agent_account(account_number)
         if not legs:
@@ -484,6 +524,7 @@ class RobinhoodOptionClient:
         }
         if price is not None:
             payload["price"] = str(price)
+        payload["ref_id"] = str(ref_id) if ref_id is not None else _deterministic_ref_id(payload)
         return payload
 
     def build_single_leg_long(
@@ -539,9 +580,19 @@ class RobinhoodOptionClient:
         payload with each leg stripped to the connector's allowed key set. The
         built payload keeps the extra contract-identifying fields for the caps /
         DTE math and a future coverage check; the connector's schema forbids
-        them, so only here, at the wire, are the legs projected down."""
+        them, so only here, at the wire, are the legs projected down.
+
+        `direction` (debit/credit) is a LANE-INTERNAL hint the caps/DTE math read,
+        not a field the connector's single-leg order schema takes -- a single
+        buy-to-open long is unambiguously a debit -- so it is dropped from the wire
+        for a single-leg order. It is retained for a multi-leg order, where a
+        spread's net direction is meaningful. `ref_id` (the idempotency key) is
+        carried through unchanged so a retry de-dupes at the venue."""
         wire = dict(payload)
-        wire["legs"] = [_connector_leg(leg) for leg in payload.get("legs", [])]
+        legs = [_connector_leg(leg) for leg in payload.get("legs", [])]
+        wire["legs"] = legs
+        if len(legs) == 1:
+            wire.pop("direction", None)
         return wire
 
     # --- place (double gate + arm; the only path that can submit) -------------
@@ -560,6 +611,7 @@ class RobinhoodOptionClient:
         days_to_expiry: int | None = None,
         open_premium_at_risk_usd: float = 0.0,
         max_loss_per_contract_usd: float | None = None,
+        ref_id: str | None = None,
     ) -> dict[str, Any]:
         """Build a DEFINED-RISK option order; submit it only on the full gate.
 
@@ -575,9 +627,10 @@ class RobinhoodOptionClient:
         dry_run (0) must NOT arm the lane.
         """
         # Build (and defined-risk-validate) the payload first -- a naked short is
-        # refused here, before any gate is even consulted.
+        # refused here, before any gate is even consulted. The payload carries a
+        # stable ref_id (idempotency key) so a retried submit de-dupes at the venue.
         payload = self.build_option_order(
-            legs, direction, quantity, order_type, price, time_in_force, account_number
+            legs, direction, quantity, order_type, price, time_in_force, account_number, ref_id=ref_id
         )
         if not (dry_run is False and confirm_live_order is True):
             return {

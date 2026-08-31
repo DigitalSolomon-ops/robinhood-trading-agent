@@ -8,6 +8,7 @@ import src.shared_state as shared_state
 from src.shared_state import (
     DisarmedArmStore,
     FileArmStore,
+    FirestoreArmStore,
     build_arm_store,
     lane_arm_marker_path,
     lane_stop_path,
@@ -112,3 +113,89 @@ def test_firestore_failure_returns_an_always_disarmed_store_never_local(
         assert store.is_armed(lane) is False
     store.set_armed("options", True)  # no-op, cannot arm a broken cloud backend
     assert store.is_armed("options") is False
+
+
+# --- FirestoreArmStore.is_armed is POSITIVE + fail-closed (the CLOUD backend) --
+# The production cloud arm backend must read ARMED only from a doc that EXPLICITLY
+# says armed:true; a missing doc, an armed:false doc, and an unreadable read all
+# read DISARMED. Exercised through an injected fake firestore client so no
+# google.cloud dependency is required.
+
+
+class _FakeDoc:
+    def __init__(self, exists: bool, data: dict | None = None) -> None:
+        self.exists = exists
+        self._data = data
+
+    def to_dict(self) -> dict | None:
+        return self._data
+
+
+class _FakeDocRef:
+    def __init__(self, doc: _FakeDoc | None = None, raise_on_get: bool = False) -> None:
+        self._doc = doc
+        self._raise = raise_on_get
+
+    def get(self):
+        if self._raise:
+            raise RuntimeError("firestore get() failed")
+        return self._doc
+
+
+class _FakeCollection:
+    def __init__(self, ref: _FakeDocRef) -> None:
+        self._ref = ref
+        self.requested: list[str] = []
+
+    def document(self, lane: str) -> _FakeDocRef:
+        self.requested.append(lane)
+        return self._ref
+
+
+class _FakeFirestoreClient:
+    def __init__(self, ref: _FakeDocRef) -> None:
+        self.collection_obj = _FakeCollection(ref)
+
+    def collection(self, name: str) -> _FakeCollection:
+        return self.collection_obj
+
+
+def _firestore_store(ref: _FakeDocRef) -> FirestoreArmStore:
+    return FirestoreArmStore("proj", client=_FakeFirestoreClient(ref))
+
+
+def test_firestore_missing_doc_reads_disarmed() -> None:
+    """MUTATION TEST: no doc for the lane -> DISARMED. Flip the `if doc.exists
+    else False` to `else True` and a lane with no arm doc reads ARMED."""
+    store = _firestore_store(_FakeDocRef(_FakeDoc(exists=False)))
+    assert store.is_armed("options") is False
+
+
+def test_firestore_doc_armed_false_reads_disarmed() -> None:
+    """MUTATION TEST: a doc that says armed:false -> DISARMED. Return
+    `doc.exists` instead of the armed value and this false doc reads ARMED."""
+    store = _firestore_store(_FakeDocRef(_FakeDoc(exists=True, data={"armed": False})))
+    assert store.is_armed("options") is False
+
+
+def test_firestore_doc_armed_true_reads_armed() -> None:
+    """MUTATION TEST: only a doc that EXPLICITLY says armed:true -> ARMED. Drop
+    the .get("armed") read (hard-code False) and this real arm marker is ignored."""
+    store = _firestore_store(_FakeDocRef(_FakeDoc(exists=True, data={"armed": True})))
+    assert store.is_armed("options") is True
+
+
+def test_firestore_read_exception_reads_disarmed() -> None:
+    """MUTATION TEST: an exception in .get() fails SAFE to DISARMED. Remove the
+    try/except and the exception propagates instead of reading disarmed."""
+    store = _firestore_store(_FakeDocRef(raise_on_get=True))
+    assert store.is_armed("options") is False
+
+
+def test_firestore_unknown_lane_reads_disarmed_without_touching_firestore() -> None:
+    """An unrecognized lane reads DISARMED before any Firestore read -- drop the
+    LANES guard and it would query the backend for a bogus lane."""
+    fake = _FakeFirestoreClient(_FakeDocRef(raise_on_get=True))
+    store = FirestoreArmStore("proj", client=fake)
+    assert store.is_armed("bogus") is False
+    assert fake.collection_obj.requested == []  # never reached the backend

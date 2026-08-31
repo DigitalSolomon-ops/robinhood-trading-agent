@@ -637,3 +637,92 @@ def test_two_proving_runs_back_to_back_both_reconcile_clean(monkeypatch, tmp_pat
 
     assert first["reconcile"]["errors"] == [] and second["reconcile"]["errors"] == []
     assert first["counts"] is True and second["counts"] is True
+
+
+# --- reconcile checks NOTIONAL/PREMIUM and CASH, not only quantity -------------
+
+
+def test_reconcile_flags_a_fill_booked_at_the_wrong_premium(tmp_path: Path) -> None:
+    """MUTATION TEST. The audit says AAPL-C-1 filled for $200 of premium; the
+    ledger booked the RIGHT contract count at the WRONG premium ($300). Quantity
+    matches, so a quantity-only reconcile passes clean -- but the notional check
+    catches the dollar disagreement. Drop the notional cross-check and this
+    reconciles clean despite the mispriced fill."""
+    write_config(tmp_path)
+    SQLiteLogger(tmp_path / "data" / "trading_agent.db").log_decision(
+        "AAPL", "option_paper_order_filled", "audit fill at $200",
+        {"contract": "AAPL-C-1", "quantity": 1, "notional": 200.0},
+    )
+    paper = PaperBroker(tmp_path / "data" / "option_paper_trades.db")
+    # Same contract, same 1 contract, but booked at a $3.00 premium -> $300 notional.
+    paper.place_order(
+        {"symbol": "AAPL-C-1", "side": "buy", "quantity": 1.0, "limit_price": 3.0, "notional": 300.0, "strategy_signal": "option_single_leg_long"}
+    )
+
+    result = reconcile_option_paper(tmp_path)
+
+    issues = {error["issue"] for error in result["errors"]}
+    assert "expected_notional_mismatch" in issues, "a fill booked at the wrong premium must not reconcile clean"
+    # The quantity itself agrees, so the quantity check alone would have passed.
+    assert "expected_position_mismatch" not in issues
+
+
+def test_reconcile_flags_cash_that_disagrees_with_the_audit_trail(tmp_path: Path) -> None:
+    """MUTATION TEST. No fill was ever audited, yet the ledger moved cash (a
+    buy+sell round trip that nets the position to zero but bleeds fees). Positions
+    and notionals both agree with the (empty) audit, so only the independent CASH
+    check against the audit can catch the leak. Drop the cash cross-check and this
+    reconciles clean despite cash the audit never accounts for."""
+    write_config(tmp_path)
+    paper = PaperBroker(tmp_path / "data" / "option_paper_trades.db")
+    # Buy then sell the same contract at the same price: net quantity 0, but the
+    # per-fill fees leave the ledger's cash below the audit's expectation.
+    paper.place_order(
+        {"symbol": "AAPL-C-9", "side": "buy", "quantity": 1.0, "limit_price": 5.0, "notional": 500.0, "strategy_signal": "option_single_leg_long"}
+    )
+    paper.place_order(
+        {"symbol": "AAPL-C-9", "side": "sell", "quantity": 1.0, "limit_price": 5.0, "notional": 500.0, "strategy_signal": "option_single_leg_long"}
+    )
+
+    result = reconcile_option_paper(tmp_path)
+
+    issues = {error["issue"] for error in result["errors"]}
+    assert "expected_cash_mismatch" in issues, "cash the audit trail does not back must not reconcile clean"
+    # No open position and no per-contract notional disagreement -- cash is the
+    # only hook that fires, so this pins the cash check specifically.
+    assert "expected_notional_mismatch" not in issues
+    assert "expected_position_mismatch" not in issues
+
+
+# --- the fill window starts at the previous RUN BOUNDARY, not the previous ------
+# completion, so a mid-run halt cannot orphan its fills into the next run's window.
+
+
+def test_a_halted_run_does_not_orphan_its_fills_into_the_next_runs_window(tmp_path: Path) -> None:
+    """MUTATION TEST. Three runs: run 1 completes, run 2 HALTS mid-way (a fill,
+    then a halt, then its reconcile -- but NO completion), run 3 completes. Run 3's
+    window must hold ONLY its own fill. Anchor the window on the previous
+    COMPLETION instead of the previous run boundary and run 2's halted fill is
+    swept forward into run 3's window (fills 2, ledger_delta 400)."""
+    write_config(tmp_path)
+    logger = SQLiteLogger(tmp_path / "data" / "trading_agent.db")
+    prov = {"basis": BASIS_CONNECTOR_QUOTE, "recorded_quotes": [{"contract": "X", "premium": 2.0}]}
+
+    logger.log_decision("AAPL", "option_paper_order_filled", "run1 fill", {"contract": "RUN1-C", "quantity": 1, "notional": 200.0})
+    logger.log_decision(None, "option_paper_loop_completed", "run1 done", {"iterations_completed": 1, "quote_basis": BASIS_CONNECTOR_QUOTE, "basis_provenance": prov})
+    logger.log_decision(None, "option_paper_reconcile", "run1 reconciled", {"errors": []})
+    # Run 2 halts: a fill, a halt, then its reconcile -- no completion row.
+    logger.log_decision("AAPL", "option_paper_order_filled", "run2 halted fill", {"contract": "ORPHAN-C", "quantity": 1, "notional": 200.0})
+    logger.log_decision(None, "option_halted", "kill switch", {})
+    logger.log_decision(None, "option_paper_reconcile", "run2 reconciled", {"errors": []})
+    # Run 3 completes cleanly.
+    logger.log_decision("AAPL", "option_paper_order_filled", "run3 fill", {"contract": "RUN3-C", "quantity": 1, "notional": 200.0})
+    logger.log_decision(None, "option_paper_loop_completed", "run3 done", {"iterations_completed": 1, "quote_basis": BASIS_CONNECTOR_QUOTE, "basis_provenance": prov})
+    logger.log_decision(None, "option_paper_reconcile", "run3 reconciled", {"errors": []})
+
+    runs = option_paper_proving_runs(tmp_path)
+
+    assert len(runs) == 2  # one per completion (the halted run logs none)
+    run3 = runs[1]
+    assert run3["fills"] == 1, "run 3's window must hold only its own fill, not the halted run's orphan"
+    assert run3["ledger_delta"] == pytest.approx(200.0)

@@ -778,6 +778,101 @@ def test_review_also_strips_schema_forbidden_leg_keys():
     assert set(reviewed_leg) == {"option_id", "side", "position_effect", "ratio_quantity"}
 
 
+# --- direction is a lane-internal hint, omitted on the single-leg wire payload -
+# The connector's single-leg order schema does not read `direction` (debit/credit)
+# -- it is a lane-internal hint the caps/DTE math use. It must not be sent to the
+# connector for a single-leg order, though the BUILT payload keeps it.
+
+
+def test_place_omits_direction_on_the_single_leg_wire_payload():
+    """MUTATION TEST: a fully gated single-leg live submit hands the connector a
+    payload with NO `direction` key. Drop the wire projection's direction pop and
+    the connector sees a lane-internal `direction` field it does not accept."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), price="1.00", days_to_expiry=30, dry_run=False, confirm_live_order=True
+    )
+
+    assert result["submitted"] is True
+    assert "direction" not in connector.place_calls[0]
+    # The BUILT payload the client returns still carries it (the caps/DTE math read it).
+    assert result["order_payload"]["direction"] == "debit"
+
+
+def test_review_omits_direction_on_the_single_leg_wire_payload():
+    """Review is connector-bound too, so its single-leg payload also omits the
+    lane-internal `direction` hint."""
+    connector = FakeConnector()
+    client = make_client(connector)
+
+    client.review_order(long_legs(), direction="debit")
+
+    assert "direction" not in connector.review_calls[0]
+
+
+# --- ref_id is a stable idempotency key so a retry cannot double-submit --------
+# Every built payload carries a `ref_id`; a retried submit of the SAME order
+# reuses the SAME key (the venue de-dupes it), and distinct orders differ.
+
+
+def test_build_stamps_a_ref_id_that_is_stable_across_identical_rebuilds():
+    """MUTATION TEST: two builds of the SAME order carry the SAME ref_id, so a
+    retry de-dupes at the venue. Make the key non-deterministic (e.g. uuid4) and
+    the two rebuilds diverge and a retry double-submits."""
+    client = make_client(FakeConnector())
+
+    first = client.build_option_order(long_legs(), direction="debit", quantity="1", price="1.00")
+    second = client.build_option_order(long_legs(), direction="debit", quantity="1", price="1.00")
+
+    assert first["ref_id"]  # present and non-empty
+    assert first["ref_id"] == second["ref_id"]
+
+
+def test_ref_id_differs_when_the_order_content_differs():
+    """A different order (here a different quantity) must mint a DIFFERENT key, or
+    two genuinely distinct orders would collide and the second be dropped."""
+    client = make_client(FakeConnector())
+
+    one = client.build_option_order(long_legs(), direction="debit", quantity="1", price="1.00")
+    two = client.build_option_order(long_legs(), direction="debit", quantity="2", price="1.00")
+
+    assert one["ref_id"] != two["ref_id"]
+
+
+def test_place_sends_the_ref_id_to_the_connector():
+    """MUTATION TEST: the idempotency key reaches the connector on a live submit.
+    Drop ref_id from the payload and the venue cannot de-dupe a retry."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), price="1.00", days_to_expiry=30, dry_run=False, confirm_live_order=True
+    )
+
+    assert result["submitted"] is True
+    sent_ref = connector.place_calls[0].get("ref_id")
+    assert sent_ref
+    # A retry of the identical order carries the identical key.
+    assert sent_ref == result["order_payload"]["ref_id"]
+
+
+def test_explicit_ref_id_overrides_the_derived_key():
+    """A caller may supply its own stable client-order-id; it wins over the
+    derived key and is what reaches the connector."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), price="1.00", days_to_expiry=30, dry_run=False, confirm_live_order=True,
+        ref_id="operator-supplied-key-123",
+    )
+
+    assert result["submitted"] is True
+    assert connector.place_calls[0]["ref_id"] == "operator-supplied-key-123"
+
+
 # --- cancel mirrors the same dry_run/confirm gate (no arm required) -----------
 
 

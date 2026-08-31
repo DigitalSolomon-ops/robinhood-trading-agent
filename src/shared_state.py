@@ -138,10 +138,16 @@ class FirestoreArmStore:
     Already POSITIVE and fail-closed for every lane: a missing/unreadable doc
     reads as DISARMED (armed only when the doc explicitly says so)."""
 
-    def __init__(self, project: str, collection: str = "trader_arm") -> None:
-        from google.cloud import firestore  # lazy: optional dependency
+    def __init__(self, project: str, collection: str = "trader_arm", client: Any | None = None) -> None:
+        # `client` is an injection seam ONLY: production passes nothing and the
+        # real firestore.Client is built lazily (the dependency is optional and
+        # cloud-only). A test supplies a fake client so the fail-closed branches of
+        # is_armed can be exercised without google.cloud installed.
+        if client is None:
+            from google.cloud import firestore  # lazy: optional dependency
 
-        self._db = firestore.Client(project=project)
+            client = firestore.Client(project=project)
+        self._db = client
         self._collection = collection
 
     def is_armed(self, lane: str) -> bool:

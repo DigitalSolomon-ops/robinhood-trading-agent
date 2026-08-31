@@ -655,20 +655,30 @@ def run_option_paper_loop(
 # ---------------------------------------------------------------------------
 
 
-def _expected_positions_from_audit(db_path: Path) -> dict[str, float]:
-    """Reconstruct the options ledger's expected open positions from an
-    INDEPENDENT source -- the ACTION_FILLED decision rows in trading_agent.db,
-    a separate store from the paper ledger the reconcile is checking.
+# The paper broker charges this fee per fill (round(notional * rate, 8)); mirror
+# it here so the cash the audit trail EXPECTS matches the ledger's cash exactly.
+_PAPER_FEE_RATE = 0.001
 
-    Only fills SINCE the most recent reconcile are counted, so the reconstruction
-    is scoped to the current, freshly-reset ledger and does not carry a prior
-    run's (archived) fills. This is what lets the reconcile be falsifiable: if
-    the ledger and the audit trail disagree about what is open, that is an error,
-    rather than the ledger being checked only against a recomputation of itself.
+
+def _expected_from_audit(db_path: Path) -> dict[str, Any]:
+    """Reconstruct the options ledger's expected open state from an INDEPENDENT
+    source -- the ACTION_FILLED decision rows in trading_agent.db, a separate
+    store from the paper ledger the reconcile is checking.
+
+    Returns per-contract expected quantities AND notionals plus the total cash
+    outlay (premium notional + the paper broker's per-fill fee). Only fills SINCE
+    the most recent reconcile are counted, so the reconstruction is scoped to the
+    current, freshly-reset ledger and does not carry a prior run's (archived)
+    fills. This is what lets the reconcile be falsifiable across THREE independent
+    hooks -- quantity, notional/premium, and cash -- rather than the ledger being
+    checked only against a recomputation of itself: right contracts booked at the
+    wrong premium (a quantity match, a notional mismatch) is caught too.
     """
     rows = _decision_rows(db_path, (ACTION_FILLED, ACTION_RECONCILE))
     last_reconcile_id = max((row["id"] for row in rows if row["action"] == ACTION_RECONCILE), default=0)
-    expected: dict[str, float] = {}
+    quantities: dict[str, float] = {}
+    notionals: dict[str, float] = {}
+    cash_outlay = 0.0
     for row in rows:
         if row["action"] != ACTION_FILLED or row["id"] <= last_reconcile_id:
             continue
@@ -679,8 +689,21 @@ def _expected_positions_from_audit(db_path: Path) -> dict[str, float]:
             quantity = float(row["details"].get("quantity") or 0.0)
         except (TypeError, ValueError):
             continue
-        expected[str(contract)] = expected.get(str(contract), 0.0) + quantity
-    return expected
+        try:
+            notional = float(row["details"].get("notional") or 0.0)
+        except (TypeError, ValueError):
+            notional = 0.0
+        contract = str(contract)
+        quantities[contract] = quantities.get(contract, 0.0) + quantity
+        notionals[contract] = round(notionals.get(contract, 0.0) + notional, 2)
+        cash_outlay += notional + round(notional * _PAPER_FEE_RATE, 8)
+    return {"quantities": quantities, "notionals": notionals, "cash_outlay": round(cash_outlay, 2)}
+
+
+def _expected_positions_from_audit(db_path: Path) -> dict[str, float]:
+    """The per-contract expected open quantities from the ACTION_FILLED audit
+    trail (see _expected_from_audit for the independence and scoping rationale)."""
+    return _expected_from_audit(db_path)["quantities"]
 
 
 def reconcile_option_paper(root: Path, epsilon: float = 0.000001) -> dict[str, Any]:
@@ -692,8 +715,42 @@ def reconcile_option_paper(root: Path, epsilon: float = 0.000001) -> dict[str, A
     disagrees with what the audit says was filled reports an error."""
     logger = SQLiteLogger(root / "data" / "trading_agent.db")
     broker = PaperBroker(root / OPTION_PAPER_LEDGER)
-    expected_positions = _expected_positions_from_audit(root / "data" / "trading_agent.db")
+    expected = _expected_from_audit(root / "data" / "trading_agent.db")
+    expected_positions = expected["quantities"]
     result = broker.reconcile_positions(epsilon=epsilon, expected_positions=expected_positions)
+
+    # On top of the quantity check, cross-check the ledger's NOTIONAL/PREMIUM and
+    # CASH against the SAME independent audit trail. A quantity match alone cannot
+    # catch a fill booked at the wrong premium -- the right contract count for the
+    # wrong dollars -- and cash conservation against the audit is a second,
+    # causally independent hook (the ledger's own cash-vs-ledger check compares a
+    # store against itself). Both are additive: they only ever ADD errors, so a
+    # genuinely clean run still reports errors == [].
+    notional_tolerance = max(epsilon, 0.01)
+    multiplier = OptionRiskConfig.from_rules(load_option_settings(root)).contract_multiplier
+    portfolio = broker.get_portfolio()
+    observed_notional: dict[str, float] = {}
+    for symbol, position in portfolio.positions.items():
+        quantity = float(position.quantity)
+        if quantity <= 0:
+            continue
+        observed_notional[symbol] = round(quantity * float(position.average_price) * multiplier, 2)
+    for contract in set(expected["notionals"]) | set(observed_notional):
+        expected_n = round(float(expected["notionals"].get(contract, 0.0)), 2)
+        actual_n = round(float(observed_notional.get(contract, 0.0)), 2)
+        if abs(expected_n - actual_n) > notional_tolerance:
+            result["errors"].append(
+                {"issue": "expected_notional_mismatch", "contract": contract, "expected": expected_n, "actual": actual_n}
+            )
+    # Cash: starting cash minus the audit's total outlay (premium + the paper
+    # broker's per-fill fee) must equal the ledger's remaining cash.
+    expected_cash = round(float(broker.starting_cash) - float(expected["cash_outlay"]), 2)
+    actual_cash = round(float(portfolio.cash_usd), 2)
+    if abs(expected_cash - actual_cash) > notional_tolerance:
+        result["errors"].append(
+            {"issue": "expected_cash_mismatch", "expected": expected_cash, "actual": actual_cash}
+        )
+
     logger.log_decision(
         None,
         ACTION_RECONCILE,
@@ -882,16 +939,28 @@ def option_paper_proving_runs(root: Path) -> list[dict[str, Any]]:
         notional moved the ledger non-trivially -- a zero-fill run proves nothing.
     """
     db_path = root / "data" / "trading_agent.db"
-    rows = _decision_rows(db_path, (ACTION_COMPLETED, ACTION_RECONCILE, ACTION_FILLED))
+    rows = _decision_rows(db_path, (ACTION_COMPLETED, ACTION_RECONCILE, ACTION_FILLED, ACTION_HALTED))
     completions = [row for row in rows if row["action"] == ACTION_COMPLETED]
     reconciles = [row for row in rows if row["action"] == ACTION_RECONCILE]
     fills = [row for row in rows if row["action"] == ACTION_FILLED]
+    # Every event that ENDS a run: a clean completion, the reconcile that follows
+    # a run, or a mid-run halt. A run's fill window starts at the previous such
+    # boundary -- NOT merely the previous completion -- because a halted run logs
+    # no completion but still ends a run (and still reconciles). Anchoring on the
+    # previous completion alone would sweep a halted run's fills forward into the
+    # next completed run's window, orphaning them onto the wrong run.
+    boundary_ids = sorted(
+        row["id"] for row in rows if row["action"] in (ACTION_COMPLETED, ACTION_RECONCILE, ACTION_HALTED)
+    )
 
     consumed: set[int] = set()
     runs: list[dict[str, Any]] = []
     for index, completion in enumerate(completions):
         completion_id = completion["id"]
-        lower = completions[index - 1]["id"] if index > 0 else 0
+        # The latest run-ending boundary strictly before this completion. The
+        # reconcile that follows THIS completion has a higher id, so it is never
+        # picked as the lower bound.
+        lower = max((bid for bid in boundary_ids if bid < completion_id), default=0)
         next_id = completions[index + 1]["id"] if index + 1 < len(completions) else None
 
         following = None
