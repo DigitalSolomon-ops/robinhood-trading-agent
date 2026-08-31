@@ -124,6 +124,20 @@ options:
       single_leg_long: 2
       long_multi_leg: 3
       defined_risk_spread: 3
+  # Play-to-candidate mapping floors (src/option_strategy.py). This layer turns
+  # the analysis-only Options Scout's ranked plays into defined-risk order
+  # CANDIDATES the risk gates above then evaluate; it never submits. A play below
+  # either floor is SKIPPED with a logged reason before any order is framed.
+  strategy:
+    # A play whose conviction (0..100) is below this is not traded -- a weak edge
+    # is skipped, not sized down. Conservative first-proving value.
+    min_conviction: 50.0
+    # A play whose rank score (conviction x backtest hit-rate x sample weight) is
+    # below this is skipped. 0.0 = rank floor off; conviction floor still applies.
+    min_rank_score: 0.0
+    # Contracts per mapped order. One contract controls 100 shares; the max debit
+    # and total-at-risk caps above still bound the resulting dollar exposure.
+    contracts_per_order: 1
 equities:
   # Out-of-band identity anchor for the single agent-tradable Robinhood account.
   # The connector self-declares which account is agent-tradable via the
