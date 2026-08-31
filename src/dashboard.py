@@ -127,6 +127,13 @@ def dashboard_app(root: Path = ROOT) -> FastAPI:
         """
         return {"status": "ok"}
 
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        # Cloud Run / GFE intercept the exact path /healthz before the container
+        # sees it, so the LB + Cloud Run health check must target /health instead.
+        # Same contract as /healthz: reads nothing, signs no broker request.
+        return {"status": "ok"}
+
     @app.get("/", response_class=HTMLResponse)
     def home() -> str:
         return page("Safety Status", home_html(app.state.root))

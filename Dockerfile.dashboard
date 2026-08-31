@@ -1,0 +1,24 @@
+# 007 trader dashboard -- Cloud Run web SERVICE (control surface + per-lane arm toggle).
+# Arm state is shared via Firestore (TRADER_ARM_FIRESTORE_PROJECT) so the toggle
+# reaches a co-located trader that reads the same store. This image serves the
+# dashboard only; data-heavy views degrade gracefully until a trader runtime is
+# co-located. It carries the trading-lane modules because the dashboard imports
+# them, but it runs NO trading loop and its order paths default to dry-run/paper.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Direct deps (fastapi/uvicorn/etc.) + Firestore for the shared arm store.
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt "google-cloud-firestore>=2.11,<3"
+
+COPY src/ ./src/
+COPY config/ ./config/
+RUN mkdir -p data logs
+
+# ADC on Cloud Run (never shell out to gcloud in-container); IAP assertion is
+# verified in src/web_security.py when IAP_AUDIENCE is set.
+ENV DS_VAULT_NO_GCLOUD=1 PYTHONUNBUFFERED=1 PORT=8080
+EXPOSE 8080
+
+ENTRYPOINT ["python", "-m", "src.web"]

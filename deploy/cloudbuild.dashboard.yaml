@@ -1,0 +1,6 @@
+# Cloud Build config for the 007 dashboard image (non-default Dockerfile name).
+# Invoked by deploy/deploy-dashboard.sh with --substitutions=_IMAGE=...
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "Dockerfile.dashboard", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]
