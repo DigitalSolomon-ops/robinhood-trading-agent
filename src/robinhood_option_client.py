@@ -338,7 +338,10 @@ class RobinhoodOptionClient:
         return self._connector.get_option_chains(symbol=symbol, **kwargs)
 
     def get_option_quotes(self, *contract_ids: str, **kwargs: Any) -> Any:
-        return self._connector.get_option_quotes(ids=list(contract_ids), **kwargs)
+        # The Robinhood options MCP tool names this argument `instrument_ids`
+        # (option instrument UUIDs), NOT `ids`. A wrong key silently returned no
+        # quotes against a permissive stub; grounded against the real schema here.
+        return self._connector.get_option_quotes(instrument_ids=list(contract_ids), **kwargs)
 
     def get_option_positions(self) -> Any:
         return self._connector.get_option_positions(account_number=self.account_number)
@@ -362,11 +365,20 @@ class RobinhoodOptionClient:
         RETAINING the contract-identifying fields (option_type / underlying /
         expiration / strike) untouched when present.
 
-        The earlier version DROPPED those fields, which is precisely what made
-        every short look 'covered' by any long: with no underlying, type or
-        strike to compare, a coverage check has nothing to reason over. They are
-        carried through here so a future strike-aware validator can prove real
-        coverage -- and so the payload the connector receives is faithful."""
+        The contract reference is emitted under the key the real Robinhood options
+        MCP order schema requires -- `option_id` (the option instrument UUID) --
+        regardless of which alias the caller supplied (option / option_id /
+        instrument / contract_ticker). The earlier version emitted `option`, a key
+        the connector does not read, so a fully gated live order would have been
+        rejected (or silently mis-filled) at the venue; grounded against the real
+        schema here.
+
+        The earlier version also DROPPED the identifying fields, which is
+        precisely what made every short look 'covered' by any long: with no
+        underlying, type or strike to compare, a coverage check has nothing to
+        reason over. They are carried through here so a future strike-aware
+        validator can prove real coverage -- and so the payload the connector
+        receives is faithful."""
         side = leg.get("side")
         effect = leg.get("position_effect")
         normalized: dict[str, Any] = {
@@ -374,10 +386,11 @@ class RobinhoodOptionClient:
             "position_effect": str(effect).strip().lower() if effect is not None else effect,
             "ratio_quantity": leg.get("ratio_quantity", 1),
         }
-        # The contract reference under whichever key the caller supplied.
-        for key in ("option", "option_id", "instrument", "contract_ticker"):
+        # The contract reference under whichever alias the caller supplied, always
+        # re-keyed to the schema's `option_id`.
+        for key in ("option_id", "option", "instrument", "contract_ticker"):
             if key in leg and leg[key] is not None:
-                normalized["option"] = leg[key]
+                normalized["option_id"] = leg[key]
                 break
         # Retain the contract-identifying fields, untouched, when the caller
         # supplied them -- absent fields are simply not carried.

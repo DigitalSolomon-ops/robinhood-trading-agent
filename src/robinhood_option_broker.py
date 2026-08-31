@@ -496,14 +496,34 @@ class RobinhoodOptionBroker:
             open_premium_at_risk_usd=open_premium_at_risk_usd,
             max_loss_per_contract_usd=max_loss_per_contract_usd,
         )
+        # Branch on the CLIENT's ACTUAL verdict -- never assume the handoff placed
+        # the order. The client re-runs its own final gates (defined risk, the
+        # shared arm store, the caps: defense in depth). If any of them refuses,
+        # NOTHING reached the connector, and reporting submitted=True would be a
+        # phantom fill -- a claimed order that never left the building. Report
+        # submitted=True only when the client's own dict says so; otherwise carry
+        # the client's preview shape (status + payload) back unchanged.
+        client_submitted = isinstance(result, dict) and result.get("submitted") is True
+        if not client_submitted:
+            status = result.get("status", "not_submitted") if isinstance(result, dict) else "not_submitted"
+            self._log_refusal(None, f"client did not submit (status={status!r})")
+            return {
+                "submitted": False,
+                "status": status,
+                "venue": VENUE,
+                "account_number": account,
+                "human_gate": self.gate_reason(),
+                "order_payload": result.get("order_payload") if isinstance(result, dict) else None,
+                "response": result.get("response") if isinstance(result, dict) else result,
+            }
         return {
             "submitted": True,
             "status": "submitted",
             "venue": VENUE,
             "account_number": account,
             "human_gate": self.gate_reason(),
-            "response": result.get("response", result) if isinstance(result, dict) else result,
-            "order_payload": result.get("order_payload") if isinstance(result, dict) else None,
+            "response": result.get("response", result),
+            "order_payload": result.get("order_payload"),
         }
 
     def _preview(

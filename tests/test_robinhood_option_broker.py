@@ -78,6 +78,18 @@ SELL_CALL_BUY_PUT_LEGS = [
 ]
 
 
+def _assert_connector_leg_shape(legs):
+    """The real Robinhood options MCP order schema requires each leg to carry
+    `option_id` (the option instrument UUID), NOT the legacy `option` key. The
+    broker hands raw `option`-keyed legs to the client, which re-keys them; assert
+    the connector only ever sees the schema key so that re-keying stays
+    load-bearing through the broker path too."""
+    assert legs is not None, "connector received no legs"
+    for leg in legs:
+        assert "option_id" in leg, f"leg missing required 'option_id': {leg}"
+        assert "option" not in leg, f"leg carries the wrong key 'option' (schema wants 'option_id'): {leg}"
+
+
 class FakeArmStore:
     """Answers is_armed for the requested lane; records what it was asked."""
 
@@ -118,10 +130,12 @@ class FakeConnector:
         return {"option_level": self.option_level}
 
     def review_option_order(self, **kwargs):
+        _assert_connector_leg_shape(kwargs.get("legs"))
         self.review_calls.append(kwargs)
         return {"reviewed": True, **kwargs}
 
     def place_option_order(self, **kwargs):
+        _assert_connector_leg_shape(kwargs.get("legs"))
         self.place_calls.append(kwargs)
         return {"order_id": "opt-order-1", "status": "accepted"}
 
@@ -171,6 +185,45 @@ def test_fully_armed_and_confirmed_submits(monkeypatch, tmp_path):
     assert result["status"] == "submitted"
     # The witness: exactly one order reached the mocked connector.
     assert len(connector.place_calls) == 1
+    # And it carried the schema key option_id, re-keyed from the raw `option` leg.
+    assert connector.place_calls[0]["legs"][0]["option_id"] == LONG_CALL
+    assert "option" not in connector.place_calls[0]["legs"][0]
+
+
+# --- property: no phantom fill -- the broker reports the CLIENT's real verdict --
+# The broker hands the order to the client, which re-runs its OWN final gates
+# (defined risk, the shared arm store, the caps: defense in depth). If the client
+# refuses, nothing reached the connector -- and the broker must report that, not a
+# phantom submitted=True.
+
+
+def test_broker_reports_not_submitted_when_client_refuses_at_its_own_gate(monkeypatch, tmp_path):
+    """PHANTOM-FILL MUTATION TEST: every broker gate is cleared, but the client
+    refuses at ITS final arm gate (here the client's shared arm store reads
+    DISARMED while the broker's reads ARMED). The connector is never reached, so
+    the broker must report submitted=False and carry the client's status back.
+    Revert the broker to hard-code submitted=True after the handoff and this
+    fails -- the result would claim a fill that never left the building."""
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    connector = FakeConnector()
+    # Broker sees ARMED; the client is wired to a DISARMED store, so the broker
+    # clears its gates and hands off, and the client is the one that refuses.
+    broker_store = FakeArmStore(armed=True)
+    client_store = FakeArmStore(armed=False)
+    client = RobinhoodOptionClient(connector, arm_store=client_store, expected_account=EXPECTED_ACCOUNT)
+    kill = KillSwitch(stop_file=str(tmp_path / "STOP_TRADING_OPTIONS"), env_var="TRADING_ENABLED")
+    broker = RobinhoodOptionBroker(
+        client, arm_store=broker_store, dry_run=False, confirm_live_order=True, kill_switch=kill
+    )
+
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="1", price="1.00", days_to_expiry=30, mode="live"
+    )
+
+    assert result["submitted"] is False
+    # The broker surfaces the client's own refusal status, not "submitted".
+    assert result["status"] == "options_lane_disarmed"
+    assert connector.place_calls == []
 
 
 # --- property: disarmed lane blocks even with the full human confirm ----------

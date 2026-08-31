@@ -25,6 +25,18 @@ LONG_CALL = "OPT-AAPL-CALL"
 SHORT_CALL = "OPT-AAPL-CALL-HIGHER"
 
 
+def _assert_connector_leg_shape(legs):
+    """The real Robinhood options MCP order schema requires each leg to carry
+    `option_id` (the option instrument UUID) -- NOT the legacy `option` key. A
+    permissive stub that accepted the wrong key let a mis-keyed payload look
+    placed; rejecting it here makes the normalizer's option_id re-keying
+    load-bearing (revert it and the connector stub raises)."""
+    assert legs is not None, "connector received no legs"
+    for leg in legs:
+        assert "option_id" in leg, f"leg missing required 'option_id': {leg}"
+        assert "option" not in leg, f"leg carries the wrong key 'option' (schema wants 'option_id'): {leg}"
+
+
 class FakeArmStore:
     """Records nothing; just answers is_armed for the requested lane."""
 
@@ -57,8 +69,10 @@ class FakeConnector:
         self.chain_calls.append(kwargs)
         return {"chains": []}
 
-    def get_option_quotes(self, **kwargs):
-        self.quote_calls.append(kwargs)
+    def get_option_quotes(self, instrument_ids):
+        # Strict signature grounded on the real MCP schema: the argument is
+        # `instrument_ids`, not `ids`. A revert to ids= raises TypeError here.
+        self.quote_calls.append({"instrument_ids": instrument_ids})
         return {"quotes": []}
 
     def get_option_positions(self, account_number=None):
@@ -70,10 +84,12 @@ class FakeConnector:
         return {"option_level": "level_3"}
 
     def review_option_order(self, **kwargs):
+        _assert_connector_leg_shape(kwargs.get("legs"))
         self.review_calls.append(kwargs)
         return {"reviewed": True, **kwargs}
 
     def place_option_order(self, **kwargs):
+        _assert_connector_leg_shape(kwargs.get("legs"))
         self.place_calls.append(kwargs)
         return {"order_id": "opt-order-1", "status": "accepted"}
 
@@ -196,13 +212,15 @@ def test_get_option_chains_passes_symbol_through():
     assert connector.chain_calls == [{"symbol": "AAPL"}]
 
 
-def test_get_option_quotes_passes_contract_ids():
+def test_get_option_quotes_passes_instrument_ids():
+    """The connector's quote tool takes `instrument_ids` (the real MCP schema),
+    not `ids`. Revert the client to ids= and the strict stub raises."""
     connector = FakeConnector()
     client = make_client(connector)
 
     client.get_option_quotes(LONG_CALL, SHORT_CALL)
 
-    assert connector.quote_calls == [{"ids": [LONG_CALL, SHORT_CALL]}]
+    assert connector.quote_calls == [{"instrument_ids": [LONG_CALL, SHORT_CALL]}]
 
 
 def test_get_option_positions_scopes_to_the_pinned_account():
@@ -234,8 +252,10 @@ def test_build_single_leg_long_is_a_debit_buy_to_open():
 
     assert payload["direction"] == "debit"
     assert payload["account_number"] == AGENT_ACCOUNT["account_number"]
+    # The built payload carries the schema key `option_id`, re-keyed from the
+    # `option` alias the caller supplied.
     assert payload["legs"] == [
-        {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option": LONG_CALL}
+        {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option_id": LONG_CALL}
     ]
 
 
@@ -289,6 +309,9 @@ def test_normalize_leg_retains_the_contract_identifying_fields():
     payload = client.build_option_order([leg], direction="debit")
 
     built = payload["legs"][0]
+    # The contract reference is re-keyed to the schema's option_id; the alias is gone.
+    assert built["option_id"] == LONG_CALL
+    assert "option" not in built
     assert built["option_type"] == "call"
     assert built["underlying"] == "AAPL"
     assert built["strike_price"] == "190"
@@ -422,7 +445,7 @@ def test_place_defaults_to_dry_run_and_returns_a_payload():
 
     assert result["submitted"] is False
     assert result["status"] == "dry_run_order_preview"
-    assert result["order_payload"]["legs"][0]["option"] == LONG_CALL
+    assert result["order_payload"]["legs"][0]["option_id"] == LONG_CALL
     assert connector.place_calls == []
 
 
@@ -456,6 +479,22 @@ def test_place_submits_only_when_dry_run_false_and_confirm_true_and_armed():
     assert result["status"] == "submitted"
     assert len(connector.place_calls) == 1
     assert connector.place_calls[0]["account_number"] == AGENT_ACCOUNT["account_number"]
+
+
+def test_place_emits_option_id_leg_to_the_connector():
+    """MUTATION TEST: a fully gated live submit hands the connector a leg keyed
+    `option_id` (the real Robinhood options schema), never the legacy `option`.
+    Revert the normalizer to emit `option` and the strict connector stub raises
+    before recording the call."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(long_legs(), dry_run=False, confirm_live_order=True)
+
+    assert result["submitted"] is True
+    placed_leg = connector.place_calls[0]["legs"][0]
+    assert placed_leg["option_id"] == LONG_CALL
+    assert "option" not in placed_leg
 
 
 def test_place_refuses_to_submit_when_the_options_lane_is_disarmed():
