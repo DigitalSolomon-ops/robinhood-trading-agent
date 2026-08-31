@@ -43,6 +43,7 @@ There is no API key and no base URL: the connector object IS the credential
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
@@ -168,6 +169,38 @@ def assert_defined_risk(legs: Sequence[Mapping[str, Any]], direction: str) -> No
                 "places no opening short, so any such sell is an uncovered short -- naked, "
                 "a ratio, or a mismatched 'cover' -- and is refused"
             )
+
+
+# The ONLY keys the real Robinhood options MCP order schema accepts on a leg
+# (additionalProperties:false). The build path retains extra contract-identifying
+# fields (option_type / underlying / strike / expiration) for the caps/DTE math
+# and a future coverage check, but the connector REJECTS any key outside this
+# set, so the leg handed to the wire is projected down to exactly these.
+_CONNECTOR_LEG_KEYS = ("option_id", "side", "position_effect", "ratio_quantity")
+
+
+def _connector_leg(leg: Mapping[str, Any]) -> dict[str, Any]:
+    """Project one normalized leg down to only the connector's allowed key set."""
+    return {key: leg[key] for key in _CONNECTOR_LEG_KEYS if key in leg}
+
+
+def _positive_limit_price(price: Any) -> float | None:
+    """A limit price coerced to a positive, finite float, or None when it is
+    missing, non-numeric, non-finite, or <= 0.
+
+    A live limit order priced at None / 0 / a negative / a non-number makes BOTH
+    dollar caps read $0 of new risk -- the debit cap sees max(premium, 0) = 0 and
+    the incremental at-risk figure is likewise 0 -- so neither cap can bind. Such
+    an order must be REFUSED at the irreversible submit rather than priced as
+    free; this is the predicate the submit path checks before it will place.
+    """
+    try:
+        value = float(price)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return value
 
 
 def _load_rules(config_root: Path | str | None) -> dict[str, Any]:
@@ -498,7 +531,18 @@ class RobinhoodOptionClient:
         payload = self.build_option_order(
             legs, direction, quantity, order_type, price, time_in_force, account_number
         )
-        return self._connector.review_option_order(**payload)
+        return self._connector.review_option_order(**self._wire_payload(payload))
+
+    @staticmethod
+    def _wire_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+        """The payload actually handed to the connector: a copy of the built
+        payload with each leg stripped to the connector's allowed key set. The
+        built payload keeps the extra contract-identifying fields for the caps /
+        DTE math and a future coverage check; the connector's schema forbids
+        them, so only here, at the wire, are the legs projected down."""
+        wire = dict(payload)
+        wire["legs"] = [_connector_leg(leg) for leg in payload.get("legs", [])]
+        return wire
 
     # --- place (double gate + arm; the only path that can submit) -------------
 
@@ -552,6 +596,16 @@ class RobinhoodOptionClient:
                 "venue": "robinhood_options",
                 "order_payload": payload,
             }
+        # Well-formed price, beside the irreversible call: a live limit order with
+        # a None / non-numeric / <= 0 price makes both dollar caps read $0 of new
+        # risk, voiding them at submit. Refuse it -- never place an unpriced order.
+        if _positive_limit_price(price) is None:
+            return {
+                "submitted": False,
+                "status": "invalid_limit_price",
+                "venue": "robinhood_options",
+                "order_payload": payload,
+            }
         # Third fact, mirrored from the broker (defense in depth): the order must
         # clear the options risk caps. A cap-blocking order -- 0DTE, over the
         # contract count, over the debit or total-at-risk cap, or above the
@@ -574,7 +628,7 @@ class RobinhoodOptionClient:
                 "order_payload": payload,
                 "risk_gate": caps_block,
             }
-        response = self._connector.place_option_order(**payload)
+        response = self._connector.place_option_order(**self._wire_payload(payload))
         return {
             "submitted": True,
             "status": "submitted",

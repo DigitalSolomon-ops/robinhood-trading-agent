@@ -76,6 +76,7 @@ from .robinhood_option_client import (
     DefinedRiskViolationError,
     RobinhoodOptionClient,
     _dte_from_legs,
+    _positive_limit_price,
     assert_defined_risk,
 )
 from .shared_state import build_arm_store
@@ -108,6 +109,33 @@ def _load_rules() -> dict[str, Any]:
     except (OSError, yaml.YAMLError):
         return {}
     return rules if isinstance(rules, dict) else {}
+
+
+def _as_position_list(payload: Any) -> list[Any]:
+    """Normalize a connector get_option_positions payload to a list of positions,
+    across the loosely-known shapes it may take (a bare list, or a mapping under
+    positions / results / option_positions / data)."""
+    if isinstance(payload, Mapping):
+        for key in ("positions", "results", "option_positions", "data"):
+            value = payload.get(key)
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                return list(value)
+        return []
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        return list(payload)
+    return []
+
+
+def _first_float(mapping: Mapping[str, Any], keys: Sequence[str]) -> float | None:
+    """The first of `keys` present in `mapping` with a numeric value, as a float,
+    or None when none is readable."""
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            try:
+                return float(mapping[key])
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 def _default_options_kill_switch() -> KillSwitch:
@@ -324,6 +352,47 @@ class RobinhoodOptionBroker:
             return "; ".join(f"[{result.name}] {result.reason}" for result in blocking)
         return None
 
+    def _open_premium_at_risk_from_positions(self) -> float:
+        """Premium currently at risk in OPEN option positions, in dollars, sourced
+        from the connector via the client.
+
+        For each held position the standing risk is its RECORDED max loss when the
+        connector reports one, else premium x contract-multiplier x contracts
+        (every position this lane opens is a long, whose max loss is the debit
+        paid). Summed over the held positions, this is the standing exposure the
+        portfolio total-at-risk cap must see at the irreversible submit, so a
+        caller that passes the 0.0 default cannot silently reset that cap to zero
+        and let the lane open unbounded cumulative risk one order at a time.
+
+        Best-effort and fail-soft on the READ: an unreadable positions payload
+        contributes 0.0 rather than crashing the submit. The under-count it then
+        guards against is re-checked by the same cap on the next order, and the
+        caller-supplied figure is still honored via max() at the call site.
+        """
+        try:
+            raw = self.client.get_option_positions()
+        except Exception:
+            return 0.0
+        multiplier = self.risk_config.contract_multiplier
+        total = 0.0
+        for position in _as_position_list(raw):
+            if not isinstance(position, Mapping):
+                continue
+            qty = _first_float(position, ("quantity", "contracts", "open_quantity", "long_quantity"))
+            if qty is None or qty <= 0:
+                continue
+            max_loss = _first_float(position, ("max_loss_usd", "max_loss", "recorded_max_loss"))
+            if max_loss is not None and max_loss > 0:
+                total += max_loss
+                continue
+            premium = _first_float(
+                position, ("average_open_price", "average_price", "average_buy_price", "price", "premium")
+            )
+            if premium is None or premium <= 0:
+                continue
+            total += premium * multiplier * qty
+        return round(total, 2)
+
     def build_option_limit_order(
         self,
         signal: TradeSignal,
@@ -463,12 +532,37 @@ class RobinhoodOptionBroker:
                 status="options_lane_disarmed",
             )
 
+        # Well-formed price, beside the irreversible call: refuse a live order
+        # whose limit price is None / non-numeric / <= 0. Such a price makes BOTH
+        # dollar caps read $0 of new risk (the debit cap sees max(premium, 0) = 0
+        # and the incremental at-risk is likewise 0), voiding them at submit. It
+        # returns a preview and never reaches the connector, even fully armed.
+        if _positive_limit_price(price) is None:
+            reason = (
+                f"limit price {price!r} is not a positive number; a live option order needs a "
+                "valid positive limit price so the debit and total-at-risk caps are meaningful"
+            )
+            self._log_refusal(None, reason)
+            return self._preview(
+                legs, direction, quantity, order_type, price, time_in_force, account,
+                reason, status="invalid_limit_price",
+            )
+
+        # Standing exposure, sourced at the irreversible moment: the premium
+        # already at risk in open option positions (from the connector), so the
+        # portfolio total-at-risk cap cannot be under-counted by a caller passing
+        # the 0.0 default. max() with any caller-supplied figure keeps the cap
+        # from being reset downward and avoids double-counting the same exposure.
+        effective_open_at_risk = max(
+            float(open_premium_at_risk_usd or 0.0), self._open_premium_at_risk_from_positions()
+        )
+
         # Third fact, beside the irreversible call: the order must clear the
         # options risk caps. A 0DTE / over-contract / over-debit / over-total /
         # over-level order returns a preview and never reaches the connector,
         # even fully gated and armed. Logged first so the audit keeps the reason.
         caps_block = self._option_caps_block_reason(
-            legs, direction, quantity, price, days_to_expiry, open_premium_at_risk_usd, max_loss_per_contract_usd
+            legs, direction, quantity, price, days_to_expiry, effective_open_at_risk, max_loss_per_contract_usd
         )
         if caps_block is not None:
             self._log_refusal(None, caps_block)
@@ -493,7 +587,7 @@ class RobinhoodOptionBroker:
             dry_run=False,
             confirm_live_order=True,
             days_to_expiry=days_to_expiry,
-            open_premium_at_risk_usd=open_premium_at_risk_usd,
+            open_premium_at_risk_usd=effective_open_at_risk,
             max_loss_per_contract_usd=max_loss_per_contract_usd,
         )
         # Branch on the CLIENT's ACTUAL verdict -- never assume the handoff placed

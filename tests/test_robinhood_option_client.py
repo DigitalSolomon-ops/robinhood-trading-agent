@@ -473,7 +473,9 @@ def test_place_submits_only_when_dry_run_false_and_confirm_true_and_armed():
     connector = FakeConnector()
     client = make_client(connector, armed=True)
 
-    result = client.place_option_order(long_legs(), dry_run=False, confirm_live_order=True)
+    result = client.place_option_order(
+        long_legs(), price="1.00", days_to_expiry=30, dry_run=False, confirm_live_order=True
+    )
 
     assert result["submitted"] is True
     assert result["status"] == "submitted"
@@ -489,7 +491,9 @@ def test_place_emits_option_id_leg_to_the_connector():
     connector = FakeConnector()
     client = make_client(connector, armed=True)
 
-    result = client.place_option_order(long_legs(), dry_run=False, confirm_live_order=True)
+    result = client.place_option_order(
+        long_legs(), price="1.00", days_to_expiry=30, dry_run=False, confirm_live_order=True
+    )
 
     assert result["submitted"] is True
     placed_leg = connector.place_calls[0]["legs"][0]
@@ -674,6 +678,104 @@ def test_client_caps_block_method_flags_each_cap():
     assert "max_contracts_per_order" in (over_ct or "")
     assert "max_debit_premium_per_trade" in (over_debit or "")
     assert within is None
+
+
+# --- submit-hardening: a None / <= 0 / non-numeric price is refused -----------
+# A live limit order whose price is None / non-numeric / <= 0 makes BOTH dollar
+# caps read $0 of new risk (max(premium, 0) = 0), so neither the debit cap nor
+# the total-at-risk cap can bind. Such an order must be refused at the submit
+# path, fully gated + armed, and never reach the connector. Each test FAILS if
+# the price guard is reverted: the order would then submit on a void cap.
+
+
+@pytest.mark.parametrize("bad_price", [None, "0", "0.00", "-1.00", "abc", "nan", "inf"])
+def test_place_refuses_a_none_or_nonpositive_price_even_fully_gated(bad_price):
+    """MUTATION TEST: fully gated + armed, but the limit price is None / <= 0 /
+    non-numeric. The order returns status 'invalid_limit_price' and the connector
+    is never called. Revert the price guard and a $0-priced order submits with
+    both dollar caps voided."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), price=bad_price, days_to_expiry=30, dry_run=False, confirm_live_order=True
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "invalid_limit_price"
+    assert connector.place_calls == []
+
+
+def test_positive_limit_price_predicate_pins_the_boundary():
+    """The predicate the submit path checks: only a positive, finite number is a
+    valid limit price. Pinned directly so neutering it fails here regardless of
+    the submit path."""
+    from src.robinhood_option_client import _positive_limit_price
+
+    assert _positive_limit_price("2.50") == 2.50
+    assert _positive_limit_price(1) == 1.0
+    for bad in (None, "0", 0, "0.00", "-0.01", -5, "abc", "", float("nan"), float("inf")):
+        assert _positive_limit_price(bad) is None, bad
+
+
+# --- submit-hardening: the connector leg carries ONLY the schema keys ----------
+# The real Robinhood options MCP order schema is additionalProperties:false --
+# a leg may carry ONLY option_id / side / position_effect / ratio_quantity. The
+# build path retains extra contract-identifying fields (option_type / underlying
+# / strike / expiration) for the caps/DTE math, but the leg handed to the
+# connector must be stripped to exactly the allowed set, or the venue rejects it.
+
+
+def test_place_strips_schema_forbidden_leg_keys_at_the_connector():
+    """MUTATION TEST: a fully gated live submit whose leg carries identifying
+    fields (option_type / underlying / strike / expiration) hands the connector a
+    leg with EXACTLY {option_id, side, position_effect, ratio_quantity} and no
+    other key. Revert the wire projection and the connector sees schema-forbidden
+    keys (additionalProperties:false) and would reject the order at the venue."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+    rich_leg = {
+        "side": "buy",
+        "position_effect": "open",
+        "ratio_quantity": 1,
+        "option": LONG_CALL,
+        "option_type": "call",
+        "underlying": "AAPL",
+        "strike_price": "190",
+        "expiration_date": "2026-09-18",
+    }
+
+    result = client.place_option_order(
+        [rich_leg], price="1.00", days_to_expiry=30, dry_run=False, confirm_live_order=True
+    )
+
+    assert result["submitted"] is True
+    placed_leg = connector.place_calls[0]["legs"][0]
+    assert set(placed_leg) == {"option_id", "side", "position_effect", "ratio_quantity"}
+    assert placed_leg["option_id"] == LONG_CALL
+    # The built payload the client returns still carries the identifying fields --
+    # only the wire leg handed to the connector is stripped.
+    assert result["order_payload"]["legs"][0]["option_type"] == "call"
+
+
+def test_review_also_strips_schema_forbidden_leg_keys():
+    """Review is connector-bound too (same additionalProperties:false schema), so
+    its leg is projected to the allowed key set as well."""
+    connector = FakeConnector()
+    client = make_client(connector)
+    rich_leg = {
+        "side": "buy",
+        "position_effect": "open",
+        "ratio_quantity": 1,
+        "option": LONG_CALL,
+        "option_type": "call",
+        "underlying": "AAPL",
+    }
+
+    client.review_order([rich_leg])
+
+    reviewed_leg = connector.review_calls[0]["legs"][0]
+    assert set(reviewed_leg) == {"option_id", "side", "position_effect", "ratio_quantity"}
 
 
 # --- cancel mirrors the same dry_run/confirm gate (no arm required) -----------

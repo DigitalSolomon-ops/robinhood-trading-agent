@@ -179,7 +179,9 @@ def test_fully_armed_and_confirmed_submits(monkeypatch, tmp_path):
     connector = FakeConnector()
     broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
 
-    result = broker.submit_option_order(legs=[LONG_LEG], direction="debit", mode="live")
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", price="1.00", days_to_expiry=30, mode="live"
+    )
 
     assert result["submitted"] is True
     assert result["status"] == "submitted"
@@ -259,7 +261,9 @@ def test_stop_trading_options_file_blocks(monkeypatch, tmp_path):
     broker = make_broker(connector, stop_file=stop, monkeypatch=monkeypatch, tmp_path=tmp_path)
 
     with pytest.raises(RuntimeError, match="kill switch is engaged"):
-        broker.submit_option_order(legs=[LONG_LEG], direction="debit", mode="live")
+        broker.submit_option_order(
+            legs=[LONG_LEG], direction="debit", price="1.00", days_to_expiry=30, mode="live"
+        )
     assert connector.place_calls == []
 
 
@@ -272,7 +276,9 @@ def test_trading_enabled_false_blocks(monkeypatch, tmp_path):
     broker = make_broker(connector, trading_enabled="false", monkeypatch=monkeypatch, tmp_path=tmp_path)
 
     with pytest.raises(RuntimeError, match="TRADING_ENABLED=false"):
-        broker.submit_option_order(legs=[LONG_LEG], direction="debit", mode="live")
+        broker.submit_option_order(
+            legs=[LONG_LEG], direction="debit", price="1.00", days_to_expiry=30, mode="live"
+        )
     assert connector.place_calls == []
 
 
@@ -458,7 +464,7 @@ def test_wrong_account_is_refused(monkeypatch, tmp_path):
 def test_place_long_call_submits_when_armed(monkeypatch, tmp_path):
     connector = FakeConnector()
     broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
-    result = broker.place_long_call(LONG_CALL, mode="live")
+    result = broker.place_long_call(LONG_CALL, price="1.00", days_to_expiry=30, mode="live")
     assert result["submitted"] is True
     assert len(connector.place_calls) == 1
 
@@ -675,6 +681,192 @@ def test_place_long_call_refuses_a_known_zero_dte(monkeypatch, tmp_path):
     result = broker.place_long_call(LONG_CALL, price="1.00", days_to_expiry=0, mode="live")
     assert result["submitted"] is False
     assert result["status"] == "options_risk_gate_blocked"
+    assert connector.place_calls == []
+
+
+# --- submit-hardening (1): a None / <= 0 / non-numeric price is refused --------
+# A live limit order priced at None / non-numeric / <= 0 makes BOTH dollar caps
+# read $0 of new risk (max(premium, 0) = 0), voiding them at the irreversible
+# submit. The broker refuses it (status 'invalid_limit_price') and never reaches
+# the connector, even fully armed + confirmed + live. Each FAILS if the price
+# guard is reverted.
+
+
+@pytest.mark.parametrize("bad_price", [None, "0", "0.00", "-2.00", "abc", "nan", "inf"])
+def test_none_or_nonpositive_price_refused_even_fully_armed(bad_price, monkeypatch, tmp_path):
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="1", price=bad_price, days_to_expiry=30, mode="live"
+    )
+    assert result["submitted"] is False
+    assert result["status"] == "invalid_limit_price"
+    assert connector.place_calls == []
+
+
+def test_none_price_refused_by_the_brokers_own_guard(monkeypatch, tmp_path):
+    """MUTATION TEST pinning the BROKER's own price guard (independent of the
+    client's mirror): the broker logs its own invalid-price refusal reason before
+    the client is ever reached. Revert the broker's price guard and the client
+    still catches it, but the broker would log 'client did not submit' instead of
+    the price reason -- so this assertion fails."""
+    connector = FakeConnector()
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    store = FakeArmStore(armed=True)
+    client = RobinhoodOptionClient(connector, arm_store=store, expected_account=EXPECTED_ACCOUNT)
+    kill = KillSwitch(stop_file=str(tmp_path / "STOP_TRADING_OPTIONS"), env_var="TRADING_ENABLED")
+    logger = _FakeLogger()
+    broker = RobinhoodOptionBroker(
+        client, arm_store=store, dry_run=False, confirm_live_order=True, kill_switch=kill, logger=logger
+    )
+
+    result = broker.submit_option_order(legs=[LONG_LEG], direction="debit", price=None, mode="live")
+
+    assert result["submitted"] is False
+    assert result["status"] == "invalid_limit_price"
+    assert connector.place_calls == []
+    # The broker's OWN guard logged the price reason (not a client-handoff status).
+    assert any("not a positive number" in str(reason) for _, _, reason, _ in logger.decisions)
+
+
+# --- submit-hardening (2): the connector leg carries ONLY the schema keys ------
+# Through the broker path too, the leg the connector receives must be exactly
+# {option_id, side, position_effect, ratio_quantity} (the real MCP schema is
+# additionalProperties:false) -- the broker hands rich legs to the client, which
+# strips them at the wire.
+
+
+def test_broker_submit_strips_schema_forbidden_leg_keys_at_the_connector(monkeypatch, tmp_path):
+    """MUTATION TEST: a rich leg (with option_type / underlying / strike /
+    expiration) submitted through the broker reaches the connector stripped to
+    exactly the four allowed keys. Revert the client's wire projection and the
+    connector sees forbidden keys."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    rich_leg = {
+        "side": "buy",
+        "position_effect": "open",
+        "ratio_quantity": 1,
+        "option": LONG_CALL,
+        "option_type": "call",
+        "underlying": "XYZ",
+        "strike_price": "100",
+        "expiration_date": "2026-09-18",
+    }
+    result = broker.submit_option_order(
+        legs=[rich_leg], direction="debit", quantity="1", price="1.00", days_to_expiry=30, mode="live"
+    )
+    assert result["submitted"] is True
+    placed_leg = connector.place_calls[0]["legs"][0]
+    assert set(placed_leg) == {"option_id", "side", "position_effect", "ratio_quantity"}
+    assert placed_leg["option_id"] == LONG_CALL
+
+
+# --- submit-hardening (3): standing exposure is sourced from open positions ----
+# The live path must not trust open_premium_at_risk_usd=0.0 -- it sources the
+# premium already at risk in open option positions from the connector, so the
+# portfolio total-at-risk cap ($1,500) cannot be under-counted. A second order
+# is refused once the standing exposure fills the cap.
+
+
+class PositionsConnector(FakeConnector):
+    """A connector that reports OPEN option positions, so the broker's standing-
+    exposure sourcing has something to sum."""
+
+    def __init__(self, positions, **kwargs):
+        super().__init__(**kwargs)
+        self._positions = positions
+
+    def get_option_positions(self, account_number=None):
+        self.position_calls.append({"account_number": account_number})
+        return {"positions": self._positions}
+
+
+def test_second_order_refused_once_open_exposure_fills_the_cap(monkeypatch, tmp_path):
+    """MUTATION TEST: $1,400 is already at risk in open positions (7 contracts x
+    $2.00 x 100). A new $200 order (1 x $2.00 x 100) is within the debit cap but
+    pushes total at-risk to $1,600, over the $1,500 cap -- so it is REFUSED with
+    status 'options_risk_gate_blocked'. Revert the positions sourcing and the
+    open exposure reads as $0, the new order clears the cap, and it SUBMITS."""
+    connector = PositionsConnector(
+        positions=[{"quantity": "7", "average_open_price": "2.00", "option_id": LONG_CALL}]
+    )
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="1", price="2.00", days_to_expiry=30, mode="live"
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_total_premium_at_risk" in result["human_gate"]
+    assert connector.place_calls == []
+
+
+def test_order_within_cap_still_submits_with_open_exposure(monkeypatch, tmp_path):
+    """Precision: standing exposure UNDER the cap does not block a compliant new
+    order. $600 open (3 x $2.00 x 100) + $200 new = $800 <= $1,500 -> submits.
+    Ensures the sourcing tightens the cap without falsely blocking."""
+    connector = PositionsConnector(
+        positions=[{"quantity": "3", "average_open_price": "2.00", "option_id": LONG_CALL}]
+    )
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="1", price="2.00", days_to_expiry=30, mode="live"
+    )
+
+    assert result["submitted"] is True
+    assert len(connector.place_calls) == 1
+
+
+def test_open_exposure_from_positions_sums_premium_and_max_loss(monkeypatch, tmp_path):
+    """Pin the broker's sourcing method directly: a position's standing risk is
+    its recorded max_loss when present, else premium x 100 x contracts. Revert it
+    and this fails independently of the end-to-end cap test."""
+    connector = PositionsConnector(
+        positions=[
+            {"quantity": "2", "average_open_price": "1.50"},  # 2 x 1.50 x 100 = 300
+            {"quantity": "1", "max_loss_usd": "250"},          # recorded max loss = 250
+            {"quantity": "0", "average_open_price": "9.99"},   # closed -> ignored
+        ]
+    )
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    assert broker._open_premium_at_risk_from_positions() == 550.0
+
+
+def test_open_exposure_is_fail_soft_on_an_unreadable_positions_read(monkeypatch, tmp_path):
+    """A positions read that raises contributes 0.0 rather than crashing the
+    submit -- the under-count it guards against is re-checked next order."""
+    connector = FakeConnector()
+
+    def _boom(account_number=None):
+        raise RuntimeError("positions unavailable")
+
+    connector.get_option_positions = _boom  # type: ignore[assignment]
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    assert broker._open_premium_at_risk_from_positions() == 0.0
+
+
+def test_caller_supplied_open_exposure_is_not_undercounted(monkeypatch, tmp_path):
+    """When a caller passes an explicit open-exposure figure HIGHER than what the
+    positions sum to, the higher figure wins (max), so the cap is never reset
+    downward. Here the caller's $1,450 + a new $200 order exceeds the $1,500 cap
+    even though the connector reports no open positions."""
+    connector = FakeConnector()  # reports no open positions
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    order = {
+        "symbol": LONG_CALL,
+        "side": "buy",
+        "quantity": "1",
+        "limit_price": 2.00,
+        "days_to_expiry": 30,
+        "open_premium_at_risk_usd": 1450.0,
+    }
+    result = broker.place_limit_order(order, mode="live")
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_total_premium_at_risk" in result["human_gate"]
     assert connector.place_calls == []
 
 
