@@ -23,7 +23,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from ..equity_intelligence import summarize_breadth, summarize_news
-from ..equity_intelligence.massive_client import OptionContract
+from ..equity_intelligence.massive_client import OptionContract, OptionSnapshot
 from .backtest import HitRate, backtest_setup
 from .indicators import Factor, build_series, directional_score_at, realized_vol_at
 
@@ -58,6 +58,19 @@ class Play:
     hit_rate: HitRate
     rank_score: float
     rationale: str
+    # --- REAL contract data (Options plan snapshot). All optional: premium/OI
+    # populate now, greeks/IV are None off market hours. Defaulted so a Play can
+    # still be built when the snapshot endpoint returns nothing. ---------------
+    premium: float | None = None  # per-share option price (x100 = one contract)
+    premium_source: str | None = None  # "last_quote_midpoint" | "day_close"
+    open_interest: float | None = None
+    day_volume: float | None = None
+    delta: float | None = None
+    gamma: float | None = None
+    theta: float | None = None
+    vega: float | None = None
+    implied_volatility: float | None = None
+    contract_selection: str = "strike_distance"  # or "target_delta"
 
     @property
     def target(self) -> float:
@@ -68,6 +81,31 @@ class Play:
     @property
     def stop(self) -> float:
         return self.floor if self.direction == "call" else self.ceiling
+
+    @property
+    def has_greeks(self) -> bool:
+        return self.delta is not None
+
+    @property
+    def cost_per_contract(self) -> float | None:
+        """Premium x 100 (one US equity option controls 100 shares)."""
+        return round(self.premium * 100.0, 2) if self.premium is not None else None
+
+    @property
+    def max_loss(self) -> float | None:
+        """The defined risk of a LONG option is the premium paid, premium x 100.
+        (This tool only ever frames long-option plays.)"""
+        return self.cost_per_contract
+
+    @property
+    def breakeven(self) -> float | None:
+        """Underlying breakeven at expiry: call strike + premium, put strike -
+        premium. None until both strike and premium are known."""
+        if self.premium is None or self.strike is None:
+            return None
+        if self.direction == "call":
+            return round(self.strike + self.premium, 2)
+        return round(self.strike - self.premium, 2)
 
 
 def _news_score(client: Any, symbol: str, news_cfg: dict[str, Any], now: datetime) -> tuple[float, str]:
@@ -106,16 +144,16 @@ def _regime(client: Any, regime_cfg: dict[str, Any], today: date) -> tuple[float
     return 0.5, "no completed session with breadth in the last week"
 
 
-def _pick_contract(
+def _nearest_expiry_contracts(
     client: Any,
     symbol: str,
     direction: str,
     target: float,
     today: date,
     horizon_days: int,
-) -> OptionContract | None:
-    """Nearest listed contract to the target: earliest expiry on/after the
-    horizon, then strike closest to the target level. Reference metadata only."""
+) -> list[OptionContract]:
+    """The listed contracts of the earliest expiry on/after the horizon, within
+    a strike band around the target. Reference metadata only (no price)."""
     # trading days -> calendar days, plus a couple of days of slack.
     target_expiry = today + timedelta(days=math.ceil(horizon_days * 7 / 5) + 2)
     lo = round(target * 0.8, 2)
@@ -130,13 +168,78 @@ def _pick_contract(
             limit=250,
         )
     except Exception:
-        return None
+        return []
     contracts = [c for c in contracts if c.expiration_date and c.contract_type == direction]
     if not contracts:
-        return None
+        return []
     nearest_expiry = min(c.expiration_date for c in contracts)
-    same_expiry = [c for c in contracts if c.expiration_date == nearest_expiry]
-    return min(same_expiry, key=lambda c: abs(c.strike_price - target))
+    return [c for c in contracts if c.expiration_date == nearest_expiry]
+
+
+def _safe_snapshot(client: Any, symbol: str, option_ticker: str) -> OptionSnapshot | None:
+    """Fetch one contract snapshot, swallowing any error (a data hiccup, an
+    entitlement gap, or a FakeClient without the method) so analysis never
+    crashes on a missing snapshot."""
+    getter = getattr(client, "get_option_snapshot", None)
+    if getter is None:
+        return None
+    try:
+        return getter(symbol, option_ticker)
+    except Exception:
+        return None
+
+
+def _select_contract(
+    client: Any,
+    symbol: str,
+    direction: str,
+    target: float,
+    today: date,
+    horizon_days: int,
+    config: dict[str, Any],
+) -> tuple[OptionContract | None, OptionSnapshot | None, str]:
+    """Choose the contract to surface and fetch its real snapshot.
+
+    Selection: within the nearest-expiry group, scan the contracts closest to
+    the target LEVEL by strike (bounded), fetch each snapshot, and -- WHEN greeks
+    are available -- pick the one whose |delta| is nearest the configured target
+    delta (default ~0.35 for the directional side). When no scanned contract has
+    greeks (weekend / after-hours), fall back to the strike-distance nearest.
+
+    Returns (contract, snapshot_for_that_contract, selection_method).
+    """
+    same_expiry = _nearest_expiry_contracts(client, symbol, direction, target, today, horizon_days)
+    if not same_expiry:
+        return None, None, "none"
+
+    sel_cfg = config.get("option_selection", {}) or {}
+    target_delta = abs(float(sel_cfg.get("target_delta", 0.35)))
+    scan_max = max(1, int(sel_cfg.get("delta_scan_max_contracts", 8)))
+
+    by_strike = sorted(same_expiry, key=lambda c: abs(c.strike_price - target))
+    scan = by_strike[:scan_max]
+
+    snaps: dict[str, OptionSnapshot] = {}
+    for contract in scan:
+        snap = _safe_snapshot(client, symbol, contract.ticker)
+        if snap is not None:
+            snaps[contract.ticker] = snap
+
+    with_greeks = [
+        (contract, snaps[contract.ticker])
+        for contract in scan
+        if contract.ticker in snaps and snaps[contract.ticker].has_greeks
+    ]
+    if with_greeks:
+        chosen, snap = min(
+            with_greeks, key=lambda cs: abs(abs(cs[1].delta) - target_delta)
+        )
+        return chosen, snap, "target_delta"
+
+    # Fallback: greeks unavailable (weekend/after-hours) -> nearest strike to the
+    # target level, with whatever snapshot (premium/OI) we did get for it.
+    chosen = by_strike[0]
+    return chosen, snaps.get(chosen.ticker), "strike_distance"
 
 
 def analyze_symbol(
@@ -231,7 +334,10 @@ def analyze_symbol(
         fresh_edge_only=bool(bt_cfg.get("fresh_edge_only", True)),
     )
 
-    contract = _pick_contract(client, symbol, direction, ceiling if direction == "call" else floor, today, horizon_days)
+    contract, snapshot, selection = _select_contract(
+        client, symbol, direction, ceiling if direction == "call" else floor,
+        today, horizon_days, config,
+    )
 
     rank_score = (conviction / 100.0) * hit.hit_rate * hit.confidence_weight
 
@@ -261,6 +367,16 @@ def analyze_symbol(
         hit_rate=hit,
         rank_score=rank_score,
         rationale=rationale,
+        premium=snapshot.premium if snapshot else None,
+        premium_source=snapshot.premium_source if snapshot else None,
+        open_interest=snapshot.open_interest if snapshot else None,
+        day_volume=snapshot.day_volume if snapshot else None,
+        delta=snapshot.delta if snapshot else None,
+        gamma=snapshot.gamma if snapshot else None,
+        theta=snapshot.theta if snapshot else None,
+        vega=snapshot.vega if snapshot else None,
+        implied_volatility=snapshot.implied_volatility if snapshot else None,
+        contract_selection=selection if contract else "strike_distance",
     )
 
 

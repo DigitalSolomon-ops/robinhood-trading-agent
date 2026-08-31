@@ -39,6 +39,14 @@ def make_play(**overrides) -> Play:
         rationale="CALL on AAPL. Trend: EMA20 above EMA50. Momentum: MACD positive. "
                   "RSI(14) 62 (above midline). Realized-vol expected move ~4.5% over 10 "
                   "trading days. Backtest: 64% hit rate over 42 past occurrences.",
+        premium=5.25,
+        premium_source="last_quote_midpoint",
+        open_interest=4213.0,
+        day_volume=1875.0,
+        delta=0.42,
+        theta=-0.08,
+        implied_volatility=0.28,
+        contract_selection="target_delta",
     )
     defaults.update(overrides)
     return Play(**defaults)
@@ -64,6 +72,47 @@ def test_html_contains_every_play_field():
         "Trend:",                    # rationale signals
     ]:
         assert token in html, f"missing {token!r}"
+
+
+def test_html_renders_real_contract_economics():
+    """Premium, cost per contract, max loss, breakeven, OI + day volume, and
+    greeks all render from the snapshot data."""
+    html = render_email_html([make_play()], TODAY)
+    assert "$5.25" in html               # premium per share
+    assert "$525.00" in html             # cost per contract = premium x 100
+    assert "MAX LOSS" in html
+    assert "215.25" in html              # breakeven = strike 210 + premium 5.25
+    assert "BREAKEVEN" in html
+    assert "OPEN INTEREST" in html
+    assert "4,213" in html               # open interest
+    assert "1,875" in html               # day volume
+    assert "Greeks:" in html
+    assert "+0.420" in html              # delta
+    assert "-0.080" in html              # theta
+    assert "28.0%" in html               # implied volatility
+
+
+def test_html_shows_pending_note_when_greeks_absent():
+    """Weekend/after-hours: greeks + IV are None, so a clear pending note shows
+    instead of blanks -- but premium and open interest still render."""
+    play = make_play(delta=None, theta=None, implied_volatility=None,
+                     contract_selection="strike_distance")
+    html = render_email_html([play], TODAY)
+    assert "pending" in html.lower()
+    assert "market hours" in html.lower()
+    assert "Greeks:" not in html         # no greek values are shown
+    assert "$525.00" in html             # premium-derived economics still render
+    assert "4,213" in html               # open interest still shows
+
+
+def test_html_shows_premium_pending_when_premium_is_none():
+    """If neither a live quote nor a day close populated (rare off-hours), the
+    premium reads 'pending' and the derived costs degrade to n/a, no crash."""
+    play = make_play(premium=None, premium_source=None,
+                     delta=None, theta=None, implied_volatility=None)
+    html = render_email_html([play], TODAY)
+    assert "pending" in html.lower()
+    assert "PREMIUM" in html
 
 
 def test_html_contains_the_prominent_disclaimer():

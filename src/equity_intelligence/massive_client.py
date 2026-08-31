@@ -137,6 +137,47 @@ class OptionContract:
 
 
 @dataclass(frozen=True)
+class OptionSnapshot:
+    """One live per-contract snapshot from the v3 options snapshot endpoint
+    (GET /v3/snapshot/options/{underlying}/{option_ticker}).
+
+    This is the FIRST place the scout ever prices an actual contract -- the
+    Options plan authorizes it. It is used to DISPLAY the contract economics and
+    to refine contract SELECTION (target-delta), never to place, size, or time an
+    order.
+
+    Field entitlement:
+      * premium (last_quote.midpoint, else day.close), open_interest and
+        day_volume populate whenever the contract has traded/quoted -- including
+        on a weekend from the most recent session.
+      * greeks {delta,gamma,theta,vega} and implied_volatility are computed from
+        LIVE quotes and come back None outside market hours (weekend / after
+        hours). Callers MUST treat every one of these as optional.
+    """
+
+    contract_ticker: str
+    underlying_ticker: str
+    premium: float | None  # prefer last_quote.midpoint, else day.close
+    premium_source: str | None  # "last_quote_midpoint" | "day_close" | None
+    open_interest: float | None
+    day_volume: float | None
+    day_close: float | None
+    bid: float | None
+    ask: float | None
+    delta: float | None
+    gamma: float | None
+    theta: float | None
+    vega: float | None
+    implied_volatility: float | None
+
+    @property
+    def has_greeks(self) -> bool:
+        """True when the greeks needed for delta-target selection are present.
+        Off market hours this is False (delta comes back None)."""
+        return self.delta is not None
+
+
+@dataclass(frozen=True)
 class TickerDetails:
     """One row from the ticker-details REFERENCE endpoint (v3/reference/tickers).
 
@@ -186,6 +227,68 @@ def _indicator_values(payload: dict[str, Any]) -> list[Any]:
     if isinstance(results, dict):
         return results.get("values", []) or []
     return []
+
+
+def _opt_float(value: Any) -> float | None:
+    """Cast a snapshot numeric to float, or None when absent/uncastable.
+    Greeks/IV/premium fields are frequently null (off market hours) -- None
+    flows through so callers can render a 'pending market hours' note instead
+    of crashing or showing a blank."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _option_snapshot_from_result(
+    result: dict[str, Any], underlying: str, option_ticker: str
+) -> OptionSnapshot:
+    day = result.get("day") if isinstance(result.get("day"), dict) else {}
+    last_quote = result.get("last_quote") if isinstance(result.get("last_quote"), dict) else {}
+    greeks = result.get("greeks") if isinstance(result.get("greeks"), dict) else {}
+    details = result.get("details") if isinstance(result.get("details"), dict) else {}
+
+    # NOTE: the v3 snapshot `day` object uses FULL field names ("close",
+    # "volume", "vwap") -- unlike the v2 aggregates endpoint, which uses the
+    # terse single letters in market_data_fields. Do not swap these for
+    # FIELD_CLOSE / FIELD_VOLUME.
+    day_close = _opt_float(day.get("close"))
+    day_volume = _opt_float(day.get("volume"))
+    bid = _opt_float(last_quote.get("bid"))
+    ask = _opt_float(last_quote.get("ask"))
+
+    # Premium: prefer the live-quote midpoint. The endpoint usually supplies it
+    # directly; when it does not but a two-sided quote exists, derive it from
+    # bid/ask. Fall back to the day's close only if no usable quote is present.
+    midpoint = _opt_float(last_quote.get("midpoint"))
+    if (midpoint is None or midpoint <= 0) and bid is not None and ask is not None and bid > 0 and ask > 0:
+        midpoint = round((bid + ask) / 2.0, 4)
+    if midpoint is not None and midpoint > 0:
+        premium, premium_source = midpoint, "last_quote_midpoint"
+    elif day_close is not None and day_close > 0:
+        premium, premium_source = day_close, "day_close"
+    else:
+        premium, premium_source = None, None
+
+    ticker = result.get("ticker") or details.get("ticker") or option_ticker
+    return OptionSnapshot(
+        contract_ticker=str(ticker),
+        underlying_ticker=str(underlying),
+        premium=premium,
+        premium_source=premium_source,
+        open_interest=_opt_float(result.get("open_interest")),
+        day_volume=day_volume,
+        day_close=day_close,
+        bid=bid,
+        ask=ask,
+        delta=_opt_float(greeks.get("delta")),
+        gamma=_opt_float(greeks.get("gamma")),
+        theta=_opt_float(greeks.get("theta")),
+        vega=_opt_float(greeks.get("vega")),
+        implied_volatility=_opt_float(result.get("implied_volatility")),
+    )
 
 
 def _bar_from_row(row: dict[str, Any]) -> Bar:
@@ -522,3 +625,32 @@ class MassiveClient:
                 )
             )
         return contracts
+
+    # --- options CONTRACT SNAPSHOT (Options plan: premium/OI/greeks/IV) --------
+
+    def get_option_snapshot(self, underlying: str, option_ticker: str) -> OptionSnapshot | None:
+        """Live per-contract snapshot (GET /v3/snapshot/options/{underlying}/{option_ticker}).
+
+        Authorized on the Options plan. Returns premium (last_quote midpoint,
+        else day close), open_interest, day volume, and greeks {delta, gamma,
+        theta, vega} + implied_volatility. Greeks/IV are computed from live
+        quotes and come back None off market hours (weekend/after-hours) -- the
+        typed result carries them as None rather than raising.
+
+        Rate-limit-aware (shares `_request_with_backoff`), but deliberately NOT
+        run through the per-UTC-day cache in `_get`: premium and greeks move
+        intraday, so a snapshot must be fetched fresh each call -- same rationale
+        as `get_current_price`. Returns None when the endpoint has no results row
+        (unknown/expired contract). This DISPLAYS and SELECTS a contract; it
+        never places, sizes, or times an order.
+        """
+        if not self.api_key:
+            raise MassiveAuthError(
+                "MASSIVE_API_KEY is not set (checked env, then Secret Manager `massive-api`)"
+            )
+        path = f"/v3/snapshot/options/{underlying}/{option_ticker}"
+        payload = self._request_with_backoff(path, {})
+        result = payload.get("results")
+        if not isinstance(result, dict) or not result:
+            return None
+        return _option_snapshot_from_result(result, underlying, option_ticker)

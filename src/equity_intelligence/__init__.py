@@ -26,6 +26,7 @@ from .massive_client import (
     NewsInsight,
     NewsItem,
     OptionContract,
+    OptionSnapshot,
     TickerDetails,
     resolve_massive_api_key,
 )
@@ -55,6 +56,7 @@ __all__ = [
     "NewsInsight",
     "NewsItem",
     "OptionContract",
+    "OptionSnapshot",
     "RegimeSnapshot",
     "RegimeVerdict",
     "SentimentFilterResult",

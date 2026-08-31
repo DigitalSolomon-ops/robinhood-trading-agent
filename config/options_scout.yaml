@@ -59,6 +59,21 @@ levels:
   # Entry zone half-width as a fraction of one ATR(14).
   entry_band_atr_fraction: 0.25
 
+# --- contract selection (Options plan: real snapshot per contract) ----------
+# For each chosen play the scout fetches the real per-contract snapshot
+# (premium, open interest, greeks, IV) and refines WHICH contract it surfaces.
+option_selection:
+  # When greeks are available (market hours), prefer the contract whose |delta|
+  # is nearest this value on the directional side -- ~0.35 is a common
+  # balance of leverage vs. probability for a long directional option. When
+  # greeks are null (weekend / after-hours) the scout falls back to the
+  # strike-nearest-the-target-level logic automatically.
+  target_delta: 0.35
+  # Upper bound on how many near-the-target contracts to pull a snapshot for
+  # while hunting the target-delta strike (one API call each). Unlimited calls
+  # are available now, but this keeps a single play's work bounded.
+  delta_scan_max_contracts: 8
+
 # --- conviction factor weights (must be > 0; normalized internally) ---------
 weights:
   trend: 0.40      # EMA20 vs EMA50, and close vs SMA200
