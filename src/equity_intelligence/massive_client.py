@@ -29,11 +29,11 @@ SECRET_MANAGER_NAME = "massive-api"
 MAX_RETRIES = 8  # enough capped-exponential backoff (…,32,60,60) to outlast a 60s window
 INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 60.0
-# Proactive min interval between REAL requests (cache hits are free). The free
-# tier is ~5 req/min; 13s spacing keeps a SHARED client under it deterministically
-# instead of relying on reactive 429 backoff. 0 disables it (the default, so
-# existing callers/tests are unchanged); a shared loop client turns it on.
-MIN_REQUEST_INTERVAL_SECONDS = 13.0
+# Proactive min interval between REAL requests (cache hits are free). On a PAID
+# plan this is 0 (no artificial spacing) — the default. On the free ~5 req/min
+# tier, set MASSIVE_MIN_INTERVAL_SECONDS=13 so a shared client stays under the
+# limit deterministically instead of relying on reactive 429 backoff.
+MIN_REQUEST_INTERVAL_SECONDS = float(os.getenv("MASSIVE_MIN_INTERVAL_SECONDS", "0") or "0")
 
 # EOD/delayed data feeds decisions and proving only -- the Robinhood connector
 # stays the sole source of execution-time price. Nothing here is a quote used

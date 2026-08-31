@@ -683,8 +683,17 @@ def run_equity_proving_run(
     but no order is placed and no connector quote is used for pricing, so the
     run is reproducible against a market that actually happened.
     """
-    # ONE shared, throttled client feeds the quote source AND every provider the
-    # loop builds, so the whole proving run stays inside the free tier.
+    # Load .env FIRST so a MASSIVE_API_KEY there is seen before the client resolves
+    # its key (env-first, then Secret Manager) -- a proving run should not depend on
+    # a live gcloud/ADC session when the key is already configured locally.
+    load_dotenv(root / ".env", override=False)
+    # Start each proving run from a FRESH paper ledger (archived, not destroyed) so
+    # the runs are GENUINELY INDEPENDENT: a run must trade on its own from starting
+    # cash, not inherit the prior run's open position -- which would leave it with no
+    # fill in its window, and the readiness gate does not count a zero-fill run.
+    PaperBroker(root / "data" / "equity_paper_trades.db").reset(archive=True)
+    # ONE shared client feeds the quote source AND every provider the loop builds,
+    # so all Massive calls share one budget + cache (throttle off on a paid plan).
     shared_massive = client or MassiveClient(min_interval=MIN_REQUEST_INTERVAL_SECONDS)
     quote_source = build_massive_quote_source(root, client=shared_massive, lookback_days=lookback_days)
     summary = run_equity_paper_loop(
@@ -701,7 +710,18 @@ def run_equity_proving_run(
         regime_provider=regime_provider,
         massive_client=shared_massive,
     )
-    return {**summary, "quote_source": MASSIVE_QUOTE_SOURCE, "provenance": quote_source.provenance()}
+    # Reconcile the paper ledger AFTER the loop and log it, so the readiness gate
+    # can pair this run's loop-completion with a following clean reconcile (a run
+    # with no reconcile of greater id does not count). Reconcile is honest: it
+    # asserts cash conservation + position consistency and reports errors on any
+    # mismatch (src/paper_broker.py), so "reconciled clean" is not a tautology.
+    reconcile = reconcile_equity_paper(root)
+    return {
+        **summary,
+        "quote_source": MASSIVE_QUOTE_SOURCE,
+        "provenance": quote_source.provenance(),
+        "reconcile": reconcile,
+    }
 
 
 def equity_backtest_series(
