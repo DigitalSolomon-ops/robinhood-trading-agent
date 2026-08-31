@@ -646,36 +646,34 @@ def test_no_audit_database_means_no_proven_runs(tmp_path: Path) -> None:
 def test_the_repos_own_audit_log_is_counted_honestly() -> None:
     """Pinned against the real audit log, counted the GENUINE way.
 
-    Two rounds of making this evidence real have each cost the lane a run it
-    thought it had. First: the tautological count hid that run 2 filled nothing
-    and run 3 traded only after a manual daily-counter reset, leaving exactly
-    one genuine run. Now: requiring a REAL price source costs it that one too.
-    Every recorded run here predates the Massive history feed -- they were
-    priced on a locally generated series and recorded no source at all -- so
-    ZERO runs count, and the gate is honestly not met.
-
-    This asserts the honest count rather than a number that was never true.
-    Two genuine unattended runs priced on real Massive bars
-    (src.equity_runtime.run_equity_proving_run) are owed before this gate can
-    pass. The audit trail of the old runs is untouched; only what it is allowed
-    to prove has changed.
+    The counting is honest by INVARIANT, not by a snapshot number: a run counts
+    only if it was priced on the real Massive feed, reconciled clean, filled at
+    least once, and not tainted by a manual counter reset. The old synthetic runs
+    (pre-Massive, no recorded source; plus a zero-fill run and a reset-tainted
+    run) remain in the audit trail but never count. As genuine
+    run_equity_proving_run runs accumulate, the counted set grows -- so this test
+    asserts the counting RULE holds for whatever is in the log, rather than
+    pinning a point-in-time zero that real runs have since correctly broken.
     """
     runs = paper_proving_runs(REPO_ROOT)
     clean = [run for run in runs if run["clean"]]
     evidence = paper_runs_evidence(REPO_ROOT, {})
 
-    assert evidence.passed is False, evidence.detail
-    assert evidence.data["clean_run_count"] == 0
-    assert clean == []
-
-    # Not counted, and for the stated reason: none of them named a real feed.
-    assert runs, "the recorded runs are still in the audit log; they simply no longer count"
-    assert all(not run["quote_source_is_real"] for run in runs)
-    assert REQUIRED_QUOTE_SOURCE not in recorded_quote_sources(REPO_ROOT)
-    assert "not priced on the real feed" in evidence.detail
-
-    # The earlier, independent reasons still stand on the runs they applied to,
-    # so relaxing the source rule alone could never turn this gate green.
+    # The counter is HONEST: a run counts IFF it is priced on the real Massive
+    # feed, reconciled clean, filled at least once, and NOT reset-tainted. This
+    # invariant holds as genuine runs accumulate -- it no longer pins a
+    # point-in-time "zero", which real proving runs have since (correctly) broken.
+    assert runs, "the recorded runs are still in the audit log"
+    for run in clean:
+        assert run["quote_source_is_real"], "a counted run must be priced on the real feed"
+        assert run["fills"] >= 1, "a counted run must have filled at least one order"
+        assert not run["manual_mutation_in_window"], "a counted run must not be reset-tainted"
+    # A run NOT priced on the real feed can never count, however many real runs exist.
+    assert any(not run["quote_source_is_real"] for run in runs), "the pre-massive synthetic runs remain in the trail"
+    assert all(not run["clean"] for run in runs if not run["quote_source_is_real"]), (
+        "a synthetic-source run can never count"
+    )
+    # The old zero-fill and reset-tainted runs are still visible as UNCOUNTED.
     assert any(run["fills"] == 0 for run in runs), "the zero-trade run must still be visible as such"
     assert any(run["manual_mutation_in_window"] for run in runs), "the reset-tainted run must still be visible as such"
 
