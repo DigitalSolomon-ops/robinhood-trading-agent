@@ -560,6 +560,83 @@ def test_place_refuses_a_short_call_covered_by_a_long_put_even_fully_gated():
     assert connector.place_calls == []
 
 
+# --- options risk caps mirrored in the client (defense in depth) --------------
+# The place path runs the option risk caps (option_risk_gates) before the
+# connector call, mirroring the broker. A fully gated + armed order that violates
+# a cap returns status "options_risk_gate_blocked" and never places. Caps are
+# read from the repo config (max_debit $500, max_contracts 5, 0DTE blocked). Each
+# FAILS if the client's caps mirror is reverted (the connector would be hit).
+
+
+def test_place_within_caps_submits():
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), quantity="2", price="2.50", days_to_expiry=30, dry_run=False, confirm_live_order=True
+    )
+
+    assert result["submitted"] is True
+    assert len(connector.place_calls) == 1
+
+
+def test_place_refuses_a_zero_dte_order_even_fully_gated():
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), quantity="1", price="1.00", days_to_expiry=0, dry_run=False, confirm_live_order=True
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "zero_dte" in result["risk_gate"]
+    assert connector.place_calls == []
+
+
+def test_place_refuses_an_over_contract_order_even_fully_gated():
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), quantity="6", price="0.50", days_to_expiry=30, dry_run=False, confirm_live_order=True
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_contracts_per_order" in result["risk_gate"]
+    assert connector.place_calls == []
+
+
+def test_place_refuses_an_over_debit_order_even_fully_gated():
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), quantity="1", price="6.00", days_to_expiry=30, dry_run=False, confirm_live_order=True
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_debit_premium_per_trade" in result["risk_gate"]
+    assert connector.place_calls == []
+
+
+def test_client_caps_block_method_flags_each_cap():
+    """Pin the client's OWN caps method directly, so reverting the client mirror
+    fails here independently of the broker."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+    zero_dte = client._option_caps_block(long_legs(), "debit", "1", "1.00", 0, 0.0, None)
+    over_ct = client._option_caps_block(long_legs(), "debit", "6", "0.50", 30, 0.0, None)
+    over_debit = client._option_caps_block(long_legs(), "debit", "1", "6.00", 30, 0.0, None)
+    within = client._option_caps_block(long_legs(), "debit", "2", "2.50", 30, 0.0, None)
+    assert "zero_dte" in (zero_dte or "")
+    assert "max_contracts_per_order" in (over_ct or "")
+    assert "max_debit_premium_per_trade" in (over_debit or "")
+    assert within is None
+
+
 # --- cancel mirrors the same dry_run/confirm gate (no arm required) -----------
 
 

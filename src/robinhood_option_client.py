@@ -43,18 +43,42 @@ There is no API key and no base URL: the connector object IS the credential
 
 from __future__ import annotations
 
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
+
+import yaml
+
+# The options-lane risk caps (debit / total-at-risk / DTE / contracts / approval
+# level). The place path runs these BEFORE the connector call, so a fully
+# gated + armed submit still cannot push a 0DTE / over-contract / over-debit /
+# over-level order past the caps -- the runtime mirror of what the strategy
+# mapper already gates at framing time.
+from .option_risk_gates import (
+    GateName,
+    OptionOrderProposal,
+    OptionRiskConfig,
+    evaluate_option_order,
+    resolve_granted_level,
+)
 
 # Reuse the equities lane's account-identity anchor verbatim -- SAME account,
 # SAME out-of-band expected identity, SAME exceptions. The options lane must not
 # fork the anchor: a second copy is a second thing to keep in sync.
 from .robinhood_equity_client import (
+    _DEFAULT_ROOT,
     AgentAccountIdentityError,
     AgentAccountMismatchError,
     NoAgentTradableAccountError,
     _load_expected_account,
 )
+
+# The DTE-family caps. They are relaxed ONLY when an order's days-to-expiry is
+# genuinely unknown at submit time (a bare-contract order that carries no
+# expiry). The dollar / size / approval-level caps are ALWAYS enforced; a real
+# order framed by the strategy layer carries a DTE, and a DTE stamped on the leg
+# is derived below, so a KNOWN 0DTE or under-floor order is still refused.
+_DTE_GATE_NAMES = frozenset({GateName.MIN_DTE, GateName.ZERO_DTE, GateName.EXPIRED})
 
 # The lane this client's arm gate reads from the shared ArmStore.
 OPTIONS_LANE = "options"
@@ -140,6 +164,40 @@ def assert_defined_risk(legs: Sequence[Mapping[str, Any]], direction: str) -> No
             )
 
 
+def _load_rules(config_root: Path | str | None) -> dict[str, Any]:
+    """Parse config/trading_rules.yaml (for the options risk caps), or {} when it
+    cannot be read -- a missing config yields the conservative defaults baked into
+    OptionRiskConfig, never a permissive blank."""
+    base = Path(config_root) if config_root is not None else _DEFAULT_ROOT
+    path = base / "config" / "trading_rules.yaml"
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            rules = yaml.safe_load(handle) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    return rules if isinstance(rules, dict) else {}
+
+
+def _dte_from_legs(legs: Sequence[Mapping[str, Any]]) -> int | None:
+    """Calendar days to the nearest expiry stamped on a leg, or None when no leg
+    carries a readable expiry. Lets the DTE cap bind on an order that names its
+    expiry on the leg even when the caller passes no explicit days_to_expiry."""
+    today = datetime.now(UTC).date()
+    for leg in legs or []:
+        if not isinstance(leg, Mapping):
+            continue
+        for key in ("expiration_date", "expiry", "expiry_date", "expiration"):
+            raw = leg.get(key)
+            if not raw:
+                continue
+            try:
+                expiry = date.fromisoformat(str(raw)[:10])
+            except (TypeError, ValueError):
+                continue
+            return (expiry - today).days
+    return None
+
+
 class RobinhoodOptionClient:
     """Robinhood options client over the authorized OAuth MCP connector.
 
@@ -162,6 +220,10 @@ class RobinhoodOptionClient:
         # ArmStore (src.shared_state.build_arm_store) in production.
         self._arm_store = arm_store
         self._lane = lane
+        self._config_root = config_root
+        # The options risk caps, read from config lazily (only a genuine submit
+        # needs them) and cached. Defaults are conservative when config is absent.
+        self._cached_risk_config: OptionRiskConfig | None = None
         self._expected_account = (
             dict(expected_account) if expected_account is not None else _load_expected_account(config_root)
         )
@@ -216,6 +278,59 @@ class RobinhoodOptionClient:
             return bool(store.is_armed(self._lane))
         except Exception:
             return False
+
+    def _risk_config(self) -> OptionRiskConfig:
+        """The options risk caps, loaded from config once and cached."""
+        if self._cached_risk_config is None:
+            self._cached_risk_config = OptionRiskConfig.from_rules(_load_rules(self._config_root))
+        return self._cached_risk_config
+
+    def _option_caps_block(
+        self,
+        legs: Sequence[Mapping[str, Any]],
+        direction: str,
+        quantity: str,
+        price: str | None,
+        days_to_expiry: int | None,
+        open_premium_at_risk_usd: float,
+        max_loss_per_contract_usd: float | None,
+    ) -> str | None:
+        """Run the options risk caps over this order; return a single blocking
+        reason string, or None when every applicable cap passes.
+
+        The debit / total-at-risk / contract-count / approval-level caps are
+        ALWAYS enforced here, immediately before the connector call. The DTE
+        floor binds whenever the expiry is known (an explicit days_to_expiry or
+        one stamped on a leg); it is relaxed ONLY when the expiry is genuinely
+        unknown, so a bare-contract order is still size/debit/level-capped.
+        """
+        config = self._risk_config()
+        dte = days_to_expiry if days_to_expiry is not None else _dte_from_legs(legs)
+        try:
+            qty_int = int(quantity)
+        except (TypeError, ValueError):
+            qty_int = 0
+        try:
+            premium = float(price) if price is not None else 0.0
+        except (TypeError, ValueError):
+            premium = 0.0
+        proposal = OptionOrderProposal(
+            legs=legs,
+            net_premium_per_contract=premium,
+            quantity=qty_int,
+            days_to_expiry=dte,
+            direction=str(direction).strip().lower(),
+            max_loss_per_contract_usd=max_loss_per_contract_usd,
+        )
+        decision = evaluate_option_order(
+            config, proposal, resolve_granted_level(self), max(float(open_premium_at_risk_usd), 0.0)
+        )
+        blocking = decision.blocking
+        if dte is None:
+            blocking = [result for result in blocking if result.name not in _DTE_GATE_NAMES]
+        if blocking:
+            return "; ".join(f"[{result.name}] {result.reason}" for result in blocking)
+        return None
 
     # --- reads ----------------------------------------------------------------
 
@@ -379,13 +494,18 @@ class RobinhoodOptionClient:
         account_number: str | None = None,
         dry_run: bool = True,
         confirm_live_order: bool = False,
+        days_to_expiry: int | None = None,
+        open_premium_at_risk_usd: float = 0.0,
+        max_loss_per_contract_usd: float | None = None,
     ) -> dict[str, Any]:
         """Build a DEFINED-RISK option order; submit it only on the full gate.
 
         READ-ONLY is the default posture. The connector's place_option_order is
         reached ONLY when dry_run is exactly False AND confirm_live_order is
-        exactly True AND the shared ArmStore reports the options lane armed.
-        Every other combination returns the same unsubmitted preview.
+        exactly True AND the shared ArmStore reports the options lane armed AND
+        the order clears the options risk caps (debit / total-at-risk / DTE /
+        contracts / approval level). Every other combination returns an
+        unsubmitted preview.
 
         Identity, not truthiness: `dry_run is False and confirm_live_order is
         True` -- a truthy non-boolean confirm ("yes") or a falsy non-boolean
@@ -412,6 +532,28 @@ class RobinhoodOptionClient:
                 "status": "options_lane_disarmed",
                 "venue": "robinhood_options",
                 "order_payload": payload,
+            }
+        # Third fact, mirrored from the broker (defense in depth): the order must
+        # clear the options risk caps. A cap-blocking order -- 0DTE, over the
+        # contract count, over the debit or total-at-risk cap, or above the
+        # granted approval level -- returns a preview and never reaches the
+        # connector, even fully gated and armed.
+        caps_block = self._option_caps_block(
+            payload["legs"],
+            payload["direction"],
+            quantity,
+            price,
+            days_to_expiry,
+            open_premium_at_risk_usd,
+            max_loss_per_contract_usd,
+        )
+        if caps_block is not None:
+            return {
+                "submitted": False,
+                "status": "options_risk_gate_blocked",
+                "venue": "robinhood_options",
+                "order_payload": payload,
+                "risk_gate": caps_block,
             }
         response = self._connector.place_option_order(**payload)
         return {

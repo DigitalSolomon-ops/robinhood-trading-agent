@@ -51,6 +51,7 @@ the credential (session-bound OAuth); this broker only ever drives that client.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -60,6 +61,13 @@ import yaml
 
 from .kill_switch import KillSwitch
 from .logger import SQLiteLogger
+from .option_risk_gates import (
+    GateName,
+    OptionOrderProposal,
+    OptionRiskConfig,
+    evaluate_option_order,
+    resolve_granted_level,
+)
 from .order_manager import OrderManager
 from .portfolio import Portfolio
 from .robinhood_option_client import (
@@ -67,10 +75,17 @@ from .robinhood_option_client import (
     AgentAccountMismatchError,
     DefinedRiskViolationError,
     RobinhoodOptionClient,
+    _dte_from_legs,
     assert_defined_risk,
 )
 from .shared_state import build_arm_store
 from .strategy_engine import TradeSignal
+
+# The DTE-family caps, relaxed only when an order's expiry is genuinely unknown
+# at submit time (a bare-contract order). The dollar / size / approval-level caps
+# are ALWAYS enforced; a real strategy-framed order carries a DTE and a KNOWN
+# 0DTE is refused. Mirrors robinhood_option_client._DTE_GATE_NAMES.
+_DTE_GATE_NAMES = frozenset({GateName.MIN_DTE, GateName.ZERO_DTE, GateName.EXPIRED})
 
 VENUE = "robinhood_options"
 
@@ -137,11 +152,17 @@ class RobinhoodOptionBroker:
         confirm_live_order: bool = False,
         kill_switch: KillSwitch | None = None,
         logger: SQLiteLogger | None = None,
+        rules: dict[str, Any] | None = None,
     ) -> None:
         self.client = client
         self.lane = lane
         self.dry_run = dry_run
         self.confirm_live_order = confirm_live_order
+        # The options risk caps (config/trading_rules.yaml options.risk). Loaded
+        # from ROOT when not injected, so a broker built with no rules still
+        # enforces the caps rather than silently skipping them.
+        self.rules = rules if rules is not None else _load_rules()
+        self.risk_config = OptionRiskConfig.from_rules(self.rules)
         # Fail closed: a broker built with no arm store still gets the shared,
         # ROOT-anchored one, so the arm gate can never be silently skipped.
         self.arm_store = arm_store if arm_store is not None else _default_options_arm_store()
@@ -247,6 +268,113 @@ class RobinhoodOptionBroker:
             self._log_refusal(None, str(exc))
             raise
 
+    def _option_caps_block_reason(
+        self,
+        legs: Sequence[Mapping[str, Any]],
+        direction: str,
+        quantity: str,
+        price: str | None,
+        days_to_expiry: int | None,
+        open_premium_at_risk_usd: float,
+        max_loss_per_contract_usd: float | None,
+    ) -> str | None:
+        """Run the options risk caps over this order; return a single blocking
+        reason, or None when every applicable cap passes.
+
+        Sits with the irreversible call, never trusted from a caller: the debit /
+        total-at-risk / contract-count / approval-level caps are ALWAYS enforced
+        before the connector is reached, and the DTE floor binds whenever the
+        expiry is known (an explicit days_to_expiry or one stamped on a leg). This
+        is the runtime mirror of the strategy mapper's framing-time gates -- an
+        armed broker still cannot push a 0DTE / over-contract / over-debit /
+        over-level order past the caps. The client re-checks too (defense in
+        depth), exactly as the defined-risk and arm gates are mirrored.
+        """
+        dte = days_to_expiry if days_to_expiry is not None else _dte_from_legs(legs)
+        try:
+            qty_int = int(quantity)
+        except (TypeError, ValueError):
+            qty_int = 0
+        try:
+            premium = float(price) if price is not None else 0.0
+        except (TypeError, ValueError):
+            premium = 0.0
+        proposal = OptionOrderProposal(
+            legs=legs,
+            net_premium_per_contract=premium,
+            quantity=qty_int,
+            days_to_expiry=dte,
+            direction=str(direction).strip().lower(),
+            max_loss_per_contract_usd=max_loss_per_contract_usd,
+        )
+        decision = evaluate_option_order(
+            self.risk_config,
+            proposal,
+            resolve_granted_level(self.client),
+            max(float(open_premium_at_risk_usd), 0.0),
+        )
+        blocking = decision.blocking
+        if dte is None:
+            blocking = [result for result in blocking if result.name not in _DTE_GATE_NAMES]
+        if blocking:
+            return "; ".join(f"[{result.name}] {result.reason}" for result in blocking)
+        return None
+
+    def build_option_limit_order(
+        self,
+        signal: TradeSignal,
+        limit_price: float,
+        contracts: int = 1,
+        time_in_force: str | None = None,
+        account_number: str | None = None,
+    ) -> dict[str, Any]:
+        """The OPTIONS lane's OWN order builder -- deliberately NOT the equities
+        dollar path (order_manager.build_limit_order).
+
+        `quantity` is a whole CONTRACT COUNT, and the notional / at-risk figure is
+        the true premium x contract-multiplier (100) x contracts. The equities
+        builder sizes quantity = dollars / price as if one unit were one share,
+        which for an option under-counts the real exposure ~100x (a $2.50 option
+        is $250 of risk per contract, not $2.50). Sizing on the multiplier here
+        is what makes the contract-count and dollar caps see the true exposure.
+        """
+        multiplier = self.risk_config.contract_multiplier
+        qty = max(int(contracts), 1)
+        premium = float(limit_price)
+        notional = round(premium * multiplier * qty, 2)
+        tif = time_in_force or (self.rules.get("orders") or {}).get("time_in_force", "gtc")
+        return {
+            "client_order_id": str(uuid.uuid4()),
+            "symbol": signal.symbol,
+            "side": signal.side,
+            "order_type": "limit",
+            "limit_price": round(premium, 8),
+            "quantity": qty,  # a contract count, never a share count
+            "contracts": qty,
+            "notional": notional,  # true premium x 100 x contracts
+            "at_risk_usd": notional,
+            "time_in_force": tif,
+            "reason": signal.reason,
+            "strategy_signal": getattr(signal, "strategy_signal", None),
+            "account_number": account_number,
+        }
+
+    def _contract_count(
+        self, limit_price: float, amount_usd: float | None, contracts: int | None
+    ) -> int:
+        """Whole contracts to trade: an explicit `contracts` wins; otherwise a
+        dollar budget is divided by the TRUE per-contract cost (premium x 100),
+        floored to whole contracts, at least one. Dividing by the real per-
+        contract cost -- not the per-share price -- is what keeps a dollar budget
+        from being read as ~100x too many contracts."""
+        if contracts is not None:
+            return max(int(contracts), 1)
+        premium = float(limit_price)
+        per_contract = premium * self.risk_config.contract_multiplier
+        if amount_usd is not None and per_contract > 0:
+            return max(int(float(amount_usd) // per_contract), 1)
+        return 1
+
     def _assert_kill_switch_open(self, symbol: str | None) -> None:
         # No fail-open path: self.kill_switch is guaranteed non-None by __init__
         # (a fail-closed default is substituted when none is wired), so the
@@ -290,13 +418,18 @@ class RobinhoodOptionBroker:
         time_in_force: str = "gtc",
         account_number: str | None = None,
         mode: str | None = None,
+        days_to_expiry: int | None = None,
+        open_premium_at_risk_usd: float = 0.0,
+        max_loss_per_contract_usd: float | None = None,
     ) -> dict[str, Any]:
         """Place a DEFINED-RISK option order; submit only on the full gate.
 
         The connector is reached ONLY when the human gate is cleared (dry_run
         False AND confirm_live_order True) AND the options lane is ARMED AND the
-        run is genuinely live. Every other combination returns an unsubmitted
-        preview and never touches the connector.
+        order clears the options risk caps (debit / total-at-risk / DTE /
+        contracts / approval level) AND the run is genuinely live. Every other
+        combination returns an unsubmitted preview and never touches the
+        connector.
 
         `mode` is a SECOND, independent brake on top of the flags: a non-live
         mode ("live-dry-run" above all) forces a preview even on an armed broker,
@@ -326,9 +459,24 @@ class RobinhoodOptionBroker:
                 status="options_lane_disarmed",
             )
 
+        # Third fact, beside the irreversible call: the order must clear the
+        # options risk caps. A 0DTE / over-contract / over-debit / over-total /
+        # over-level order returns a preview and never reaches the connector,
+        # even fully gated and armed. Logged first so the audit keeps the reason.
+        caps_block = self._option_caps_block_reason(
+            legs, direction, quantity, price, days_to_expiry, open_premium_at_risk_usd, max_loss_per_contract_usd
+        )
+        if caps_block is not None:
+            self._log_refusal(None, caps_block)
+            return self._preview(
+                legs, direction, quantity, order_type, price, time_in_force, account,
+                caps_block, status="options_risk_gate_blocked",
+            )
+
         # Past this point the next call is irreversible: re-read the kill switch,
         # then hand the client both flags explicitly. The client re-validates
-        # defined risk and re-checks the shared arm store (defense in depth).
+        # defined risk, re-checks the shared arm store, AND re-runs the caps
+        # (defense in depth).
         self._assert_kill_switch_open(None)
         result = self.client.place_option_order(
             legs=legs,
@@ -340,6 +488,9 @@ class RobinhoodOptionBroker:
             account_number=account,
             dry_run=False,
             confirm_live_order=True,
+            days_to_expiry=days_to_expiry,
+            open_premium_at_risk_usd=open_premium_at_risk_usd,
+            max_loss_per_contract_usd=max_loss_per_contract_usd,
         )
         return {
             "submitted": True,
@@ -389,12 +540,14 @@ class RobinhoodOptionBroker:
         time_in_force: str = "gtc",
         account_number: str | None = None,
         mode: str | None = None,
+        days_to_expiry: int | None = None,
     ) -> dict[str, Any]:
         """The scout's bread-and-butter play: BUY-to-open a single call/put.
 
         A long option is defined-risk by construction (max loss = premium paid),
         so this is the safest order the lane places. Routed through the same
-        gated submit path as any other order.
+        gated submit path as any other order -- including the risk caps, so a
+        known 0DTE or over-debit long is still refused.
         """
         long_leg = {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option": contract}
         return self.submit_option_order(
@@ -405,6 +558,7 @@ class RobinhoodOptionBroker:
             time_in_force=time_in_force,
             account_number=account_number,
             mode=mode,
+            days_to_expiry=days_to_expiry,
         )
 
     def place_limit_order(self, order: dict[str, Any], mode: str | None = None) -> dict[str, Any]:
@@ -435,6 +589,9 @@ class RobinhoodOptionBroker:
             time_in_force=str(order.get("time_in_force", "gtc")),
             account_number=order.get("account_number"),
             mode=mode,
+            days_to_expiry=order.get("days_to_expiry"),
+            open_premium_at_risk_usd=float(order.get("open_premium_at_risk_usd", 0.0) or 0.0),
+            max_loss_per_contract_usd=order.get("max_loss_per_contract_usd"),
         )
 
     def cancel_order(self, order_id: str) -> Any:
@@ -479,16 +636,32 @@ class RobinhoodOptionBroker:
         account_number: str | None = None,
         has_api_credentials: bool = True,
         amount_usd: float | None = None,
+        days_to_expiry: int | None = None,
+        contracts: int | None = None,
+        open_premium_at_risk_usd: float = 0.0,
     ) -> dict[str, Any] | None:
-        """Gate the account, then hand the signal to the SHARED OrderManager.
+        """Size on the CONTRACT MULTIPLIER, then route through the lane's own
+        gated submit path -- deliberately NOT the equities dollar path.
 
-        A non-actionable signal (a strategy hold) is logged and returned here,
-        before the account/risk gates, since there is no order to gate. The
-        account check happens next, ahead of the risk layer, because an order
-        aimed at the off-limits default account must be refused whatever the risk
-        rules would decide. Everything after it -- kill switch, caps, allowlist,
-        cooldown, arm gate, audit rationale -- is the existing OrderManager /
-        RiskManager plus this broker's arm gate, unchanged.
+        A non-actionable signal (a strategy hold) is logged and returned first,
+        since there is no order to size. The account check comes next, ahead of
+        sizing, because an order aimed at the off-limits default account must be
+        refused whatever the caps would decide.
+
+        Sizing then uses this broker's OWN builder (build_option_limit_order):
+        quantity is a whole CONTRACT COUNT and the notional / at-risk is premium
+        x contract-multiplier (100) x contracts, so the exposure the caps see is
+        the true figure -- not the ~100x under-count the share-based OrderManager
+        path (order_manager.build_limit_order) would produce for an option. The
+        order routes through place_limit_order -> submit_option_order, which
+        re-checks the account, defined-risk, arm gate, kill switch AND the
+        options risk caps (max_contracts, debit, total-at-risk, approval level)
+        at the irreversible moment. A `mode` other than "live" forces a preview,
+        so an armed broker cannot turn a preview/paper run into a real order.
+
+        `order_manager` is retained for signature parity and its audit logger;
+        the equities RiskManager dollar path it drives is not used for options,
+        whose risk model is the options caps above.
         """
         logger = self.logger or order_manager.logger
 
@@ -507,20 +680,25 @@ class RobinhoodOptionBroker:
             logger.log_decision(signal.symbol, "option_order_refused", str(exc), {"venue": VENUE, "side": signal.side})
             raise
 
-        def route() -> dict[str, Any] | None:
-            return order_manager.process_signal(
-                signal=signal,
-                limit_price=limit_price,
-                mode=mode,
-                portfolio=portfolio,
-                daily_summary=daily_summary,
-                has_api_credentials=has_api_credentials,
-                amount_usd=amount_usd,
-            )
+        # OPTIONS-lane sizing: whole contracts + true premium x100 x contracts.
+        count = self._contract_count(limit_price, amount_usd, contracts)
+        order = self.build_option_limit_order(signal, limit_price, contracts=count, account_number=account_number)
+        order["days_to_expiry"] = days_to_expiry
+        order["open_premium_at_risk_usd"] = open_premium_at_risk_usd
 
-        if mode == "live":
-            return route()
-        # Any other mode is a preview or a paper fill; an armed broker must not
-        # turn one into a real order.
-        with self.forced_preview():
-            return route()
+        result = self.place_limit_order(order, mode=mode)
+        submitted = bool(isinstance(result, dict) and result.get("submitted"))
+        logger.log_decision(
+            signal.symbol,
+            "option_order_submitted" if submitted else "option_order_preview",
+            signal.reason,
+            {
+                "venue": VENUE,
+                "side": signal.side,
+                "contracts": count,
+                "limit_price": float(limit_price),
+                "notional": order["notional"],
+                "status": result.get("status") if isinstance(result, dict) else None,
+            },
+        )
+        return result

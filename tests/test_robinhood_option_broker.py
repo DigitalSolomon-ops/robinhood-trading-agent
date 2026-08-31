@@ -28,6 +28,29 @@ from src.robinhood_option_client import (
     DefinedRiskViolationError,
     RobinhoodOptionClient,
 )
+from src.strategy_engine import TradeSignal
+
+
+class _FakeLogger:
+    """Records log_decision calls; the caps path logs a refusal rationale."""
+
+    def __init__(self) -> None:
+        self.decisions: list[tuple] = []
+
+    def log_decision(self, symbol, action, reason, details):
+        self.decisions.append((symbol, action, reason, details))
+
+
+class _FakeOrderManager:
+    """A stand-in OrderManager -- submit_signal only reads its .logger now that
+    the options lane sizes through its own builder, not the equities dollar path."""
+
+    def __init__(self) -> None:
+        self.logger = _FakeLogger()
+
+
+def _long_call_signal() -> TradeSignal:
+    return TradeSignal(symbol=LONG_CALL, side="buy", confidence=1.0, reason="unit-test long call")
 
 # The agent-tradable account carries the SAME ground-truth identity the equities
 # and options clients pin: nickname "Agentic", number ending 2092.
@@ -70,8 +93,9 @@ class FakeArmStore:
 class FakeConnector:
     """Records calls instead of reaching the real Robinhood options connector."""
 
-    def __init__(self, accounts: list[dict] | None = None) -> None:
+    def __init__(self, accounts: list[dict] | None = None, option_level: str = "level_3") -> None:
         self.accounts = accounts if accounts is not None else [AGENT_ACCOUNT, DEFAULT_ACCOUNT]
+        self.option_level = option_level
         self.place_calls: list[dict] = []
         self.review_calls: list[dict] = []
         self.cancel_calls: list[dict] = []
@@ -91,7 +115,7 @@ class FakeConnector:
         return {"positions": []}
 
     def get_option_level_upgrade_info(self, **kwargs):
-        return {"option_level": "level_3"}
+        return {"option_level": self.option_level}
 
     def review_option_order(self, **kwargs):
         self.review_calls.append(kwargs)
@@ -458,3 +482,169 @@ def test_default_kill_switch_is_options_lane(monkeypatch, tmp_path):
     broker = RobinhoodOptionBroker(client, arm_store=store, dry_run=False, confirm_live_order=True)
     assert broker.kill_switch.stop_file.name == "STOP_TRADING_OPTIONS"
     assert broker.kill_switch.env_var == "TRADING_ENABLED"
+
+
+# --- caps AT SUBMIT: 0DTE / over-contract / over-debit / over-level refused ----
+# Fix A. The option risk caps (option_risk_gates) run INSIDE submit_option_order,
+# before the client/connector call -- and are mirrored in the client (defense in
+# depth). A FULLY armed + confirmed + live order that violates a cap returns an
+# unsubmitted preview (status "options_risk_gate_blocked") and never reaches the
+# connector. Each test FAILS if the caps call is reverted: the order would then
+# submit and connector.place_calls would be non-empty. The caps are read from the
+# repo's config/trading_rules.yaml (max_debit $500, max_contracts 5, min_dte 2,
+# 0DTE blocked, single-leg long needs level 2).
+
+
+def test_within_caps_order_submits(monkeypatch, tmp_path):
+    """A compliant long (2 contracts x $2.50 = $500 debit == cap, 30d, level 3)
+    still submits -- the caps are active but do not block a compliant order."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="2", price="2.50", days_to_expiry=30, mode="live"
+    )
+    assert result["submitted"] is True
+    assert len(connector.place_calls) == 1
+
+
+def test_zero_dte_order_refused_even_fully_armed(monkeypatch, tmp_path):
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="1", price="1.00", days_to_expiry=0, mode="live"
+    )
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "zero_dte" in result["human_gate"]
+    assert connector.place_calls == []
+
+
+def test_over_contract_order_refused_even_fully_armed(monkeypatch, tmp_path):
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    # 6 contracts > the 5-contract per-order cap; premium kept small so ONLY the
+    # contract cap blocks (0.50 x 100 x 6 = $300 debit, under the $500 cap).
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="6", price="0.50", days_to_expiry=30, mode="live"
+    )
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_contracts_per_order" in result["human_gate"]
+    assert connector.place_calls == []
+
+
+def test_over_debit_order_refused_even_fully_armed(monkeypatch, tmp_path):
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    # 1 contract x $6.00 x 100 = $600 debit, over the $500 per-trade debit cap.
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="1", price="6.00", days_to_expiry=30, mode="live"
+    )
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_debit_premium_per_trade" in result["human_gate"]
+    assert connector.place_calls == []
+
+
+def test_over_approval_level_order_refused_even_fully_armed(monkeypatch, tmp_path):
+    # The account is granted only level 1; a single-leg long needs level 2.
+    connector = FakeConnector(option_level="level_1")
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="1", price="1.00", days_to_expiry=30, mode="live"
+    )
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "option_approval_level" in result["human_gate"]
+    assert connector.place_calls == []
+
+
+def test_place_long_call_refuses_a_known_zero_dte(monkeypatch, tmp_path):
+    """The convenience long-call wrapper threads days_to_expiry into the caps: a
+    known 0DTE long is refused even fully armed."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    result = broker.place_long_call(LONG_CALL, price="1.00", days_to_expiry=0, mode="live")
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert connector.place_calls == []
+
+
+# --- Fix B: the options lane's OWN sizing (contract count + true notional) ------
+# submit_signal must NOT size options through the equities dollar path
+# (order_manager.build_limit_order, which counts one unit as one share and
+# under-counts option exposure ~100x). Its own builder sets quantity to a whole
+# contract count and notional/at-risk to premium x 100 x contracts.
+
+
+def test_broker_caps_block_method_flags_each_cap(monkeypatch, tmp_path):
+    """Pin the broker's OWN caps method directly, so reverting it fails here
+    regardless of the client's mirror (the end-to-end tests alone would still
+    pass on the client's caps if the broker's were neutered)."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    zero_dte = broker._option_caps_block_reason([LONG_LEG], "debit", "1", "1.00", 0, 0.0, None)
+    over_ct = broker._option_caps_block_reason([LONG_LEG], "debit", "6", "0.50", 30, 0.0, None)
+    over_debit = broker._option_caps_block_reason([LONG_LEG], "debit", "1", "6.00", 30, 0.0, None)
+    within = broker._option_caps_block_reason([LONG_LEG], "debit", "2", "2.50", 30, 0.0, None)
+    assert "zero_dte" in (zero_dte or "")
+    assert "max_contracts_per_order" in (over_ct or "")
+    assert "max_debit_premium_per_trade" in (over_debit or "")
+    assert within is None
+
+
+def test_broker_caps_block_method_flags_over_level(monkeypatch, tmp_path):
+    connector = FakeConnector(option_level="level_1")
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    reason = broker._option_caps_block_reason([LONG_LEG], "debit", "1", "1.00", 30, 0.0, None)
+    assert "option_approval_level" in (reason or "")
+
+
+def test_broker_caps_relax_dte_only_when_the_expiry_is_unknown(monkeypatch, tmp_path):
+    """A bare order with no expiry (and no price) clears the caps -- the DTE floor
+    is relaxed only when the expiry is genuinely unknown, while the dollar/size/
+    level caps still apply."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    assert broker._option_caps_block_reason([LONG_LEG], "debit", "1", None, None, 0.0, None) is None
+
+
+def test_build_option_limit_order_sizes_on_the_contract_multiplier(monkeypatch, tmp_path):
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    order = broker.build_option_limit_order(_long_call_signal(), limit_price=2.50, contracts=3)
+    assert order["quantity"] == 3  # a CONTRACT count, never a share count
+    assert order["contracts"] == 3
+    assert order["notional"] == 750.0  # 2.50 x 100 x 3, not 7.50
+    assert order["at_risk_usd"] == 750.0
+
+
+def test_submit_signal_sizes_on_true_cost_and_refuses_over_contract(monkeypatch, tmp_path):
+    """A $2,000 budget on a $2.50 option = $250 TRUE cost/contract = 8 contracts,
+    over the 5-contract cap -> REFUSED. The old share-based path would have read
+    the budget as 800 'shares' at $2,000 notional and cleared the dollar cap, so
+    this pins that options size on the 100x multiplier, not the equities path."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    result = broker.submit_signal(
+        _FakeOrderManager(), _long_call_signal(), limit_price=2.50, mode="live",
+        portfolio=None, daily_summary={}, amount_usd=2000.0, days_to_expiry=30,
+    )
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_contracts_per_order" in result["human_gate"]
+    assert connector.place_calls == []
+
+
+def test_submit_signal_within_budget_submits_true_contract_count(monkeypatch, tmp_path):
+    """A $500 budget on a $2.50 option = 2 contracts ($500 debit == cap): submits,
+    and the payload carries 2 contracts (the true count), not 200 'shares'."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    result = broker.submit_signal(
+        _FakeOrderManager(), _long_call_signal(), limit_price=2.50, mode="live",
+        portfolio=None, daily_summary={}, amount_usd=500.0, days_to_expiry=30,
+    )
+    assert result["submitted"] is True
+    assert len(connector.place_calls) == 1
+    assert connector.place_calls[0]["quantity"] == "2"
