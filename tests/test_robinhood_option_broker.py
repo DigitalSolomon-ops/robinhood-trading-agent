@@ -484,6 +484,61 @@ def test_default_kill_switch_is_options_lane(monkeypatch, tmp_path):
     assert broker.kill_switch.env_var == "TRADING_ENABLED"
 
 
+# --- the REAL default arm store is POSITIVE + fail-closed ---------------------
+# A broker built with NO explicit arm store consults the shared default store
+# (build_arm_store, ROOT-anchored). That default must read DISARMED unless a
+# positive ARM_STATE_OPTIONS marker exists, and must NEVER fall back to a local
+# fail-open store when a cloud backend was requested but could not be built. Both
+# tests build the broker WITHOUT an arm store and fully confirmed live; each FAILS
+# if the fail-closed default is reverted, because the order would then submit and
+# connector.place_calls would be non-empty. The connector stays mocked throughout.
+
+
+def _default_store_broker(connector, monkeypatch, tmp_path):
+    """A broker with its REAL default arm store, ROOT pointed at an empty tmp tree
+    (no ARM_STATE_OPTIONS marker, no config), fully confirmed live, kill switch
+    open."""
+    monkeypatch.setattr("src.robinhood_option_broker.ROOT", tmp_path)
+    monkeypatch.setenv("TRADING_ENABLED", "true")
+    client = RobinhoodOptionClient(connector, expected_account=EXPECTED_ACCOUNT)
+    kill = KillSwitch(stop_file=str(tmp_path / "STOP_TRADING_OPTIONS"), env_var="TRADING_ENABLED")
+    # arm_store omitted on purpose: the broker must build its own fail-closed default.
+    return RobinhoodOptionBroker(client, dry_run=False, confirm_live_order=True, kill_switch=kill)
+
+
+def test_default_arm_store_disarmed_without_a_positive_marker(monkeypatch, tmp_path):
+    monkeypatch.delenv("TRADER_ARM_FIRESTORE_PROJECT", raising=False)
+    connector = FakeConnector()
+    broker = _default_store_broker(connector, monkeypatch, tmp_path)
+    assert broker._is_options_lane_armed() is False  # no marker == DISARMED
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="1", price="1.00", days_to_expiry=30, mode="live"
+    )
+    assert result["submitted"] is False
+    assert result["status"] == "options_lane_disarmed"
+    assert connector.place_calls == []
+
+
+def test_default_arm_store_disarmed_when_firestore_requested_but_unavailable(monkeypatch, tmp_path):
+    monkeypatch.setenv("TRADER_ARM_FIRESTORE_PROJECT", "some-project")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("firestore unavailable")
+
+    monkeypatch.setattr("src.shared_state.FirestoreArmStore", _boom)
+    connector = FakeConnector()
+    broker = _default_store_broker(connector, monkeypatch, tmp_path)
+    # A requested-but-unbuildable cloud store must fail CLOSED, never fall back to
+    # a local fail-open file store.
+    assert broker._is_options_lane_armed() is False
+    result = broker.submit_option_order(
+        legs=[LONG_LEG], direction="debit", quantity="1", price="1.00", days_to_expiry=30, mode="live"
+    )
+    assert result["submitted"] is False
+    assert result["status"] == "options_lane_disarmed"
+    assert connector.place_calls == []
+
+
 # --- caps AT SUBMIT: 0DTE / over-contract / over-debit / over-level refused ----
 # Fix A. The option risk caps (option_risk_gates) run INSIDE submit_option_order,
 # before the client/connector call -- and are mirrored in the client (defense in

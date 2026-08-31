@@ -62,10 +62,14 @@ from .web_security import install_security_middleware
 SECRET_MARKERS = ("ROBINHOOD_API_KEY", "ROBINHOOD_PRIVATE_KEY", "PRIVATE_KEY", "API_KEY")
 
 # --- Per-lane arm / disarm toggle -------------------------------------------
-# Each lane trades only when its stop file is ABSENT (armed); the file present
-# means DISARMED (halted). Disarming is one click (the safe direction). Arming
-# requires an explicit confirm. NOTE: this enables/halts a lane's loop -- it does
-# NOT switch a lane from paper to LIVE, which stays a separate, higher gate.
+# The toggle delegates to the shared ArmStore, whose meaning is per lane: crypto
+# and equities are ARMED when their stop file is ABSENT (disarm writes it), while
+# the leveraged OPTIONS lane is POSITIVE and fail-closed -- ARMED only when its
+# own ARM_STATE marker is PRESENT (arm writes that marker, a DIFFERENT file from
+# the kill-switch stop file; the default with no marker is DISARMED). Disarming
+# is one click (the safe direction); arming requires an explicit confirm. NOTE:
+# this enables/halts a lane's loop -- it does NOT switch a lane from paper to
+# LIVE, which stays a separate, higher gate.
 TRADING_LANES = ("crypto", "equities", "options")
 
 
@@ -184,7 +188,8 @@ def dashboard_app(root: Path = ROOT) -> FastAPI:
     @app.post("/kill/{lane}/disarm")
     def lane_disarm(lane: str) -> RedirectResponse:
         # Disarm = HALT the lane. Safe direction, one click. Backend-agnostic
-        # (local stop file OR Firestore) through the shared arm store.
+        # through the shared arm store: for crypto/equities this writes the stop
+        # file, for the options lane it removes the positive ARM_STATE marker.
         rules, _ = load_dashboard_settings(app.state.root)
         if lane in _lane_stop_paths(app.state.root, rules):
             build_arm_store(app.state.root, rules).set_armed(lane, False, by="dashboard")
@@ -195,8 +200,10 @@ def dashboard_app(root: Path = ROOT) -> FastAPI:
 
     @app.post("/kill/{lane}/arm")
     async def lane_arm(lane: str, request: Request) -> RedirectResponse:
-        # Arm = remove the stop file = ENABLE the lane. Requires an explicit confirm;
-        # only a human request through the (IAP-gated) dashboard reaches this route.
+        # Arm = ENABLE the lane. For crypto/equities this removes the stop file;
+        # for the options lane it WRITES the positive ARM_STATE marker (a separate
+        # file from the kill switch). Requires an explicit confirm; only a human
+        # request through the (IAP-gated) dashboard reaches this route.
         form = await parse_form(request)
         rules, _ = load_dashboard_settings(app.state.root)
         if lane in _lane_stop_paths(app.state.root, rules) and form.get("confirm_arm") == "on":

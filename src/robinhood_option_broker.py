@@ -89,9 +89,11 @@ _DTE_GATE_NAMES = frozenset({GateName.MIN_DTE, GateName.ZERO_DTE, GateName.EXPIR
 
 VENUE = "robinhood_options"
 
-# The lane repo root, so a fail-closed default kill switch and default arm store
-# resolve to the SAME STOP_TRADING_OPTIONS file the runtime wires explicitly,
-# regardless of the process's CWD.
+# The lane repo root, so the fail-closed default kill switch and default arm
+# store resolve to their own ROOT-anchored files regardless of the process's CWD.
+# They are DIFFERENT files: the kill switch is STOP_TRADING_OPTIONS, the arm store
+# is the POSITIVE ARM_STATE_OPTIONS marker -- the emergency stop and the arm gate
+# are two independent controls, never the same file.
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -122,9 +124,11 @@ def _default_options_kill_switch() -> KillSwitch:
 def _default_options_arm_store() -> Any:
     """Fail-closed default arm store: the shared, ROOT-anchored ArmStore for the
     options lane. A broker built with no store still consults the real arm state
-    (the STOP_TRADING_OPTIONS file locally, Firestore in the cloud) rather than
-    silently skipping the arm gate -- and _is_options_lane_armed() still reads an
-    unreadable store as DISARMED, so the failure mode stays fail-safe."""
+    (the POSITIVE ARM_STATE_OPTIONS marker locally -- a DIFFERENT file from the
+    kill switch, DISARMED unless the marker is present -- or Firestore in the
+    cloud) rather than silently skipping the arm gate. _is_options_lane_armed()
+    still reads an absent / unreadable store as DISARMED, so the failure mode
+    stays fail-safe."""
     return build_arm_store(ROOT, _load_rules())
 
 

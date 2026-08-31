@@ -1,8 +1,11 @@
 """Per-lane arm/disarm toggle in the 007 dashboard.
 
-Disarm halts a lane (writes its stop file) in one click; arm enables it (removes
-the stop file) and REQUIRES an explicit confirm. Only a human request through the
-(IAP-gated) dashboard reaches these routes -- the agent never flips them.
+Disarm halts a lane in one click; arm enables it and REQUIRES an explicit confirm.
+Only a human request through the (IAP-gated) dashboard reaches these routes -- the
+agent never flips them. Crypto and equities track arm state via their stop file
+(disarm writes it, arm removes it); the leveraged OPTIONS lane is POSITIVE and
+fail-closed -- disarm removes its ARM_STATE marker, arm writes it, and the marker
+is a DIFFERENT file from the kill-switch stop file.
 """
 from __future__ import annotations
 
@@ -12,6 +15,7 @@ import yaml
 from fastapi.testclient import TestClient
 
 from src.dashboard import _lane_stop_paths, dashboard_app
+from src.shared_state import build_arm_store, lane_arm_marker_path
 from tests.test_dashboard import make_dashboard_root
 
 
@@ -59,12 +63,32 @@ def test_arm_with_confirm_enables_the_lane(tmp_path: Path) -> None:
     assert not eq_stop.exists()  # armed = stop file removed
 
 
-def test_lanes_are_independent(tmp_path: Path) -> None:
+def test_options_is_disarmed_by_default_and_arms_via_a_positive_marker(tmp_path: Path) -> None:
+    root = make_dashboard_root(tmp_path)
+    rules = _rules(root)
+    _, opt_stop = _lane_stop_paths(root, rules)["options"]
+    marker = lane_arm_marker_path(root, "options")
+    c = _client(root)
+    # Default: DISARMED (no marker). Under the old absence==armed rule this was
+    # armed, so the assertion fails if the fail-closed options gate is reverted.
+    assert build_arm_store(root, rules).is_armed("options") is False
+    assert not marker.exists()
+    # Arm with confirm -> writes the POSITIVE marker, never the kill-switch file.
+    c.post("/kill/options/arm", data={"confirm_arm": "on"}, follow_redirects=False)
+    assert marker.exists()
+    assert not opt_stop.exists()
+    assert build_arm_store(root, rules).is_armed("options") is True
+    # Disarm -> removes the marker.
+    c.post("/kill/options/disarm", follow_redirects=False)
+    assert not marker.exists()
+    assert build_arm_store(root, rules).is_armed("options") is False
+
+
+def test_disarming_options_leaves_equities_alone(tmp_path: Path) -> None:
     root = make_dashboard_root(tmp_path)
     paths = _lane_stop_paths(root, _rules(root))
     c = _client(root)
     c.post("/kill/options/disarm", follow_redirects=False)
-    assert paths["options"][1].exists()
     assert not paths["equities"][1].exists()  # disarming options left equities alone
 
 
