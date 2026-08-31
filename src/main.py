@@ -2072,6 +2072,21 @@ def build_parser() -> argparse.ArgumentParser:
     proving_parser.add_argument("--hours", type=float, default=None, help="alternative time bound")
     proving_parser.add_argument("--lookback-days", type=int, default=None, help="Massive history depth per symbol")
     proving_parser.add_argument("--cash", default="10000.00", help="paper starting cash")
+    # The OPTIONS analog: a bounded, unattended DEFINED-RISK options paper proving
+    # run priced on a REAL basis (real Massive underlying closes x an expected-move
+    # fraction). Fresh ledger each run, reconciled clean, basis recorded. Paper
+    # only -- it never touches the connector's order path.
+    option_proving_parser = sub.add_parser(
+        "run-option-proving-run",
+        help="A bounded, unattended DEFINED-RISK options paper proving run priced on a REAL basis.",
+    )
+    option_proving_parser.add_argument("--iterations", type=int, default=60, help="bounded cycle count (default 60)")
+    option_proving_parser.add_argument("--hours", type=float, default=None, help="alternative time bound")
+    option_proving_parser.add_argument("--lookback-days", type=int, default=None, help="Massive underlying history depth")
+    option_proving_parser.add_argument(
+        "--expected-move-fraction", type=float, default=None, help="premium as this fraction of the real close"
+    )
+    option_proving_parser.add_argument("--dte", type=int, default=None, help="days to expiry for framed contracts")
     sub.add_parser("validate-symbols")
     sub.add_parser("collect-intelligence")
     sub.add_parser("intelligence-status")
@@ -2184,6 +2199,23 @@ def main(argv: list[str] | None = None) -> int:
         if args.lookback_days is not None:
             kwargs["lookback_days"] = args.lookback_days
         summary = run_equity_proving_run(connector, ROOT, **kwargs)
+        print(json.dumps(summary, indent=2, default=str))
+    elif args.command == "run-option-proving-run":
+        from src.option_runtime import build_option_paper_proving_connector, run_option_proving_run
+
+        connector = build_option_paper_proving_connector(ROOT)
+        kwargs = {}
+        if args.iterations is not None:
+            kwargs["iterations"] = args.iterations
+        if args.hours is not None:
+            kwargs["hours"] = args.hours
+        if args.lookback_days is not None:
+            kwargs["lookback_days"] = args.lookback_days
+        if args.expected_move_fraction is not None:
+            kwargs["expected_move_fraction"] = args.expected_move_fraction
+        if args.dte is not None:
+            kwargs["days_to_expiry"] = args.dte
+        summary = run_option_proving_run(connector, ROOT, **kwargs)
         print(json.dumps(summary, indent=2, default=str))
     elif args.command == "validate-symbols":
         validate_symbols()
