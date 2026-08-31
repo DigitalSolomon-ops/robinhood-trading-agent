@@ -1614,6 +1614,36 @@ def equity_live_readiness_command(output_format: str = "json", output_path: str 
     return report
 
 
+def option_live_readiness_command(output_format: str = "json", output_path: str | None = None) -> dict[str, Any]:
+    """The options lane's live-readiness gate (src/option_readiness.py).
+
+    Runs the full test suite, evaluates every options gate against it, reads the
+    audit log and config for the evidence no test can speak to (caps, the shared
+    account anchor, two clean paper runs on a real basis, lane isolation), and
+    writes the verdict to the audit log. Read-only -- it never reaches the
+    connector and never changes a posture.
+
+    Exits non-zero when the verdict is ready:false, so this can gate a script
+    without anyone having to remember to read the JSON.
+    """
+    from .option_readiness import option_live_readiness, readiness_markdown as option_readiness_markdown
+
+    report = option_live_readiness(ROOT, logger=SQLiteLogger(ROOT / "data" / "trading_agent.db"))
+    rendered = option_readiness_markdown(report) if output_format == "markdown" else json.dumps(report, indent=2)
+    if output_path:
+        path = Path(output_path)
+        if not path.is_absolute():
+            path = ROOT / path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(rendered + "\n", encoding="utf-8")
+        print(f"wrote {path}")
+    else:
+        print(rendered)
+    if not report["ready"]:
+        raise SystemExit(1)
+    return report
+
+
 def collect_intelligence() -> None:
     rules, _ = load_settings()
     symbols = symbol_lists(rules)["live_allowed_symbols"]
@@ -2064,6 +2094,12 @@ def build_parser() -> argparse.ArgumentParser:
     equity_readiness_parser = sub.add_parser("equity-live-readiness")
     equity_readiness_parser.add_argument("--format", choices=["json", "markdown"], default="json")
     equity_readiness_parser.add_argument("--output", default=None, help="write the report to this path instead of stdout")
+    # The OPTIONS analog of equity-live-readiness (src/option_readiness.py): runs
+    # the full suite, proves every options gate against it, reads config + audit
+    # log for the evidence no test can speak to, and writes the verdict. Read-only.
+    option_readiness_parser = sub.add_parser("option-live-readiness")
+    option_readiness_parser.add_argument("--format", choices=["json", "markdown"], default="json")
+    option_readiness_parser.add_argument("--output", default=None, help="write the report to this path instead of stdout")
     proving_parser = sub.add_parser(
         "run-equity-proving-run",
         help="A bounded, unattended equities paper proving run priced on REAL Massive history.",
@@ -2187,6 +2223,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(live_launch_readiness(args.run_tests, args.check_connection), indent=2))
     elif args.command == "equity-live-readiness":
         equity_live_readiness_command(args.format, args.output)
+    elif args.command == "option-live-readiness":
+        option_live_readiness_command(args.format, args.output)
     elif args.command == "run-equity-proving-run":
         from src.equity_runtime import run_equity_proving_run, build_paper_proving_connector
 
