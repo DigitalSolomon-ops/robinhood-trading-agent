@@ -368,10 +368,14 @@ def _load_rules(config_root: Path | str | None) -> dict[str, Any]:
 
 
 def _dte_from_legs(legs: Sequence[Mapping[str, Any]]) -> int | None:
-    """Calendar days to the nearest expiry stamped on a leg, or None when no leg
-    carries a readable expiry. Lets the DTE cap bind on an order that names its
-    expiry on the leg even when the caller passes no explicit days_to_expiry."""
+    """Calendar days to the NEAREST expiry stamped on any leg, or None when no leg
+    carries a readable expiry. Scans every leg and returns the MINIMUM DTE (not the
+    first one found), so a near-dated leg binds the DTE cap even when another leg is
+    far-dated -- a spread carrying a 0DTE leg is 0DTE-exposed. Lets the DTE cap bind
+    on an order that names its expiry on the leg even when the caller passes no
+    explicit days_to_expiry."""
     today = datetime.now(UTC).date()
+    nearest: int | None = None
     for leg in legs or []:
         if not isinstance(leg, Mapping):
             continue
@@ -383,8 +387,11 @@ def _dte_from_legs(legs: Sequence[Mapping[str, Any]]) -> int | None:
                 expiry = date.fromisoformat(str(raw)[:10])
             except (TypeError, ValueError):
                 continue
-            return (expiry - today).days
-    return None
+            dte = (expiry - today).days
+            if nearest is None or dte < nearest:
+                nearest = dte
+            break  # one readable expiry per leg is enough; move to the next leg
+    return nearest
 
 
 class RobinhoodOptionClient:
@@ -560,7 +567,13 @@ class RobinhoodOptionClient:
         slip through the manual place/build helpers by simply omitting the DTE.
         """
         config = self._risk_config()
-        dte = days_to_expiry if days_to_expiry is not None else _dte_from_legs(legs)
+        # Take the STRICTER (nearest) of an explicit days_to_expiry and a
+        # leg-stamped expiry, so a caller cannot loosen a nearer leg-stamped
+        # 0DTE/short-dated expiry by passing a larger days_to_expiry -- mirroring
+        # caps_direction (stricter direction) and _effective_max_loss_per_contract
+        # (max at-risk). Neither present -> None -> refused (fail closed) below.
+        _dte_candidates = [d for d in (days_to_expiry, _dte_from_legs(legs)) if d is not None]
+        dte = min(_dte_candidates) if _dte_candidates else None
         if dte is None:
             return (
                 f"[{GateName.MIN_DTE}] a live option order requires a known days-to-expiry "

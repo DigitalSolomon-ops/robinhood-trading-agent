@@ -1258,6 +1258,49 @@ def test_place_binds_dte_from_a_leg_stamped_expiry_and_submits():
     assert len(connector.place_calls) == 1
 
 
+def test_place_takes_the_nearer_leg_stamped_dte_over_a_false_explicit_dte():
+    """MUTATION TEST: a caller cannot loosen the DTE floor by passing a large
+    days_to_expiry while a leg is stamped a NEARER expiry. The leg expires TODAY
+    (0DTE) but the caller claims days_to_expiry=30; fully gated + armed + priced,
+    the client must take the STRICTER (nearest) DTE and block on zero_dte, connector
+    never called. Revert the reconciliation (trust the caller's explicit DTE) and
+    the 0DTE long submits."""
+    from datetime import UTC, datetime
+
+    today = datetime.now(UTC).date().isoformat()
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+    stamped_leg = {**long_legs()[0], "expiration_date": today}
+
+    result = client.place_option_order(
+        [stamped_leg], quantity="1", price="1.00", days_to_expiry=30,  # false, larger
+        dry_run=False, confirm_live_order=True,
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "zero_dte" in result["risk_gate"]
+    assert connector.place_calls == []
+
+
+def test_dte_from_legs_returns_the_nearest_across_legs_not_the_first():
+    """Pin the helper directly: with a far leg FIRST and a near leg second, the
+    nearest (min) DTE is returned, not the first-found. Revert to first-wins and a
+    spread hiding a 0DTE leg behind a far leg escapes the floor."""
+    from datetime import UTC, datetime, timedelta
+
+    from src.robinhood_option_client import _dte_from_legs
+
+    today = datetime.now(UTC).date()
+    far = (today + timedelta(days=30)).isoformat()
+    near = today.isoformat()
+    legs = [
+        {"side": "buy", "position_effect": "open", "option": LONG_CALL, "expiration_date": far},
+        {"side": "sell", "position_effect": "close", "option": LONG_CALL, "expiration_date": near},
+    ]
+    assert _dte_from_legs(legs) == 0
+
+
 # (3) STANDING AT-RISK from open positions ------------------------------------
 
 

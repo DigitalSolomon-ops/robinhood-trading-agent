@@ -332,7 +332,12 @@ class RobinhoodOptionBroker:
         over-debit / over-level order past the caps. The client re-checks too
         (defense in depth), exactly as the defined-risk and arm gates are mirrored.
         """
-        dte = days_to_expiry if days_to_expiry is not None else _dte_from_legs(legs)
+        # Take the STRICTER (nearest) of an explicit days_to_expiry and a
+        # leg-stamped expiry -- a caller cannot loosen a nearer leg-stamped
+        # 0DTE/short-dated expiry with a larger days_to_expiry. Mirrors the client
+        # (defense in depth) and caps_direction/effective-max-loss (stricter wins).
+        _dte_candidates = [d for d in (days_to_expiry, _dte_from_legs(legs)) if d is not None]
+        dte = min(_dte_candidates) if _dte_candidates else None
         if dte is None:
             return (
                 f"[{GateName.MIN_DTE}] a live option order requires a known days-to-expiry "

@@ -709,6 +709,29 @@ def test_zero_dte_order_refused_even_fully_armed(monkeypatch, tmp_path):
     assert connector.place_calls == []
 
 
+def test_nearer_leg_stamped_dte_wins_over_a_false_explicit_dte(monkeypatch, tmp_path):
+    """MUTATION TEST: mirroring the client, the broker cannot be tricked into
+    loosening the DTE floor by a large days_to_expiry when a leg is stamped a NEARER
+    expiry. The leg expires TODAY (0DTE) but the caller claims days_to_expiry=30;
+    fully armed + confirmed live, the broker must take the STRICTER (nearest) DTE and
+    block on zero_dte, connector never called. Revert the reconciliation and the
+    0DTE long submits."""
+    from datetime import UTC, datetime
+
+    today = datetime.now(UTC).date().isoformat()
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    stamped_leg = {**LONG_LEG, "expiration_date": today}
+    result = broker.submit_option_order(
+        legs=[stamped_leg], direction="debit", quantity="1", price="1.00",
+        days_to_expiry=30, mode="live",  # false, larger
+    )
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "zero_dte" in result["human_gate"]
+    assert connector.place_calls == []
+
+
 def test_over_contract_order_refused_even_fully_armed(monkeypatch, tmp_path):
     connector = FakeConnector()
     broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
