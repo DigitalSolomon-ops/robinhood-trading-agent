@@ -49,6 +49,22 @@ class FakeArmStore:
         return self.armed
 
 
+class FakeKillSwitch:
+    """A test double for the options kill switch: HALTED exactly when it is given
+    halt reasons, OPEN otherwise. The real KillSwitch reads STOP_TRADING_OPTIONS +
+    TRADING_ENABLED; injecting this keeps the client tests off the real filesystem
+    and process env while still exercising the client's irreversible-moment
+    re-check via halt_reasons()."""
+
+    def __init__(self, halts: list[str] | None = None) -> None:
+        self._halts = list(halts or [])
+        self.queried = 0
+
+    def halt_reasons(self) -> list[str]:
+        self.queried += 1
+        return list(self._halts)
+
+
 class FakeConnector:
     """Records calls instead of reaching the real Robinhood options connector."""
 
@@ -98,9 +114,19 @@ class FakeConnector:
         return {"order_id": order_id, "status": "cancel_requested"}
 
 
-def make_client(connector: FakeConnector, armed: bool = True) -> RobinhoodOptionClient:
+def make_client(
+    connector: FakeConnector, armed: bool = True, kill_switch: object | None = None
+) -> RobinhoodOptionClient:
+    # Inject an OPEN kill switch by default so a fully-gated + armed order can
+    # submit under test without depending on the real STOP_TRADING_OPTIONS file or
+    # a process-wide TRADING_ENABLED (the broker tests achieve the same by anchoring
+    # the stop file to tmp_path and setting the env). A test that wants to exercise
+    # the halt path passes a FakeKillSwitch with halt reasons.
     return RobinhoodOptionClient(
-        connector, arm_store=FakeArmStore(armed=armed), expected_account=EXPECTED_ACCOUNT
+        connector,
+        arm_store=FakeArmStore(armed=armed),
+        expected_account=EXPECTED_ACCOUNT,
+        kill_switch=kill_switch if kill_switch is not None else FakeKillSwitch(),
     )
 
 
@@ -1011,3 +1037,259 @@ def test_client_caps_spare_a_genuine_sell_to_close_credit_from_the_debit_cap():
     sell_to_close = [{"side": "sell", "position_effect": "close", "ratio_quantity": 1, "option": LONG_CALL}]
 
     assert client._option_caps_block(sell_to_close, "credit", "1", "6.00", 30, 0.0, None) is None
+
+
+# --- client-irreversible-parity: mirror the broker's irreversible-moment gates
+# A DIRECT client.place_option_order (the public, connector-calling submit) must
+# enforce the SAME irreversible-moment gates the broker does, so a direct client
+# submit is exactly as safe as one routed through the broker. Each test below is
+# a MUTATION TEST: it FAILS if the mirrored guard is reverted.
+
+
+class PositionsConnector(FakeConnector):
+    """A connector that reports fixed OPEN option positions, so the client's own
+    _open_premium_at_risk_from_positions has real standing exposure to source."""
+
+    def __init__(self, positions: list[dict], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._positions = positions
+
+    def get_option_positions(self, account_number=None):
+        self.position_calls.append({"account_number": account_number})
+        return {"positions": self._positions}
+
+
+class NonAcceptingConnector(FakeConnector):
+    """A connector whose place_option_order does NOT raise but returns a response
+    that carries no acceptance signal -- the phantom-fill trap the client's
+    response inspection closes."""
+
+    def __init__(self, response, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._response = response
+
+    def place_option_order(self, **kwargs):
+        _assert_connector_leg_shape(kwargs.get("legs"))
+        self.place_calls.append(kwargs)
+        return self._response
+
+
+# (1) KILL SWITCH -------------------------------------------------------------
+
+
+def test_place_refuses_to_submit_when_the_options_kill_switch_is_halted():
+    """MUTATION TEST (item 1): fully gated + armed + priced + within caps, but the
+    options kill switch is HALTED. The client must consult it at the irreversible
+    moment and refuse -- status 'kill_switch_engaged', the connector never called.
+    Revert the kill-switch re-check in place_option_order and this order submits."""
+    connector = FakeConnector()
+    client = make_client(
+        connector, armed=True, kill_switch=FakeKillSwitch(["STOP_TRADING_OPTIONS exists"])
+    )
+
+    result = client.place_option_order(
+        long_legs(), quantity="1", price="1.00", days_to_expiry=30,
+        dry_run=False, confirm_live_order=True,
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "kill_switch_engaged"
+    assert "STOP_TRADING_OPTIONS" in result["kill_switch"]
+    assert connector.place_calls == []
+
+
+def test_place_fails_closed_when_the_kill_switch_is_unreadable():
+    """An emergency stop that RAISES on read must read as HALTED (fail closed), so
+    a broken switch can never leave the client's submit path unguarded."""
+
+    class RaisingKillSwitch:
+        def halt_reasons(self):
+            raise RuntimeError("switch unreadable")
+
+    connector = FakeConnector()
+    client = make_client(connector, armed=True, kill_switch=RaisingKillSwitch())
+
+    result = client.place_option_order(
+        long_legs(), quantity="1", price="1.00", days_to_expiry=30,
+        dry_run=False, confirm_live_order=True,
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "kill_switch_engaged"
+    assert connector.place_calls == []
+
+
+# (2) DTE FAIL-CLOSED ---------------------------------------------------------
+
+
+def test_place_refuses_an_unknown_dte_live_long_even_fully_gated():
+    """MUTATION TEST (item 2): fully gated + armed + priced, a single long call
+    with NO explicit days_to_expiry and NO leg-stamped expiry. The client must
+    FAIL CLOSED -- status 'options_risk_gate_blocked' naming MIN_DTE -- and never
+    reach the connector. Revert the fail-closed DTE handling (strip the DTE gates
+    when the expiry is unknown) and a known 0DTE / short-dated long slips through
+    the manual place/build helpers by omitting the DTE, submitting here."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), quantity="1", price="1.00",  # no days_to_expiry, no leg expiry
+        dry_run=False, confirm_live_order=True,
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "min_days_to_expiry" in result["risk_gate"]
+    assert connector.place_calls == []
+
+
+def test_place_binds_dte_from_a_leg_stamped_expiry_and_submits():
+    """Precision: the fail-closed refusal is only for a GENUINELY unknown expiry.
+    A leg stamping a far-dated expiration derives a known DTE, so a fully gated +
+    armed order submits with no explicit days_to_expiry -- the refusal must not
+    over-block an order that names its expiry on the leg."""
+    from datetime import UTC, datetime, timedelta
+
+    far = (datetime.now(UTC).date() + timedelta(days=30)).isoformat()
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+    stamped_leg = {**long_legs()[0], "expiration_date": far}
+
+    result = client.place_option_order(
+        [stamped_leg], quantity="1", price="1.00",  # no explicit days_to_expiry
+        dry_run=False, confirm_live_order=True,
+    )
+
+    assert result["submitted"] is True
+    assert len(connector.place_calls) == 1
+
+
+# (3) STANDING AT-RISK from open positions ------------------------------------
+
+
+def test_place_refuses_when_open_positions_push_total_at_risk_over_cap():
+    """MUTATION TEST (item 3): the caller passes the 0.0 open-at-risk default, but
+    the connector reports open positions worth $1,500 already at risk (3 x $5.00 x
+    100). A new $200 long (1 x $2.00 x 100) makes $1,700 total, over the $1,500
+    cap. The client must SELF-SOURCE the standing exposure and block -- status
+    'options_risk_gate_blocked' naming the total-at-risk cap, connector never
+    called. Revert the self-sourcing (default standing exposure to 0.0) and the
+    order under-counts to $200 and submits."""
+    connector = PositionsConnector(
+        positions=[{"quantity": "3", "average_open_price": "5.00", "option_id": LONG_CALL}]
+    )
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), quantity="1", price="2.00", days_to_expiry=30,
+        dry_run=False, confirm_live_order=True,  # open_premium_at_risk_usd defaults 0.0
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_total_premium_at_risk" in result["risk_gate"]
+    assert connector.place_calls == []
+
+
+def test_client_open_exposure_from_positions_sums_premium_and_max_loss():
+    """Pin the client's OWN sourcing method directly: a position's standing risk
+    is its recorded max_loss when present, else premium x 100 x contracts; a
+    closed (qty 0) position is ignored. Revert the method and this fails
+    independently of the end-to-end cap test."""
+    connector = PositionsConnector(
+        positions=[
+            {"quantity": "2", "average_open_price": "1.50"},  # 2 x 1.50 x 100 = 300
+            {"quantity": "1", "max_loss_usd": "250"},          # recorded max loss = 250
+            {"quantity": "0", "average_open_price": "9.99"},   # closed -> ignored
+        ]
+    )
+    client = make_client(connector, armed=True)
+    assert client._open_premium_at_risk_from_positions() == 550.0
+
+
+# (4) LONG AT-RISK FROM DEBIT -------------------------------------------------
+
+
+def test_place_ignores_a_tiny_caller_max_loss_and_derives_at_risk_from_debit():
+    """MUTATION TEST (item 4): a long (BUY leg) whose caller-supplied
+    max_loss_per_contract_usd ($0.50) is far BELOW the real debit ($2.00 x 100 =
+    $200). With $1,400 already at risk, the true total is $1,600 > the $1,500 cap,
+    but the tiny caller figure would read only $1,400.50 and slip under. The client
+    must derive at-risk from the debit and IGNORE the smaller caller figure --
+    status 'options_risk_gate_blocked' naming the total-at-risk cap, connector
+    never called. Revert _effective_max_loss_per_contract (trust the caller's
+    max_loss) and the order under-counts and submits."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), quantity="1", price="2.00", days_to_expiry=30,
+        dry_run=False, confirm_live_order=True,
+        open_premium_at_risk_usd=1400.0,
+        max_loss_per_contract_usd=0.50,
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_total_premium_at_risk" in result["risk_gate"]
+    assert connector.place_calls == []
+
+
+def test_effective_max_loss_pins_the_debit_floor_for_a_buy_leg():
+    """Pin the helper directly: for any BUY leg the per-contract max loss is at
+    least the debit paid (premium x multiplier); a lower or None caller figure is
+    ignored, a HIGHER one (a real width-based max loss) wins, and an all-sell
+    reducing order passes its caller figure through unchanged."""
+    from src.robinhood_option_client import _effective_max_loss_per_contract
+
+    assert _effective_max_loss_per_contract(long_legs(), 2.00, 100, 0.50) == 200.0
+    assert _effective_max_loss_per_contract(long_legs(), 2.00, 100, None) == 200.0
+    assert _effective_max_loss_per_contract(long_legs(), 2.00, 100, 500.0) == 500.0
+    sell_to_close = [{"side": "sell", "position_effect": "close", "ratio_quantity": 1, "option": LONG_CALL}]
+    assert _effective_max_loss_per_contract(sell_to_close, 2.00, 100, 0.50) == 0.50
+
+
+# (5) RESPONSE INSPECTION -----------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "response",
+    [None, {}, {"foo": "bar"}, "accepted-looking-string", {"status": "rejected"}, {"status": "unconfirmed"}],
+)
+def test_place_reports_not_submitted_on_a_non_accepting_response(response):
+    """MUTATION TEST (item 5): the connector call does NOT raise but returns a
+    response with no acceptance signal (no order id, no accepting status -- or an
+    explicit rejection). The client must inspect the response and report
+    submitted=False, status 'order_not_accepted', carrying the raw response back --
+    never claim a fill merely because the call returned. The connector WAS reached
+    here (place_calls == 1), so the verdict is on the response, not on reaching the
+    connector. Revert the response inspection (submitted=True whenever the call
+    did not raise) and this phantom fill passes."""
+    connector = NonAcceptingConnector(response=response)
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), quantity="1", price="1.00", days_to_expiry=30,
+        dry_run=False, confirm_live_order=True,
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "order_not_accepted"
+    assert result["response"] == response
+    assert len(connector.place_calls) == 1
+
+
+def test_place_reports_submitted_on_an_id_only_acceptance():
+    """Precision: an acceptance signal need not be a status word -- a venue-minted
+    order id alone is acceptance. A response carrying only an id reports
+    submitted=True, so the inspection does not over-block a real fill."""
+    connector = NonAcceptingConnector(response={"id": "venue-minted-42"})
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), quantity="1", price="1.00", days_to_expiry=30,
+        dry_run=False, confirm_live_order=True,
+    )
+
+    assert result["submitted"] is True
+    assert len(connector.place_calls) == 1

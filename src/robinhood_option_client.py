@@ -66,6 +66,12 @@ from .option_risk_gates import (
     resolve_granted_level,
 )
 
+# The options-lane emergency stop. place_option_order re-reads it at the
+# irreversible moment (STOP_TRADING_OPTIONS + TRADING_ENABLED), mirroring the
+# broker -- a direct client submit must honor the kill switch too, not only a
+# submit routed through the broker.
+from .kill_switch import KillSwitch
+
 # Reuse the equities lane's account-identity anchor verbatim -- SAME account,
 # SAME out-of-band expected identity, SAME exceptions. The options lane must not
 # fork the anchor: a second copy is a second thing to keep in sync.
@@ -77,15 +83,116 @@ from .robinhood_equity_client import (
     _load_expected_account,
 )
 
-# The DTE-family caps. They are relaxed ONLY when an order's days-to-expiry is
-# genuinely unknown at submit time (a bare-contract order that carries no
-# expiry). The dollar / size / approval-level caps are ALWAYS enforced; a real
-# order framed by the strategy layer carries a DTE, and a DTE stamped on the leg
-# is derived below, so a KNOWN 0DTE or under-floor order is still refused.
-_DTE_GATE_NAMES = frozenset({GateName.MIN_DTE, GateName.ZERO_DTE, GateName.EXPIRED})
-
 # The lane this client's arm gate reads from the shared ArmStore.
 OPTIONS_LANE = "options"
+
+# The lane repo root, so a client built with no explicit kill switch resolves its
+# fail-closed default to the options lane's OWN ROOT-anchored stop file regardless
+# of the process CWD. Same anchor the broker uses (src/ -> agent root).
+_ROOT = _DEFAULT_ROOT
+
+
+def _default_options_kill_switch() -> KillSwitch:
+    """Fail-closed default for a client built without an explicit kill switch.
+
+    A missing kill switch must NEVER turn the client's submit path into an
+    unguarded one. Fall back to the options lane's OWN ROOT-anchored switch --
+    STOP_TRADING_OPTIONS plus TRADING_ENABLED -- so the emergency stop is honored
+    on a direct client submit exactly as it is via the broker. Never the crypto
+    lane's STOP_TRADING or the equities lane's STOP_TRADING_EQUITIES."""
+    return KillSwitch(stop_file=str(_ROOT / "STOP_TRADING_OPTIONS"), env_var="TRADING_ENABLED")
+
+
+def _as_position_list(payload: Any) -> list[Any]:
+    """Normalize a connector get_option_positions payload to a list of positions,
+    across the loosely-known shapes it may take (a bare list, or a mapping under
+    positions / results / option_positions / data). Shared with the broker so the
+    standing-at-risk sourcing reads positions identically on both paths."""
+    if isinstance(payload, Mapping):
+        for key in ("positions", "results", "option_positions", "data"):
+            value = payload.get(key)
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                return list(value)
+        return []
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        return list(payload)
+    return []
+
+
+def _first_float(mapping: Mapping[str, Any], keys: Sequence[str]) -> float | None:
+    """The first of `keys` present in `mapping` with a numeric value, as a float,
+    or None when none is readable. Shared with the broker."""
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            try:
+                return float(mapping[key])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _effective_max_loss_per_contract(
+    legs: Sequence[Mapping[str, Any]],
+    premium_per_share: float,
+    multiplier: int,
+    caller_max_loss_per_contract_usd: float | None,
+) -> float | None:
+    """The per-contract max loss the total-at-risk cap must see.
+
+    Any order carrying a BUY leg PAYS premium, so its per-contract max loss is at
+    least the debit paid (premium-per-share x contract multiplier). A caller
+    max_loss_per_contract_usd LOWER than that debit -- or None -- is ignored in
+    favour of the debit, so a tiny caller figure cannot under-count the cap. An
+    all-sell (sell-to-close reducing) order carries no opening debit, so its
+    caller figure is passed through unchanged. Shared by the client and the broker
+    so both caps paths derive at-risk identically."""
+    has_buy = any(
+        isinstance(leg, Mapping) and str(leg.get("side")).strip().lower() == "buy" for leg in (legs or [])
+    )
+    if not has_buy:
+        return caller_max_loss_per_contract_usd
+    debit_per_contract = max(float(premium_per_share), 0.0) * multiplier
+    if caller_max_loss_per_contract_usd is None:
+        return debit_per_contract
+    try:
+        return max(float(caller_max_loss_per_contract_usd), debit_per_contract)
+    except (TypeError, ValueError):
+        return debit_per_contract
+
+
+# Connector-response statuses that signal the venue ACCEPTED the order, and those
+# that signal an explicit rejection. place_option_order reports submitted=True only
+# after seeing an acceptance signal (an order id or an accepting status) in the
+# response -- never merely because the connector call did not raise.
+_ACCEPTED_STATUSES = frozenset(
+    {"accepted", "confirmed", "queued", "filled", "partially_filled", "pending", "new", "submitted", "ok", "placed"}
+)
+_REJECTED_STATUSES = frozenset({"rejected", "cancelled", "canceled", "failed", "denied", "error", "unconfirmed"})
+
+
+def _response_accepted(response: Any) -> bool:
+    """True only when the connector's place response carries an acceptance signal.
+
+    An acceptance is an explicit accepting status/state, or an order id the venue
+    minted for the order. An explicit rejecting status wins over everything. A
+    non-mapping response, an empty mapping, or one with neither an id nor an
+    accepting status is NOT an acceptance -- reporting submitted=True on it would
+    be a phantom fill (a claimed order the venue never acknowledged)."""
+    if not isinstance(response, Mapping):
+        return False
+    for key in ("status", "state", "order_status"):
+        value = response.get(key)
+        if value is not None:
+            token = str(value).strip().lower()
+            if token in _REJECTED_STATUSES:
+                return False
+            if token in _ACCEPTED_STATUSES:
+                return True
+    for key in ("id", "order_id"):
+        value = response.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
 
 # Re-exported so callers can catch them from this module too.
 __all__ = [
@@ -287,8 +394,13 @@ class RobinhoodOptionClient:
         lane: str = OPTIONS_LANE,
         expected_account: Mapping[str, str] | None = None,
         config_root: Path | str | None = None,
+        kill_switch: KillSwitch | None = None,
     ) -> None:
         self._connector = connector
+        # Fail closed: a client built with no kill switch still gets the options
+        # lane's own ROOT-anchored switch, so a direct submit re-checks the
+        # emergency stop at the irreversible moment exactly as the broker does.
+        self._kill_switch = kill_switch if kill_switch is not None else _default_options_kill_switch()
         # A missing arm store reads as DISARMED (fail safe): a real submit then
         # can never fire, exactly as a disarmed lane. The store is the shared
         # ArmStore (src.shared_state.build_arm_store) in production.
@@ -369,6 +481,55 @@ class RobinhoodOptionClient:
             self._cached_risk_config = OptionRiskConfig.from_rules(_load_rules(self._config_root))
         return self._cached_risk_config
 
+    def _kill_switch_halt_reason(self) -> str | None:
+        """The reason the options kill switch is engaged, or None when it is open.
+
+        Re-read at the irreversible moment, never trusted from a caller. Fail
+        CLOSED: an unreadable switch reads as HALTED, so a broken emergency stop
+        can never leave the submit path unguarded."""
+        try:
+            halts = self._kill_switch.halt_reasons()
+        except Exception:
+            return "kill switch is unreadable (fail closed)"
+        if halts:
+            return "kill switch is engaged: " + "; ".join(halts)
+        return None
+
+    def _open_premium_at_risk_from_positions(self) -> float:
+        """Premium currently at risk in OPEN option positions, in dollars, sourced
+        from the connector -- mirrors the broker's method so a DIRECT client submit
+        cannot under-count the portfolio total-at-risk cap by defaulting the
+        standing exposure to 0.0.
+
+        For each held position the standing risk is its RECORDED max loss when the
+        connector reports one, else premium x contract-multiplier x contracts
+        (every position this lane opens is a long, whose max loss is the debit
+        paid). Best-effort and fail-soft on the READ: an unreadable positions
+        payload contributes 0.0 rather than crashing the submit."""
+        try:
+            raw = self.get_option_positions()
+        except Exception:
+            return 0.0
+        multiplier = self._risk_config().contract_multiplier
+        total = 0.0
+        for position in _as_position_list(raw):
+            if not isinstance(position, Mapping):
+                continue
+            qty = _first_float(position, ("quantity", "contracts", "open_quantity", "long_quantity"))
+            if qty is None or qty <= 0:
+                continue
+            max_loss = _first_float(position, ("max_loss_usd", "max_loss", "recorded_max_loss"))
+            if max_loss is not None and max_loss > 0:
+                total += max_loss
+                continue
+            premium = _first_float(
+                position, ("average_open_price", "average_price", "average_buy_price", "price", "premium")
+            )
+            if premium is None or premium <= 0:
+                continue
+            total += premium * multiplier * qty
+        return round(total, 2)
+
     def _option_caps_block(
         self,
         legs: Sequence[Mapping[str, Any]],
@@ -383,13 +544,20 @@ class RobinhoodOptionClient:
         reason string, or None when every applicable cap passes.
 
         The debit / total-at-risk / contract-count / approval-level caps are
-        ALWAYS enforced here, immediately before the connector call. The DTE
-        floor binds whenever the expiry is known (an explicit days_to_expiry or
-        one stamped on a leg); it is relaxed ONLY when the expiry is genuinely
-        unknown, so a bare-contract order is still size/debit/level-capped.
+        ALWAYS enforced here, immediately before the connector call. The DTE floor
+        binds whenever the expiry is known (an explicit days_to_expiry or one
+        stamped on a leg). When the expiry is genuinely UNKNOWN -- neither supplied
+        nor stamped on a leg -- a live order is REFUSED (fail closed) rather than
+        having the DTE gates stripped, so a known 0DTE / short-dated long cannot
+        slip through the manual place/build helpers by simply omitting the DTE.
         """
         config = self._risk_config()
         dte = days_to_expiry if days_to_expiry is not None else _dte_from_legs(legs)
+        if dte is None:
+            return (
+                f"[{GateName.MIN_DTE}] a live option order requires a known days-to-expiry "
+                "(an explicit days_to_expiry or a leg-stamped expiration); refusing (fail closed)"
+            )
         try:
             qty_int = int(quantity)
         except (TypeError, ValueError):
@@ -410,14 +578,20 @@ class RobinhoodOptionClient:
             # total-at-risk cap. At the submit path defined risk has already
             # refused every opening short, so any buy leg here is a real debit.
             direction=caps_direction(legs, direction),
-            max_loss_per_contract_usd=max_loss_per_contract_usd,
+            # LONG AT-RISK FROM DEBIT: any order carrying a BUY leg is a real debit
+            # whose per-contract max loss IS the debit paid (premium x multiplier).
+            # Ignore a caller max_loss_per_contract_usd LOWER than that, so a tiny
+            # caller figure cannot under-count the total-at-risk cap. Defined risk
+            # has already refused every opening short, so no genuine credit spread
+            # (whose max loss is width-minus-credit, below the debit) reaches here.
+            max_loss_per_contract_usd=_effective_max_loss_per_contract(
+                legs, premium, config.contract_multiplier, max_loss_per_contract_usd
+            ),
         )
         decision = evaluate_option_order(
             config, proposal, resolve_granted_level(self), max(float(open_premium_at_risk_usd), 0.0)
         )
         blocking = decision.blocking
-        if dte is None:
-            blocking = [result for result in blocking if result.name not in _DTE_GATE_NAMES]
         if blocking:
             return "; ".join(f"[{result.name}] {result.reason}" for result in blocking)
         return None
@@ -676,18 +850,26 @@ class RobinhoodOptionClient:
                 "venue": "robinhood_options",
                 "order_payload": payload,
             }
+        # Standing exposure, sourced at the irreversible moment (mirrors the
+        # broker): the premium already at risk in open option positions, so a
+        # DIRECT client submit cannot under-count the portfolio total-at-risk cap
+        # by passing the 0.0 default. max() with any caller-supplied figure keeps
+        # the cap from being reset downward and avoids double-counting.
+        effective_open_at_risk = max(
+            float(open_premium_at_risk_usd or 0.0), self._open_premium_at_risk_from_positions()
+        )
         # Third fact, mirrored from the broker (defense in depth): the order must
-        # clear the options risk caps. A cap-blocking order -- 0DTE, over the
-        # contract count, over the debit or total-at-risk cap, or above the
-        # granted approval level -- returns a preview and never reaches the
-        # connector, even fully gated and armed.
+        # clear the options risk caps. A cap-blocking order -- 0DTE, an unknown
+        # DTE, over the contract count, over the debit or total-at-risk cap, or
+        # above the granted approval level -- returns a preview and never reaches
+        # the connector, even fully gated and armed.
         caps_block = self._option_caps_block(
             payload["legs"],
             payload["direction"],
             quantity,
             price,
             days_to_expiry,
-            open_premium_at_risk_usd,
+            effective_open_at_risk,
             max_loss_per_contract_usd,
         )
         if caps_block is not None:
@@ -698,7 +880,33 @@ class RobinhoodOptionClient:
                 "order_payload": payload,
                 "risk_gate": caps_block,
             }
+        # Past this point the next call is irreversible: re-read the options kill
+        # switch (STOP_TRADING_OPTIONS + TRADING_ENABLED), mirroring the broker. A
+        # halted (or unreadable) switch returns a preview -- no connector call --
+        # so a direct client submit honors the emergency stop too.
+        halt = self._kill_switch_halt_reason()
+        if halt is not None:
+            return {
+                "submitted": False,
+                "status": "kill_switch_engaged",
+                "venue": "robinhood_options",
+                "order_payload": payload,
+                "kill_switch": halt,
+            }
         response = self._connector.place_option_order(**self._wire_payload(payload))
+        # Report submitted=True ONLY after inspecting the connector response for an
+        # acceptance signal (an order id / accepting status). A call that merely
+        # did not raise but returned nothing venue-acknowledged is NOT a fill --
+        # claiming submitted=True on it would be a phantom order. Otherwise carry
+        # the preview shape back with the raw response for the caller to inspect.
+        if not _response_accepted(response):
+            return {
+                "submitted": False,
+                "status": "order_not_accepted",
+                "venue": "robinhood_options",
+                "order_payload": payload,
+                "response": response,
+            }
         return {
             "submitted": True,
             "status": "submitted",

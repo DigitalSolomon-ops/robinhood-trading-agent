@@ -541,10 +541,28 @@ def test_place_long_call_blocked_when_disarmed(monkeypatch, tmp_path):
 def test_place_limit_order_buy_submits_when_armed(monkeypatch, tmp_path):
     connector = FakeConnector()
     broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
-    order = {"symbol": LONG_CALL, "side": "buy", "quantity": "1", "limit_price": 2.50}
+    # A real OrderManager-facing order carries days_to_expiry (submit_signal stamps
+    # it). With the DTE fail-closed rule an order whose expiry is genuinely unknown
+    # is now refused, so a submitting order must name its DTE.
+    order = {"symbol": LONG_CALL, "side": "buy", "quantity": "1", "limit_price": 2.50, "days_to_expiry": 30}
     result = broker.place_limit_order(order, mode="live")
     assert result["submitted"] is True
     assert len(connector.place_calls) == 1
+
+
+def test_place_limit_order_buy_fails_closed_without_a_dte(monkeypatch, tmp_path):
+    """MUTATION TEST (item 2, broker half, end-to-end): an OrderManager-facing buy
+    with NO days_to_expiry and no leg-stamped expiry is refused at the caps (fail
+    closed), even fully armed + confirmed live. status 'options_risk_gate_blocked',
+    connector never called. Revert the broker's fail-closed DTE handling and this
+    unknown-DTE order submits."""
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    order = {"symbol": LONG_CALL, "side": "buy", "quantity": "1", "limit_price": 2.50}
+    result = broker.place_limit_order(order, mode="live")
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert connector.place_calls == []
 
 
 def test_place_limit_order_disarmed_previews(monkeypatch, tmp_path):
@@ -958,13 +976,32 @@ def test_broker_caps_block_method_flags_over_level(monkeypatch, tmp_path):
     assert "option_approval_level" in (reason or "")
 
 
-def test_broker_caps_relax_dte_only_when_the_expiry_is_unknown(monkeypatch, tmp_path):
-    """A bare order with no expiry (and no price) clears the caps -- the DTE floor
-    is relaxed only when the expiry is genuinely unknown, while the dollar/size/
-    level caps still apply."""
+def test_broker_caps_fail_closed_when_the_expiry_is_unknown(monkeypatch, tmp_path):
+    """MUTATION TEST (item 2, broker half): a live order whose expiry is genuinely
+    unknown -- no explicit days_to_expiry AND no leg-stamped expiry -- is REFUSED
+    (fail closed), mirroring the client's _option_caps_block. The reason names the
+    MIN_DTE gate. Revert the broker to the old 'strip the DTE gates when unknown'
+    behavior and a known 0DTE / short-dated long slips through the manual helpers
+    by simply omitting the DTE -- this returns None then and fails here."""
     connector = FakeConnector()
     broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
-    assert broker._option_caps_block_reason([LONG_LEG], "debit", "1", None, None, 0.0, None) is None
+    reason = broker._option_caps_block_reason([LONG_LEG], "debit", "1", "1.00", None, 0.0, None)
+    assert reason is not None
+    assert "min_days_to_expiry" in reason
+
+
+def test_broker_caps_bind_dte_from_a_leg_stamped_expiry(monkeypatch, tmp_path):
+    """Precision: the fail-closed refusal is only for a GENUINELY unknown expiry.
+    A leg that stamps its own far-dated expiration derives a known DTE, so the
+    caps pass (None) even with no explicit days_to_expiry -- the refusal must not
+    over-block an order that names its expiry on the leg."""
+    from datetime import UTC, datetime, timedelta
+
+    connector = FakeConnector()
+    broker = make_broker(connector, monkeypatch=monkeypatch, tmp_path=tmp_path)
+    far = (datetime.now(UTC).date() + timedelta(days=30)).isoformat()
+    stamped_leg = {**LONG_LEG, "expiration_date": far}
+    assert broker._option_caps_block_reason([stamped_leg], "debit", "1", "1.00", None, 0.0, None) is None
 
 
 def test_build_option_limit_order_sizes_on_the_contract_multiplier(monkeypatch, tmp_path):

@@ -83,12 +83,6 @@ from .robinhood_option_client import (
 from .shared_state import build_arm_store
 from .strategy_engine import TradeSignal
 
-# The DTE-family caps, relaxed only when an order's expiry is genuinely unknown
-# at submit time (a bare-contract order). The dollar / size / approval-level caps
-# are ALWAYS enforced; a real strategy-framed order carries a DTE and a KNOWN
-# 0DTE is refused. Mirrors robinhood_option_client._DTE_GATE_NAMES.
-_DTE_GATE_NAMES = frozenset({GateName.MIN_DTE, GateName.ZERO_DTE, GateName.EXPIRED})
-
 VENUE = "robinhood_options"
 
 # The lane repo root, so the fail-closed default kill switch and default arm
@@ -327,13 +321,23 @@ class RobinhoodOptionBroker:
         Sits with the irreversible call, never trusted from a caller: the debit /
         total-at-risk / contract-count / approval-level caps are ALWAYS enforced
         before the connector is reached, and the DTE floor binds whenever the
-        expiry is known (an explicit days_to_expiry or one stamped on a leg). This
-        is the runtime mirror of the strategy mapper's framing-time gates -- an
-        armed broker still cannot push a 0DTE / over-contract / over-debit /
-        over-level order past the caps. The client re-checks too (defense in
-        depth), exactly as the defined-risk and arm gates are mirrored.
+        expiry is known (an explicit days_to_expiry or one stamped on a leg). When
+        the expiry is genuinely UNKNOWN -- neither supplied nor stamped on a leg --
+        a live order is REFUSED (fail closed) rather than having the DTE gates
+        stripped, so a known 0DTE / short-dated long cannot slip through the manual
+        place_long_call / place_limit_order helpers by simply omitting the DTE.
+        Mirrors the client's _option_caps_block, which fails closed identically.
+        This is the runtime mirror of the strategy mapper's framing-time gates --
+        an armed broker still cannot push a 0DTE / unknown-DTE / over-contract /
+        over-debit / over-level order past the caps. The client re-checks too
+        (defense in depth), exactly as the defined-risk and arm gates are mirrored.
         """
         dte = days_to_expiry if days_to_expiry is not None else _dte_from_legs(legs)
+        if dte is None:
+            return (
+                f"[{GateName.MIN_DTE}] a live option order requires a known days-to-expiry "
+                "(an explicit days_to_expiry or a leg-stamped expiration); refusing (fail closed)"
+            )
         try:
             qty_int = int(quantity)
         except (TypeError, ValueError):
@@ -363,8 +367,6 @@ class RobinhoodOptionBroker:
             max(float(open_premium_at_risk_usd), 0.0),
         )
         blocking = decision.blocking
-        if dte is None:
-            blocking = [result for result in blocking if result.name not in _DTE_GATE_NAMES]
         if blocking:
             return "; ".join(f"[{result.name}] {result.reason}" for result in blocking)
         return None
