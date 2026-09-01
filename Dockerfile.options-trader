@@ -1,0 +1,30 @@
+# Options TRADER runtime -- Cloud Run JOB (one arm-gated, paper-first cycle/run).
+#
+# Co-located with the 007 dashboard via the SHARED FirestoreArmStore
+# (TRADER_ARM_FIRESTORE_PROJECT): the dashboard toggle writes the options lane's
+# arm state, this job reads it. DISARMED (the default) -> a no-op cycle that
+# places zero orders. ARMED -> one bounded PAPER cycle.
+#
+# This image carries the full trading-lane modules (like the dashboard image),
+# but it can build ONLY the headless PaperProvingOptionConnector -- whose order
+# methods raise -- so it cannot place a live options order even in principle, and
+# it holds NO Robinhood credential. Massive (read-only market data) prices the
+# analysis-only scout plays; that is the sole external call.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Full app deps + Firestore (shared arm store). MASSIVE_API_KEY is injected as env
+# from Secret Manager at deploy time; the container never shells out to gcloud.
+COPY requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt "google-cloud-firestore>=2.11,<3"
+
+COPY src/ ./src/
+COPY config/ ./config/
+RUN mkdir -p data logs
+
+# ADC-only secret resolution on Cloud Run (no in-container gcloud). No PORT: this
+# is a Job, not a web service.
+ENV DS_VAULT_NO_GCLOUD=1 PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "-m", "src.option_trader"]
