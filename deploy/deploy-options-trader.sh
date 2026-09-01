@@ -71,9 +71,17 @@ gcloud secrets add-iam-policy-binding massive-api --project="$PROJECT" \
   --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor" >/dev/null
 
 echo "==> Deploy Cloud Run Job (shared arm store; NO OPTIONS_TRADER_LIVE, NO Robinhood secret)"
+# TRADING_ENABLED=true holds the kill switch OPEN so the Firestore ARM MARKER (the
+# dashboard toggle) is the effective on/off control -- without it the kill switch
+# defaults to halting every cycle and an armed lane would never run. The two are
+# deliberately independent controls: the arm marker enables, STOP_TRADING_OPTIONS /
+# TRADING_ENABLED=false is the emergency stop. This is safe: the job is PAPER-ONLY
+# by construction (its only connector raises on any order path), so an open kill
+# switch cannot produce a live order -- disarming (or a redeploy with
+# TRADING_ENABLED=false) fully stops it.
 gcloud run jobs deploy "$JOB" --project="$PROJECT" --region="$REGION" \
   --image="$IMAGE" --service-account="$SA" \
-  --set-env-vars="DS_VAULT_NO_GCLOUD=1,TRADER_ARM_FIRESTORE_PROJECT=${PROJECT}" \
+  --set-env-vars="DS_VAULT_NO_GCLOUD=1,TRADER_ARM_FIRESTORE_PROJECT=${PROJECT},TRADING_ENABLED=true" \
   --set-secrets="MASSIVE_API_KEY=massive-api:latest" \
   --max-retries=1 --task-timeout=900s --memory=512Mi \
   --parallelism=1 --tasks=1

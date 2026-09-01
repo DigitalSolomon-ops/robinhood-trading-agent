@@ -261,6 +261,10 @@ def test_trader_deploy_script_is_paper_and_fail_closed():
     # Reads the SHARED arm store and grants only what a paper reader needs.
     assert "TRADER_ARM_FIRESTORE_PROJECT=" in body
     assert "roles/datastore.user" in body
+    # Kill switch held OPEN so the Firestore ARM MARKER is the effective control
+    # (without it an armed lane would silently halt every cycle). Safe: paper-only
+    # job -> cannot yield a live order. A removal that breaks arming fails here.
+    assert "TRADING_ENABLED=true" in body
     # The project has conditional bindings -> the grant must be unconditional.
     assert "--condition=None" in body
     # A Job, bounded and non-concurrent -- never an unbounded/daemon service.
