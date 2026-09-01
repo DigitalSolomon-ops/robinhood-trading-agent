@@ -27,13 +27,19 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    log = logging.getLogger(__name__)
     try:
         summary = run_option_cycle(ROOT)
     except Exception:  # pragma: no cover - top-level container guard
-        logging.getLogger(__name__).exception("options trade cycle failed")
+        log.exception("options trade cycle failed")
         return 1
-    # One structured line for the execution log.
-    print(json.dumps(summary, default=str))
+    # One structured line for the execution log. Emit it via the logging module
+    # (reliably captured by Cloud Run on stderr) AND stdout for local runs -- a
+    # fast-exiting container can drop an unflushed stdout print, and this summary
+    # is the operator's per-cycle monitoring record.
+    line = json.dumps(summary, default=str)
+    log.info("options trade cycle summary: %s", line)
+    print(line, flush=True)
     # A disarmed / halted / paper cycle is a clean success (exit 0). Only an
     # unexpected internal error (caught above) fails the execution. A reconcile
     # error is surfaced in the summary as a data signal; it does not, by itself,
