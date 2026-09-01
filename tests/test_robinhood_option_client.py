@@ -1258,19 +1258,27 @@ def test_place_binds_dte_from_a_leg_stamped_expiry_and_submits():
     assert len(connector.place_calls) == 1
 
 
-def test_place_takes_the_nearer_leg_stamped_dte_over_a_false_explicit_dte():
+@pytest.mark.parametrize("expiry_key", ["expiration_date", "expiry", "expiry_date", "expiration"])
+def test_place_takes_the_nearer_leg_stamped_dte_over_a_false_explicit_dte(expiry_key):
     """MUTATION TEST: a caller cannot loosen the DTE floor by passing a large
     days_to_expiry while a leg is stamped a NEARER expiry. The leg expires TODAY
     (0DTE) but the caller claims days_to_expiry=30; fully gated + armed + priced,
     the client must take the STRICTER (nearest) DTE and block on zero_dte, connector
     never called. Revert the reconciliation (trust the caller's explicit DTE) and
-    the 0DTE long submits."""
+    the 0DTE long submits.
+
+    Parametrized over ALL FOUR expiry aliases _dte_from_legs reads: this also pins
+    the alias-parity fix -- _normalize_leg canonicalizes every alias to
+    expiration_date, so the client's NORMALIZED-leg DTE check catches a 0DTE stamp
+    under expiry_date/expiration too (not just the two the retain-list once kept),
+    matching the broker's raw-leg screen. Revert the canonicalization and the
+    expiry_date / expiration cases submit a 0DTE order on the direct client path."""
     from datetime import UTC, datetime
 
     today = datetime.now(UTC).date().isoformat()
     connector = FakeConnector()
     client = make_client(connector, armed=True)
-    stamped_leg = {**long_legs()[0], "expiration_date": today}
+    stamped_leg = {**long_legs()[0], expiry_key: today}
 
     result = client.place_option_order(
         [stamped_leg], quantity="1", price="1.00", days_to_expiry=30,  # false, larger

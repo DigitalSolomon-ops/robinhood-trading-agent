@@ -683,13 +683,24 @@ class RobinhoodOptionClient:
             "option_type",
             "underlying",
             "underlying_symbol",
-            "expiration_date",
-            "expiry",
             "strike_price",
             "strike",
         ):
             if key in leg and leg[key] is not None:
                 normalized[key] = leg[key]
+        # Canonicalize the expiry to a SINGLE key (expiration_date) so the caps/DTE
+        # reader (_dte_from_legs) sees it regardless of which alias the caller used.
+        # This closes a parity gap: the client's DTE check runs on NORMALIZED legs,
+        # and the earlier retain-list carried only expiration_date/expiry -- so a leg
+        # stamped under expiry_date/expiration lost its expiry here while the broker's
+        # RAW-leg check still caught it, making the client's defense-in-depth strictly
+        # weaker than the broker screen it backs up. Same alias precedence as
+        # _dte_from_legs; none of these keys reach the connector (the wire projection
+        # keeps only _CONNECTOR_LEG_KEYS).
+        for key in ("expiration_date", "expiry", "expiry_date", "expiration"):
+            if leg.get(key) is not None:
+                normalized["expiration_date"] = leg[key]
+                break
         return normalized
 
     def _assert_defined_risk(self, legs: Sequence[Mapping[str, Any]], direction: str) -> None:
