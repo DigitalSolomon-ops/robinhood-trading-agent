@@ -300,6 +300,14 @@ def _connector_leg(leg: Mapping[str, Any]) -> dict[str, Any]:
 _REF_ID_NAMESPACE = uuid.UUID("6f2a9d3e-8b41-5c76-9a0e-4d7f1c2b3e58")
 
 
+# Keys the BUILT payload carries that the PLACE order schema accepts but the
+# REVIEW order schema does NOT. review_option_order is additionalProperties:false
+# and takes no `ref_id` -- the idempotency key is a place-time concern only -- so
+# a review call carrying ref_id would InputValidationError at the venue. These
+# place-only keys are stripped from the review wire; the place wire keeps them.
+_PLACE_ONLY_WIRE_KEYS = ("ref_id",)
+
+
 def _deterministic_ref_id(payload: Mapping[str, Any]) -> str:
     """A stable client-order-id (`ref_id`) derived ONLY from the order's
     identifying content, so a RETRY of the same logical order carries the SAME
@@ -763,10 +771,10 @@ class RobinhoodOptionClient:
         payload = self.build_option_order(
             legs, direction, quantity, order_type, price, time_in_force, account_number
         )
-        return self._connector.review_option_order(**self._wire_payload(payload))
+        return self._connector.review_option_order(**self._wire_payload(payload, for_review=True))
 
     @staticmethod
-    def _wire_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    def _wire_payload(payload: Mapping[str, Any], *, for_review: bool = False) -> dict[str, Any]:
         """The payload actually handed to the connector: a copy of the built
         payload with each leg stripped to the connector's allowed key set. The
         built payload keeps the extra contract-identifying fields for the caps /
@@ -777,13 +785,22 @@ class RobinhoodOptionClient:
         not a field the connector's single-leg order schema takes -- a single
         buy-to-open long is unambiguously a debit -- so it is dropped from the wire
         for a single-leg order. It is retained for a multi-leg order, where a
-        spread's net direction is meaningful. `ref_id` (the idempotency key) is
-        carried through unchanged so a retry de-dupes at the venue."""
+        spread's net direction is meaningful.
+
+        `ref_id` (the idempotency key) is a PLACE-only field: place_option_order
+        accepts it (so a retry de-dupes at the venue), but review_option_order is
+        additionalProperties:false and takes no ref_id -- a review call carrying it
+        would InputValidationError. This shared helper builds BOTH wires, so
+        `for_review` strips every place-only key (ref_id and any future sibling)
+        from the review payload while the place payload keeps them."""
         wire = dict(payload)
         legs = [_connector_leg(leg) for leg in payload.get("legs", [])]
         wire["legs"] = legs
         if len(legs) == 1:
             wire.pop("direction", None)
+        if for_review:
+            for key in _PLACE_ONLY_WIRE_KEYS:
+                wire.pop(key, None)
         return wire
 
     # --- place (double gate + arm; the only path that can submit) -------------

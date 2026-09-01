@@ -25,6 +25,38 @@ LONG_CALL = "OPT-AAPL-CALL"
 SHORT_CALL = "OPT-AAPL-CALL-HIGHER"
 
 
+# The EXACT top-level key set the real review_option_order schema accepts
+# (additionalProperties:false). Notably it carries NO `ref_id` -- the idempotency
+# key is a place-only field -- so a review payload carrying ref_id would
+# InputValidationError at the venue. A permissive stub that swallowed ref_id let
+# that regression hide; this set makes the review wire's key projection
+# load-bearing.
+_REVIEW_ALLOWED_KEYS = frozenset(
+    {
+        "account_number",
+        "chain_symbol",
+        "direction",
+        "legs",
+        "market_hours",
+        "price",
+        "quantity",
+        "stop_price",
+        "time_in_force",
+        "type",
+        "underlying_type",
+    }
+)
+
+
+def _assert_review_schema_keys(kwargs):
+    """The real review_option_order schema is additionalProperties:false and takes
+    no ref_id. Reject any key outside the allowed set (chiefly a place-only ref_id)
+    so a review wire that ships ref_id fails here exactly as it would at the venue."""
+    assert "ref_id" not in kwargs, f"review payload carries place-only 'ref_id': {sorted(kwargs)}"
+    extra = set(kwargs) - _REVIEW_ALLOWED_KEYS
+    assert not extra, f"review payload carries schema-forbidden keys {sorted(extra)} (additionalProperties:false)"
+
+
 def _assert_connector_leg_shape(legs):
     """The real Robinhood options MCP order schema requires each leg to carry
     `option_id` (the option instrument UUID) -- NOT the legacy `option` key. A
@@ -101,6 +133,7 @@ class FakeConnector:
 
     def review_option_order(self, **kwargs):
         _assert_connector_leg_shape(kwargs.get("legs"))
+        _assert_review_schema_keys(kwargs)
         self.review_calls.append(kwargs)
         return {"reviewed": True, **kwargs}
 
@@ -946,6 +979,67 @@ def test_explicit_ref_id_overrides_the_derived_key():
     assert connector.place_calls[0]["ref_id"] == "operator-supplied-key-123"
 
 
+# --- ref_id is PLACE-only: the review wire must not ship it --------------------
+# review_option_order is additionalProperties:false and takes no ref_id, while the
+# built payload (and the place wire) carry one. The shared _wire_payload builds
+# both, so the review wire must strip ref_id (and any other place-only key) or a
+# real review call InputValidationErrors at the venue.
+
+
+def test_review_wire_payload_omits_ref_id_and_carries_only_review_schema_keys():
+    """MUTATION TEST: a review call hands the connector a payload with NO ref_id
+    and NO other key outside the review schema's allowed set. Drop the for_review
+    strip (ship the place wire to review) and ref_id rides along -- the FakeConnector's
+    review-schema guard fires exactly as the real additionalProperties:false venue would."""
+    connector = FakeConnector()
+    client = make_client(connector)
+
+    client.review_order(long_legs(), direction="debit", quantity="1", price="1.00")
+
+    reviewed = connector.review_calls[0]
+    assert "ref_id" not in reviewed
+    # A single-leg long: direction is a lane hint dropped at the wire too, so the
+    # review payload is exactly account_number / legs / quantity / type /
+    # time_in_force / price -- every one an allowed review-schema key.
+    assert set(reviewed) == {"account_number", "legs", "quantity", "type", "time_in_force", "price"}
+    assert set(reviewed) <= _REVIEW_ALLOWED_KEYS
+
+
+def test_place_wire_still_carries_ref_id_while_review_wire_does_not():
+    """Precision: the place-only strip is REVIEW-only. The very same built order,
+    sent to place, keeps its ref_id (so a retry de-dupes at the venue); sent to
+    review, drops it. Proves _wire_payload's for_review branch, not a blanket removal."""
+    connector = FakeConnector()
+    client = make_client(connector, armed=True)
+
+    built = client.build_option_order(long_legs(), direction="debit", quantity="1", price="1.00")
+    place_wire = client._wire_payload(built)
+    review_wire = client._wire_payload(built, for_review=True)
+
+    assert place_wire["ref_id"] == built["ref_id"]
+    assert "ref_id" not in review_wire
+
+
+def test_review_wire_keeps_direction_but_omits_ref_id_on_a_multi_leg_order():
+    """A multi-leg order retains `direction` on the wire (a spread's net direction
+    is meaningful and the review schema accepts it), yet still drops the place-only
+    ref_id. Guards against a strip that keys off leg count instead of place-vs-review."""
+    connector = FakeConnector()
+    client = make_client(connector)
+    # A long multi-leg (two buy-to-open legs) -- defined risk, so it clears the build.
+    multi = [
+        {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option": LONG_CALL},
+        {"side": "buy", "position_effect": "open", "ratio_quantity": 1, "option": SHORT_CALL},
+    ]
+
+    client.review_order(multi, direction="debit", quantity="1", price="2.00")
+
+    reviewed = connector.review_calls[0]
+    assert reviewed["direction"] == "debit"
+    assert "ref_id" not in reviewed
+    assert set(reviewed) <= _REVIEW_ALLOWED_KEYS
+
+
 # --- cancel mirrors the same dry_run/confirm gate (no arm required) -----------
 
 
@@ -1205,6 +1299,103 @@ def test_client_open_exposure_from_positions_sums_premium_and_max_loss():
     )
     client = make_client(connector, armed=True)
     assert client._open_premium_at_risk_from_positions() == 550.0
+
+
+# The REAL Robinhood get_option_positions response: a `results` list (alongside a
+# `next` pagination field), each position carrying the venue's ACTUAL field names
+# and string-formatted values -- not a tidy, permissive self-authored fake. The
+# standing-exposure sourcing is proven against THIS shape so it cannot silently
+# read $0 (and void the total-at-risk cap) against the payload it will really see.
+_RECORDED_OPTION_POSITIONS = {
+    "next": None,
+    "results": [
+        {  # an OPEN long: 4 contracts, $2.50 premium/share -> 2.50 x 100 x 4 = $1,000
+            "account": "https://api.robinhood.com/accounts/1AB23456/",
+            "average_price": "2.5000",
+            "chain_id": "b1e2c3d4-5678-90ab-cdef-1234567890ab",
+            "chain_symbol": "AAPL",
+            "created_at": "2026-08-20T14:31:09.123456Z",
+            "id": "pos-1",
+            "option": "https://api.robinhood.com/options/instruments/uuid-1/",
+            "option_id": "uuid-1",
+            "pending_buy_quantity": "0.0000",
+            "pending_sell_quantity": "0.0000",
+            "quantity": "4.0000",
+            "intraday_quantity": "0.0000",
+            "intraday_average_open_price": "0.0000",
+            "trade_value_multiplier": "100.0000",
+            "type": "long",
+            "updated_at": "2026-08-20T14:31:09.123456Z",
+            "url": "https://api.robinhood.com/options/positions/pos-1/",
+        },
+        {  # a second OPEN long: 2 contracts, $2.00 premium/share -> 2.00 x 100 x 2 = $400
+            "account": "https://api.robinhood.com/accounts/1AB23456/",
+            "average_price": "2.0000",
+            "chain_symbol": "MSFT",
+            "option_id": "uuid-2",
+            "quantity": "2.0000",
+            "intraday_average_open_price": "0.0000",
+            "trade_value_multiplier": "100.0000",
+            "type": "long",
+        },
+        {  # CLOSED: the real API returns zero-quantity positions too -> ignored
+            "average_price": "9.9900",
+            "chain_symbol": "TSLA",
+            "option_id": "uuid-3",
+            "quantity": "0.0000",
+            "trade_value_multiplier": "100.0000",
+            "type": "long",
+        },
+    ],
+}
+
+
+class RecordedShapePositionsConnector(FakeConnector):
+    """Returns the realistic recorded get_option_positions payload verbatim, so the
+    sourcing is exercised against the venue's real `results` wrapper and field
+    names -- not the permissive `{"positions": [...]}` shape the other fakes use."""
+
+    def get_option_positions(self, account_number=None):
+        self.position_calls.append({"account_number": account_number})
+        return _RECORDED_OPTION_POSITIONS
+
+
+def test_open_exposure_sourced_from_the_real_recorded_positions_shape():
+    """MUTATION TEST (item 3): fed the REAL Robinhood response -- a `results` list
+    of positions using the venue's actual field names (average_price / quantity /
+    trade_value_multiplier / type) with string values and noise fields, plus a
+    closed zero-quantity position -- the sourcing sums the two OPEN longs
+    (2.50x100x4 + 2.00x100x2 = $1,400) under the lane's per-share premium
+    convention and ignores the closed one. Grounds the sourcing on the shape it
+    will really see: revert `_as_position_list` to only unwrap `positions` (not
+    `results`), or the premium/quantity field lists to miss `average_price`/
+    `quantity`, and this reads $0 -- silently voiding the total-at-risk cap on
+    live positions."""
+    connector = RecordedShapePositionsConnector()
+    client = make_client(connector, armed=True)
+
+    assert client._open_premium_at_risk_from_positions() == 1400.0
+
+
+def test_recorded_shape_open_exposure_binds_the_total_at_risk_cap_end_to_end():
+    """The real-shape standing exposure flows all the way into the submit-path cap:
+    $1,400 already at risk (from the recorded positions) + a new $200 long
+    (1 x $2.00 x 100, itself within the $500 per-trade debit cap) = $1,600, over
+    the $1,500 total-at-risk cap. The client self-sources from the real shape and
+    BLOCKS on the TOTAL cap -- connector never called -- even though the caller
+    passes the 0.0 open-at-risk default."""
+    connector = RecordedShapePositionsConnector()
+    client = make_client(connector, armed=True)
+
+    result = client.place_option_order(
+        long_legs(), quantity="1", price="2.00", days_to_expiry=30,
+        dry_run=False, confirm_live_order=True,  # open_premium_at_risk_usd defaults 0.0
+    )
+
+    assert result["submitted"] is False
+    assert result["status"] == "options_risk_gate_blocked"
+    assert "max_total_premium_at_risk" in result["risk_gate"]
+    assert connector.place_calls == []
 
 
 # (4) LONG AT-RISK FROM DEBIT -------------------------------------------------
