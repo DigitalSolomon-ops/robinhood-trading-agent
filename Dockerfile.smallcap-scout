@@ -16,6 +16,8 @@ RUN pip install --no-cache-dir \
 COPY src/__init__.py ./src/__init__.py
 COPY src/market_data_fields.py ./src/market_data_fields.py
 COPY src/market_hours.py ./src/market_hours.py
+COPY src/scout_email_branding.py ./src/scout_email_branding.py
+COPY assets/logo-email.png ./assets/logo-email.png
 COPY src/smallcap_scout/ ./src/smallcap_scout/
 COPY src/options_scout/ ./src/options_scout/
 COPY src/equity_intelligence/ ./src/equity_intelligence/

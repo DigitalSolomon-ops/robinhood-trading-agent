@@ -14,10 +14,9 @@ import html
 import smtplib
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from typing import Any
 
+from .. import scout_email_branding as branding
 from .config import resolve_from_addr, resolve_gmail_app_password, resolve_to_addr
 from .scanner import ScoutPick, _fmt_float
 
@@ -148,12 +147,7 @@ def render_email_html(picks: list[ScoutPick], today: date) -> str:
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
          style="max-width:620px;background:#ffffff;border-radius:10px;overflow:hidden;
                 font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
-    <tr><td style="background:#0b2440;padding:18px 16px;">
-      <div style="color:#fff;font-size:18px;font-weight:700;">Small-Cap Scout</div>
-      <div style="color:#9fb0cc;font-size:13px;margin-top:2px;">
-        {_e(today.isoformat())} &middot; {len(picks)} ranked momentum names &middot; analysis only
-      </div>
-    </td></tr>
+    {branding.branded_header("Small-Cap Scout", f"{today.isoformat()} · {len(picks)} ranked momentum names · analysis only", accent="#0b2440")}
     <tr><td style="padding:12px 16px 0 16px;">
       <div style="border:1px solid #c9d4e2;background:#f2f6fb;border-radius:8px;
                   padding:10px 12px;color:#274060;font-size:12px;line-height:1.5;">
@@ -252,12 +246,13 @@ def send_or_preview(
     host = email_cfg.get("smtp_host", "smtp.gmail.com")
     port = int(email_cfg.get("smtp_port", 465))
 
-    message = MIMEMultipart("alternative")
-    message["Subject"] = subject
-    message["From"] = from_addr
-    message["To"] = ", ".join(recipients)
-    message.attach(MIMEText("This is an HTML email; enable HTML to read the Small-Cap Scout watchlist.", "plain", "utf-8"))
-    message.attach(MIMEText(body, "html", "utf-8"))
+    message = branding.build_message(
+        subject,
+        from_addr,
+        ", ".join(recipients),
+        body,
+        "This is an HTML email; enable HTML to read the Small-Cap Scout watchlist.",
+    )
 
     # Port 465 uses implicit SSL (SMTP_SSL, no STARTTLS); 587 uses STARTTLS.
     # Many networks block 587 while leaving 465 open, so 465 is the safer default.

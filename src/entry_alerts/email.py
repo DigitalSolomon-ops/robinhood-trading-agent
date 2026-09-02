@@ -15,10 +15,9 @@ import html
 import smtplib
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from typing import Any
 
+from .. import scout_email_branding as branding
 from .config import resolve_from_addr, resolve_gmail_app_password, resolve_to_addr
 from .store import PlayRecord
 
@@ -128,12 +127,7 @@ def render_email_html(hits: list[Hit], today: date) -> str:
   <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
          style="max-width:520px;background:#ffffff;border-radius:10px;overflow:hidden;
                 font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
-    <tr><td style="background:#12203a;padding:16px 14px;">
-      <div style="color:#fff;font-size:17px;font-weight:700;">Entry-Hit Alert</div>
-      <div style="color:#9fb0cc;font-size:12px;margin-top:2px;">
-        {_e(today.isoformat())} &middot; {len(hits)} new hit{'s' if len(hits) != 1 else ''} &middot; notification only
-      </div>
-    </td></tr>
+    {branding.branded_header("Entry-Hit Alert", f"{today.isoformat()} · {len(hits)} new hit{'s' if len(hits) != 1 else ''} · notification only", accent="#12203a")}
     <tr><td style="padding:14px;">
       <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
         {rows}
@@ -202,12 +196,13 @@ def send_or_preview(
     host = email_cfg.get("smtp_host", "smtp.gmail.com")
     port = int(email_cfg.get("smtp_port", 465))
 
-    message = MIMEMultipart("alternative")
-    message["Subject"] = subject
-    message["From"] = from_addr
-    message["To"] = to_addr
-    message.attach(MIMEText("This is an HTML email; enable HTML to read the entry-hit alert.", "plain", "utf-8"))
-    message.attach(MIMEText(body, "html", "utf-8"))
+    message = branding.build_message(
+        subject,
+        from_addr,
+        to_addr,
+        body,
+        "This is an HTML email; enable HTML to read the entry-hit alert.",
+    )
 
     # Port 465 uses implicit SSL (SMTP_SSL, no STARTTLS); 587 uses STARTTLS.
     # Many networks block 587 while leaving 465 open, so 465 is the safer default.

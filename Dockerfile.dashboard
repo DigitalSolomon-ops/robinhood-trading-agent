@@ -18,6 +18,9 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY src/ ./src/
 COPY config/ ./config/
+# The dashboard serves /assets/logo.png (favicon + header); without this the app
+# 404s the logo. Ships the brand assets into the image.
+COPY assets/ ./assets/
 RUN mkdir -p data logs
 
 # ADC on Cloud Run (never shell out to gcloud in-container); IAP assertion is
