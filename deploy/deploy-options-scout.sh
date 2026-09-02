@@ -48,17 +48,30 @@ if ! gcloud iam service-accounts describe "$SA" --project="$PROJECT" >/dev/null 
     sleep 5
   done
 fi
-for S in massive-api gmail-app-password; do
+# finnhub is optional (Phase 4 enrichment); bind it too when the secret exists.
+for S in massive-api gmail-app-password finnhub; do
+  gcloud secrets describe "$S" --project="$PROJECT" >/dev/null 2>&1 || continue
   gcloud secrets add-iam-policy-binding "$S" --project="$PROJECT" \
     --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor" >/dev/null \
     || echo "   (skipped $S binding — already present, or account lacks secret setIamPolicy; safe to continue)"
 done
 
+# Inject the Finnhub key only when the secret exists AND the runtime SA can read
+# it -- otherwise Cloud Run would refuse the revision. Enrichment stays dormant
+# (email unchanged) until both are true.
+SECRETS="MASSIVE_API_KEY=massive-api:latest,GMAIL_APP_PASSWORD=gmail-app-password:latest"
+if gcloud secrets describe finnhub --project="$PROJECT" >/dev/null 2>&1; then
+  SECRETS="${SECRETS},FINNHUB_API_KEY=finnhub:latest"
+  echo "==> Finnhub enrichment ON (injecting FINNHUB_API_KEY from secret 'finnhub')"
+else
+  echo "==> Finnhub enrichment OFF (no 'finnhub' secret); email still sends"
+fi
+
 echo "==> Deploy Cloud Run Job (secrets injected as env)"
 gcloud run jobs deploy "$JOB" --project="$PROJECT" --region="$REGION" \
   --image="$IMAGE" --service-account="$SA" \
   --set-env-vars="DS_VAULT_NO_GCLOUD=1" \
-  --set-secrets="MASSIVE_API_KEY=massive-api:latest,GMAIL_APP_PASSWORD=gmail-app-password:latest" \
+  --set-secrets="$SECRETS" \
   --max-retries=1 --task-timeout=900s --memory=512Mi
 
 echo "==> Allow the scheduler SA to run the job"

@@ -39,7 +39,23 @@ def run_options_scout_email(
     return send_or_preview(
         plays, config, dry_run=dry_run, out_path=out_path, today=today, print_fn=print_fn,
         extra_recipients=_report_recipients(),
+        enrichment=_build_enrichment(plays, today, config),
     )
+
+
+def _build_enrichment(plays: list[Any], today: Any, config: dict[str, Any]) -> dict[str, Any]:
+    """Best-effort Finnhub event context (earnings-in-horizon + latest headline)
+    for the play symbols. Any failure or a missing API key yields {}, so the
+    email renders exactly as before -- enrichment is a bonus, the email is the
+    product."""
+    try:
+        from ..scout_enrichment.enrichment import enrich_symbols
+
+        symbols = [str(getattr(play, "symbol", "")) for play in plays]
+        horizon = int((config.get("enrichment") or {}).get("earnings_horizon_days", 14))
+        return enrich_symbols(symbols, today=today, earnings_horizon_days=horizon)
+    except Exception:
+        return {}
 
 
 def _report_recipients() -> list[str]:

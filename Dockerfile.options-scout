@@ -18,6 +18,7 @@ COPY src/market_hours.py ./src/market_hours.py
 COPY src/scout_email_branding.py ./src/scout_email_branding.py
 COPY assets/logo-email.png ./assets/logo-email.png
 COPY src/options_scout/ ./src/options_scout/
+COPY src/scout_enrichment/ ./src/scout_enrichment/
 COPY src/equity_intelligence/ ./src/equity_intelligence/
 COPY src/entry_alerts/ ./src/entry_alerts/
 COPY config/options_scout.yaml ./config/options_scout.yaml

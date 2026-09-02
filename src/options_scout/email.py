@@ -144,7 +144,40 @@ def _badge(direction: str) -> str:
     )
 
 
-def _play_block(rank: int, play: Play) -> str:
+def _enrichment_block(enrich: Any) -> str:
+    """Finnhub event context for one play: an EARNINGS-in-horizon warning (the big
+    risk for an options play -- IV crush + gap) and/or a recent news headline.
+    Returns "" when there is nothing to add (the common no-key case)."""
+    if enrich is None:
+        return ""
+    parts: list[str] = []
+    if getattr(enrich, "earnings_in_horizon", False) and getattr(enrich, "earnings_date", None):
+        days = getattr(enrich, "days_to_earnings", None)
+        when = f"in {days}d " if isinstance(days, int) else ""
+        parts.append(
+            '<div style="margin-top:8px;font-size:12px;color:#8a2b00;background:#fff1e6;'
+            'border:1px solid #ffd2ad;border-radius:4px;padding:6px 8px;">'
+            f"&#9888; <strong>EARNINGS {when}</strong>({_e(enrich.earnings_date)}) "
+            "&mdash; expect elevated IV and gap risk across this play.</div>"
+        )
+    elif getattr(enrich, "earnings_date", None):
+        days = getattr(enrich, "days_to_earnings", None)
+        tail = f" ({days}d)" if isinstance(days, int) else ""
+        parts.append(
+            '<div style="margin-top:8px;font-size:12px;color:#8a9099;">'
+            f"Next earnings: {_e(enrich.earnings_date)}{_e(tail)}</div>"
+        )
+    if getattr(enrich, "headline", None):
+        source = getattr(enrich, "headline_source", None)
+        src_html = f' <span style="color:#9098a4;">({_e(source)})</span>' if source else ""
+        parts.append(
+            '<div style="margin-top:6px;font-size:12px;color:#444;">'
+            f"<strong>News:</strong> {_e(enrich.headline)}{src_html}</div>"
+        )
+    return "".join(parts)
+
+
+def _play_block(rank: int, play: Play, enrichment: Any = None) -> str:
     strike = f"{play.strike:g}" if play.strike is not None else "n/a"
     expiry = play.expiry_date or "n/a"
     ticker = play.contract_ticker or "(no listed contract matched)"
@@ -183,6 +216,7 @@ def _play_block(rank: int, play: Play) -> str:
             </tr>
           </table>
           {_economics_block(play)}
+          {_enrichment_block(enrichment)}
           <div style="margin-top:10px;font-size:13px;color:#333;">
             <strong>Hit rate:</strong> {play.hit_rate.hit_rate * 100:.0f}%
             over {play.hit_rate.occurrences} past occurrences{lc}
@@ -197,9 +231,13 @@ def _play_block(rank: int, play: Play) -> str:
     </td></tr>"""
 
 
-def render_email_html(plays: list[Play], today: date) -> str:
+def render_email_html(plays: list[Play], today: date, enrichment: dict[str, Any] | None = None) -> str:
+    enrichment = enrichment or {}
     if plays:
-        rows = "".join(_play_block(i + 1, p) for i, p in enumerate(plays))
+        rows = "".join(
+            _play_block(i + 1, p, enrichment.get(str(p.symbol).upper()))
+            for i, p in enumerate(plays)
+        )
     else:
         rows = (
             '<tr><td style="padding:16px;font-size:14px;color:#444;">'
@@ -245,10 +283,13 @@ def render_email_html(plays: list[Play], today: date) -> str:
 
 
 def compose_email(
-    plays: list[Play], config: dict[str, Any], today: date | None = None
+    plays: list[Play],
+    config: dict[str, Any],
+    today: date | None = None,
+    enrichment: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
     today = today or datetime.now(UTC).date()
-    return build_subject(plays, today), render_email_html(plays, today)
+    return build_subject(plays, today), render_email_html(plays, today, enrichment)
 
 
 def _recipient_set(to_addr: str, extra_recipients: list[str] | None) -> list[str]:
@@ -274,16 +315,18 @@ def send_or_preview(
     smtp_factory: Any = None,
     print_fn: Any = print,
     extra_recipients: list[str] | None = None,
+    enrichment: dict[str, Any] | None = None,
 ) -> EmailResult:
     """Compose the email, then either send it (Gmail SMTP + STARTTLS) or, in
     dry-run, print/write it WITHOUT opening any SMTP connection.
 
     `to_addr` (the config/env default) stays the primary recipient; any
     `extra_recipients` (the operator-managed report list) are added and deduped.
+    `enrichment` is the optional Finnhub per-symbol event context.
     `smtp_factory` is only for tests -- it must never be exercised in dry-run.
     """
     today = today or datetime.now(UTC).date()
-    subject, body = compose_email(plays, config, today)
+    subject, body = compose_email(plays, config, today, enrichment)
     to_addr = resolve_to_addr(config)
     from_addr = resolve_from_addr(config)
     recipients = _recipient_set(to_addr, extra_recipients)
