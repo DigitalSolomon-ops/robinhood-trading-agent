@@ -370,6 +370,8 @@ Co = "tests/test_robinhood_option_client.py::"
 Rg = "tests/test_option_risk_gates.py::"
 Ro = "tests/test_option_runtime.py::"
 O = "tests/test_option_readiness.py::"
+Dp = "tests/test_defined_risk_polarity.py::"
+Tc = "tests/test_option_trader_cycle.py::"
 
 
 GATES: tuple[Gate, ...] = (
@@ -413,6 +415,13 @@ GATES: tuple[Gate, ...] = (
             Co + "test_place_submits_only_when_dry_run_false_and_confirm_true_and_armed",
             Co + "test_place_refuses_to_submit_when_the_options_lane_is_disarmed",
             Co + "test_place_refuses_to_submit_when_no_arm_store_is_wired",
+            # The co-located trader RUNTIME's own arm gate (the seam the paper loop
+            # does not apply itself): disarmed / DisarmedArmStore no-op, and a live
+            # request cannot bypass the gate. Pinned so a skip cannot retire it.
+            Tc + "test_disarmed_is_a_noop_zero_fills",
+            Tc + "test_live_request_cannot_bypass_the_arm_gate",
+            Tc + "test_disarmed_arm_store_fails_closed",
+            Tc + "test_armed_and_open_runs_one_paper_cycle",
         ),
     ),
     Gate(
@@ -450,6 +459,11 @@ GATES: tuple[Gate, ...] = (
             Ro + "test_options_kill_switch_is_its_own_file_not_the_crypto_or_equities_stop",
             Ro + "test_options_stop_file_halts_the_loop_immediately",
             Ro + "test_trading_enabled_false_halts_the_loop",
+            # The co-located trader RUNTIME honors the kill switch on an armed lane:
+            # TRADING_ENABLED=false and the STOP_TRADING_OPTIONS file each halt the
+            # cycle (no fills). Pinned so a skip cannot retire it.
+            Tc + "test_armed_but_env_disabled_halts",
+            Tc + "test_armed_but_stop_file_halts",
         ),
         evidence=lane_isolation_evidence,
     ),
@@ -479,6 +493,15 @@ GATES: tuple[Gate, ...] = (
             Bo + "test_a_short_call_covered_by_a_long_put_is_refused",
             Bo + "test_empty_legs_refused",
             Ro + "test_an_undefined_risk_leg_never_books_a_paper_fill",
+            # The FAIL-CLOSED polarity of the defined-risk floor: ANY sell not
+            # provably sell-to-close is refused (effect-less / blank / opening),
+            # and a genuine sell-to-close / single long still passes. Pinned so a
+            # skip cannot retire the polarity regression tests.
+            Dp + "test_any_sell_not_provably_close_is_refused",
+            Dp + "test_classify_marks_an_effectless_sell_unsupported",
+            Dp + "test_a_naked_ratio_is_refused_by_the_floor",
+            Dp + "test_a_genuine_sell_to_close_is_still_allowed",
+            Dp + "test_a_single_opening_long_still_passes",
         ),
     ),
     Gate(
