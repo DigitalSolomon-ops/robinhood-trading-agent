@@ -65,7 +65,10 @@ def _persist_for_alerts(picks: list[Any], day: str) -> None:
         from ..entry_alerts.store import record_from_smallcap_pick, save_plays
 
         records = [
-            record for record in (record_from_smallcap_pick(pick, day) for pick in picks)
+            record
+            for record in (
+                record_from_smallcap_pick(pick, day, rank=i + 1) for i, pick in enumerate(picks)
+            )
             if record is not None
         ]
         if records:

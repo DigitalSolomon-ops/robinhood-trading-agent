@@ -65,7 +65,10 @@ def _persist_for_alerts(plays: list[Any], day: str) -> None:
         from ..entry_alerts.store import record_from_options_play, save_plays
 
         records = [
-            record for record in (record_from_options_play(play, day) for play in plays)
+            record
+            for record in (
+                record_from_options_play(play, day, rank=i + 1) for i, play in enumerate(plays)
+            )
             if record is not None
         ]
         if records:

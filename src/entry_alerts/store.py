@@ -59,10 +59,28 @@ BULLISH_DIRECTIONS = frozenset({"call", "long"})
 BEARISH_DIRECTIONS = frozenset({"put", "short"})
 
 
+def _opt_float(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_int(value: Any) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class PlayRecord:
-    """One day's active play, reduced to exactly what the alert needs. Levels
-    are on the UNDERLYING; nothing here is an order or a live quote."""
+    """One day's active play. Levels are on the UNDERLYING; nothing here is an
+    order or a live quote. The optional predictive-feature fields (conviction,
+    predicted_hit_rate, ...) are what the scout FORECAST at publish time -- the
+    calibration engine compares them to the settlement engine's realized outcome.
+    They round-trip through from_dict/to_json so a same-day mark_fired re-save
+    never drops them."""
 
     id: str
     source: str  # "options" | "smallcap"
@@ -72,6 +90,11 @@ class PlayRecord:
     target: float
     stop: float
     date: str  # YYYY-MM-DD
+    # --- optional predictive features (present for options plays; None otherwise) ---
+    conviction: float | None = None  # 0..100 rank/confidence the scout assigned
+    predicted_hit_rate: float | None = None  # backtested target-before-stop rate, 0..1
+    hit_rate_occurrences: int | None = None  # backtest sample size behind that rate
+    rank: int | None = None  # 1-based position in that day's ranked email
 
     @property
     def bullish(self) -> bool:
@@ -89,6 +112,10 @@ class PlayRecord:
                 target=float(raw["target"]),
                 stop=float(raw["stop"]),
                 date=str(raw.get("date", "")),
+                conviction=_opt_float(raw.get("conviction")),
+                predicted_hit_rate=_opt_float(raw.get("predicted_hit_rate")),
+                hit_rate_occurrences=_opt_int(raw.get("hit_rate_occurrences")),
+                rank=_opt_int(raw.get("rank")),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -145,12 +172,14 @@ def make_play_id(source: str, symbol: str, direction: str, day: str) -> str:
     return f"{source}:{symbol.upper()}:{direction.lower()}:{day}"
 
 
-def record_from_options_play(play: Any, day: str) -> PlayRecord | None:
+def record_from_options_play(play: Any, day: str, *, rank: int | None = None) -> PlayRecord | None:
     """Build a PlayRecord from an options_scout Play (duck-typed).
 
-    Uses the Play's `entry` and its direction-aware `target`/`stop` properties.
-    Returns None if a required level is missing/uncastable -- the caller swallows
-    that, so a malformed play never breaks the email."""
+    Uses the Play's `entry` and its direction-aware `target`/`stop` properties,
+    and captures the play's PREDICTIVE features (conviction + backtested hit rate)
+    for the calibration engine. Returns None if a required level is missing/
+    uncastable -- the caller swallows that, so a malformed play never breaks the
+    email."""
     try:
         symbol = str(play.symbol)
         direction = str(play.direction)
@@ -159,6 +188,7 @@ def record_from_options_play(play: Any, day: str) -> PlayRecord | None:
         stop = float(play.stop)
     except (AttributeError, TypeError, ValueError):
         return None
+    hit_rate = getattr(play, "hit_rate", None)
     return PlayRecord(
         id=make_play_id(SOURCE_OPTIONS, symbol, direction, day),
         source=SOURCE_OPTIONS,
@@ -168,15 +198,20 @@ def record_from_options_play(play: Any, day: str) -> PlayRecord | None:
         target=target,
         stop=stop,
         date=day,
+        conviction=_opt_float(getattr(play, "conviction", None)),
+        predicted_hit_rate=_opt_float(getattr(hit_rate, "hit_rate", None)),
+        hit_rate_occurrences=_opt_int(getattr(hit_rate, "occurrences", None)),
+        rank=_opt_int(rank),
     )
 
 
-def record_from_smallcap_pick(pick: Any, day: str) -> PlayRecord | None:
+def record_from_smallcap_pick(pick: Any, day: str, *, rank: int | None = None) -> PlayRecord | None:
     """Build a PlayRecord from a smallcap_scout ScoutPick (duck-typed).
 
     Small-cap picks are long-only momentum continuations; their levels live on
     `pick.levels`. A pick without computed levels yields None (no entry to alert
-    on)."""
+    on). Small caps carry no conviction/backtested-hit-rate, so those predictive
+    features stay None; only the ranked position is captured."""
     levels = getattr(pick, "levels", None)
     if levels is None:
         return None
@@ -197,6 +232,7 @@ def record_from_smallcap_pick(pick: Any, day: str) -> PlayRecord | None:
         target=target,
         stop=stop,
         date=day,
+        rank=_opt_int(rank),
     )
 
 

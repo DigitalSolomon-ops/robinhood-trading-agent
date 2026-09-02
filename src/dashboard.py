@@ -272,6 +272,11 @@ def dashboard_app(root: Path = ROOT) -> FastAPI:
         day = request.query_params.get("day")
         return page("Scout Reports", scout_reports_html(app.state.root, day))
 
+    @app.get("/calibration", response_class=HTMLResponse)
+    def calibration() -> str:
+        # ANALYSIS/DISPLAY ONLY: predicted-vs-realized accuracy over settled plays.
+        return page("Scout Calibration", calibration_html(app.state.root))
+
     @app.get("/scout-recipients", response_class=HTMLResponse)
     def scout_recipients() -> str:
         return page("Report Recipients", scout_recipients_html(app.state.root))
@@ -1116,6 +1121,115 @@ def scout_reports_html(root: Path, selected_day: str | None = None) -> str:
     )
 
 
+def _fmt_rate(value: Any) -> str:
+    """A 0..1 rate rendered as a percentage, or an em dash when absent."""
+    return f"{value * 100:.1f}%" if isinstance(value, (int, float)) else "—"
+
+
+def calibration_html(root: Path) -> str:
+    """Predicted-vs-realized accuracy over settled plays. ANALYSIS/DISPLAY ONLY --
+    surfaces whether the scout's conviction ranks outcomes correctly and whether
+    its backtested hit-rate matches reality. Never trades, never tunes weights."""
+    bucket = _entry_alerts_bucket()
+    try:
+        from .scout_calibration.calibration import load_calibration
+
+        report = load_calibration(days=60, bucket=bucket)
+    except Exception as exc:  # a read/compute hiccup must not crash the tab
+        return f'<p class="warn">Calibration is unavailable right now ({escape(str(exc))}).</p>'
+
+    intro = (
+        '<p class="muted">How trustworthy is the scout\'s own confidence? This compares '
+        "what it FORECAST (conviction, backtested hit-rate) against what the settlement "
+        "engine REALIZED (target hit before stop). It only surfaces the numbers &mdash; it "
+        "never trades and does not auto-tune any weight.</p>"
+    )
+
+    settled = report.get("settled", 0)
+    if not settled:
+        openn = report.get("open", 0)
+        return (
+            intro
+            + '<p class="warn">No settled plays yet'
+            + (f" ({openn} still open)." if openn else ".")
+            + " Calibration fills in automatically as the settlement engine records "
+            "WIN/LOSS outcomes after each session closes.</p>"
+        )
+
+    drift = report.get("predicted_vs_realized_drift")
+    drift_txt = f"{drift * 100:+.1f} pts" if isinstance(drift, (int, float)) else "—"
+    drift_cls = "warn" if report.get("drift_flag") else "muted"
+    overall = (
+        f"<p><b>{escape(settled)}</b> settled play(s) &middot; "
+        f"<b>{escape(report.get('wins', 0))}W / {escape(report.get('losses', 0))}L</b> &middot; "
+        f"realized win rate <b>{_fmt_rate(report.get('realized_win_rate'))}</b> &middot; "
+        f"avg return <b>{escape(_fmt_return(report.get('avg_return_pct')))}</b> &middot; "
+        f"{escape(report.get('open', 0))} still open</p>"
+        f"<p class='{drift_cls}'>Backtested hit-rate predicted "
+        f"<b>{_fmt_rate(report.get('avg_predicted_hit_rate'))}</b> over "
+        f"{escape(report.get('n_with_prediction', 0))} play(s) with a forecast; "
+        f"realized minus predicted = <b>{escape(drift_txt)}</b>"
+        + ("  &mdash; &#9888; DRIFT beyond threshold." if report.get("drift_flag") else "")
+        + "</p>"
+    )
+
+    mono = report.get("conviction_monotonic")
+    if mono is True:
+        mono_line = '<p class="safe">Conviction ranks outcomes correctly: higher-conviction tiers realize higher win rates.</p>'
+    elif mono is False:
+        mono_line = '<p class="warn">&#9888; Conviction is NOT monotonic &mdash; a higher-conviction tier is realizing a LOWER win rate than a lower one. The ranking signal may need review.</p>'
+    else:
+        mono_line = '<p class="muted">Not enough settled plays per tier yet to judge whether conviction ranks outcomes correctly.</p>'
+
+    tier_rows = "".join(
+        "<tr>"
+        f"<td>{escape(t['label'])}</td>"
+        f"<td>{escape(t['n'])}</td>"
+        f"<td>{escape(t['wins'])}</td>"
+        f"<td>{_fmt_rate(t['win_rate'])}</td>"
+        f"<td>{escape(_fmt_optional(round(t['avg_conviction'], 1) if t.get('avg_conviction') is not None else None))}</td>"
+        f"<td>{escape(_fmt_return(t.get('avg_return_pct')))}</td>"
+        "</tr>"
+        for t in report.get("tiers", [])
+    )
+    tier_table = (
+        "<table><thead><tr><th>Conviction tier</th><th>Settled</th><th>Wins</th>"
+        "<th>Win rate</th><th>Avg conviction</th><th>Avg return</th></tr></thead>"
+        f"<tbody>{tier_rows}</tbody></table>"
+    )
+
+    source_rows = "".join(
+        f"<tr><td>{escape(src)}</td><td>{escape(s['n'])}</td>"
+        f"<td>{escape(s['wins'])}</td><td>{_fmt_rate(s['win_rate'])}</td></tr>"
+        for src, s in report.get("by_source", {}).items()
+    )
+    source_table = (
+        "<table><thead><tr><th>Source</th><th>Settled</th><th>Wins</th><th>Win rate</th></tr></thead>"
+        f"<tbody>{source_rows}</tbody></table>"
+        if source_rows
+        else "<p class='muted'>No per-source breakdown yet.</p>"
+    )
+
+    days = report.get("as_of_days", [])
+    coverage = (
+        f"<p class='muted'>Across {len(days)} report day(s)"
+        + (f", {escape(days[-1])} &rarr; {escape(days[0])}" if days else "")
+        + ".</p>"
+    )
+
+    return (
+        intro
+        + section("Overall", "Realized accuracy across every settled play, and how it compares to the scout's backtested forecast. A large gap (drift) with enough sample is flagged.")
+        + overall
+        + coverage
+        + section("By conviction tier", "Does higher conviction actually win more? If the win rate does not rise with the tier, the conviction signal is miscalibrated.")
+        + mono_line
+        + tier_table
+        + section("By source", "Realized win rate split by scout (options vs small-cap).")
+        + source_table
+    )
+
+
 def run_recipient_action(root: Path, form: dict[str, str]) -> dict[str, Any]:
     """Add or remove one report recipient. Never raises: validation failures and
     backend hiccups come back as a message the tab renders."""
@@ -1200,6 +1314,7 @@ NAV_ITEMS = [
     ("/", "Status", "Safety Status"),
     ("/equities", "Equities Lane", "Equities Lane"),
     ("/scout-reports", "Scout Reports", "Scout Reports"),
+    ("/calibration", "Calibration", "Scout Calibration"),
     ("/scout-recipients", "Report Recipients", "Report Recipients"),
     ("/live-control", "Live Control Center", "Live Control Center"),
     ("/live-readiness", "Live Readiness", "Live Readiness"),
