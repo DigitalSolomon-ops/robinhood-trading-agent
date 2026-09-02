@@ -21,7 +21,11 @@ REGION="${REGION:-us-central1}"
 JOB="${JOB:-scout-settlement}"
 REPO="${REPO:-scouts}"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${JOB}:latest"
-SA_NAME="scout-settlement-sa"
+# Reuse the entry-alerts runtime SA: it already has exactly what settlement needs
+# -- massive-api secretAccessor + objectAdmin on the shared day-state bucket --
+# and reusing it avoids needing service-account-create rights for a hands-off
+# deploy. Override with SA_NAME=scout-settlement-sa (pre-created) for isolation.
+SA_NAME="${SA_NAME:-entry-alerts-sa}"
 SA="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 SCHED_JOB="${JOB}-daily"
 BUCKET="${ENTRY_ALERTS_BUCKET:-digitalsolomon-entry-alerts}"
