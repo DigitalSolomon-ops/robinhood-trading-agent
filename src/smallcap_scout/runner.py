@@ -37,8 +37,22 @@ def run_smallcap_scout_email(
     picks = scan(client, config, today=today, now=now)
     _persist_for_alerts(picks, today.isoformat())
     return send_or_preview(
-        picks, config, dry_run=dry_run, out_path=out_path, today=today, print_fn=print_fn
+        picks, config, dry_run=dry_run, out_path=out_path, today=today, print_fn=print_fn,
+        extra_recipients=_report_recipients(),
     )
+
+
+def _report_recipients() -> list[str]:
+    """The operator-managed report distribution list, read best-effort from the
+    same GCS/local store the scout persists picks to. Additive: any failure to
+    read yields [] so the email still goes to the default operator address."""
+    try:
+        from ..entry_alerts.config import load_alerts_config, resolve_bucket
+        from ..entry_alerts.store import load_recipients
+
+        return load_recipients(bucket=resolve_bucket(load_alerts_config()))
+    except Exception:
+        return []
 
 
 def _persist_for_alerts(picks: list[Any], day: str) -> None:

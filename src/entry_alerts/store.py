@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
@@ -34,6 +35,19 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[2]
 LOCAL_DIR = ROOT / "data" / "entry_alerts"
 GCS_PREFIX = "entry-alerts"
+
+# The recipients list lives at the BUCKET ROOT (not under the per-day prefix), so
+# gs://<bucket>/recipients.json; local dev fallback is data/entry_alerts/recipients.json.
+RECIPIENTS_OBJECT = "recipients.json"
+
+# A day file name is exactly a calendar date; the recipients file is not, so the
+# report-day lister can tell them apart by shape.
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Deliberately permissive single-line email check. This is a display/config
+# surface behind IAP, not an RFC-5322 validator; it only rejects the obvious
+# garbage (no @, spaces, missing TLD) so a typo does not silently land.
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 SOURCE_OPTIONS = "options"
 SOURCE_SMALLCAP = "smallcap"
@@ -278,3 +292,236 @@ def mark_fired(ids: set[str], *, day: str, bucket: str | None = None) -> DayStat
     state.fired |= set(ids)
     _persist(state, bucket=bucket)
     return state
+
+
+# --- report reads (RAW, for the dashboard) -----------------------------------
+#
+# The dashboard renders EXACTLY what is on disk/in the bucket, including optional
+# fields the DayState dataclass drops (contract, conviction, rank, and the
+# not-yet-written actual/outcome/return the settlement engine will add later).
+# So these readers return the raw parsed JSON dicts rather than PlayRecords, and
+# never raise -- a missing bucket/day/lib degrades to a local read then to empty.
+
+
+def load_report_raw(day: str, *, bucket: str | None = None) -> dict[str, Any] | None:
+    """Return the day's raw JSON document ({date, plays:{id:{...}}, fired:[...]}),
+    or None when neither backend has it. Optional per-play fields are preserved
+    verbatim so a future outcome/actual field 'just lights up'."""
+    gcs = _gcs_bucket(bucket)
+    if gcs is not None:
+        try:
+            blob = gcs.blob(_object_name(day))
+            if blob.exists():
+                return _parse_report(blob.download_as_text())
+        except Exception:
+            pass  # fall through to local on any GCS hiccup
+    path = _local_path(day)
+    if path.exists():
+        try:
+            return _parse_report(path.read_text(encoding="utf-8"))
+        except OSError:
+            return None
+    return None
+
+
+def _parse_report(text: str) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def list_report_days(limit: int = 14, *, bucket: str | None = None) -> list[str]:
+    """The most recent calendar days that have a plays file, newest first, capped
+    at `limit`. Reads GCS when available, else the local dir. Never raises."""
+    days: set[str] = set()
+    gcs = _gcs_bucket(bucket)
+    if gcs is not None:
+        try:
+            prefix = f"{GCS_PREFIX}/"
+            for blob in gcs.list_blobs(prefix=prefix):
+                name = blob.name[len(prefix):]
+                if name.endswith(".json") and _DATE_RE.match(name[:-5]):
+                    days.add(name[:-5])
+        except Exception:
+            pass
+    if not days and LOCAL_DIR.exists():
+        try:
+            for child in LOCAL_DIR.glob("*.json"):
+                stem = child.stem
+                if _DATE_RE.match(stem):
+                    days.add(stem)
+        except OSError:
+            pass
+    return sorted(days, reverse=True)[: max(int(limit), 0)]
+
+
+def report_plays(raw: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Flatten a raw day document to a list of play dicts. Honors an optional
+    per-record `rank` (else falls back to a stable symbol/id ordering) so the
+    table has a deterministic order even though the store sorts by id."""
+    if not isinstance(raw, dict):
+        return []
+    plays = raw.get("plays")
+    if not isinstance(plays, dict):
+        return []
+    records = [rec for rec in plays.values() if isinstance(rec, dict)]
+    records.sort(key=lambda r: (_rank_key(r), str(r.get("symbol", "")), str(r.get("id", ""))))
+    return records
+
+
+def _rank_key(rec: dict[str, Any]) -> float:
+    try:
+        return float(rec.get("rank"))
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+def play_outcome(rec: dict[str, Any]) -> dict[str, Any] | None:
+    """The optional settled result for a play, from either `outcome` or `actual`.
+    Returns None when the settlement engine has not filled one yet (the common
+    case today). A present value may be a dict ({verdict, actual, return_pct,...})
+    or a bare string ('WIN'/'LOSS'/'OPEN'); both are normalized to a dict."""
+    raw = rec.get("outcome")
+    if raw is None:
+        raw = rec.get("actual")
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    return {"verdict": str(raw)}
+
+
+def report_summary(raw: dict[str, Any] | None) -> dict[str, Any]:
+    """Small header stats for a day: play count and, only when outcomes exist,
+    a running accuracy over the settled plays."""
+    records = report_plays(raw)
+    settled: list[str] = []
+    for rec in records:
+        outcome = play_outcome(rec)
+        if outcome is not None:
+            verdict = str(outcome.get("verdict", "")).strip().upper()
+            if verdict in {"WIN", "LOSS"}:
+                settled.append(verdict)
+    summary: dict[str, Any] = {"plays": len(records), "settled": len(settled)}
+    if settled:
+        wins = sum(1 for v in settled if v == "WIN")
+        summary["accuracy_pct"] = round(100.0 * wins / len(settled), 1)
+    return summary
+
+
+# --- recipients (report distribution list) -----------------------------------
+#
+# A tiny operator-managed distribution list stored as {"recipients": [...]}. The
+# dashboard reads/writes it (behind IAP); the scouts read it best-effort to widen
+# their send. It lives at the bucket ROOT so it is not mistaken for a day file.
+
+
+def valid_email(value: str) -> bool:
+    return bool(EMAIL_RE.match(value.strip())) if isinstance(value, str) else False
+
+
+def _recipients_local_path() -> Path:
+    return LOCAL_DIR / RECIPIENTS_OBJECT
+
+
+def load_recipients(*, bucket: str | None = None) -> list[str]:
+    """The current recipient list (deduped, order-preserving), or [] on any
+    missing/corrupt/unreachable backend. Never raises."""
+    gcs = _gcs_bucket(bucket)
+    if gcs is not None:
+        try:
+            blob = gcs.blob(RECIPIENTS_OBJECT)
+            if blob.exists():
+                return _parse_recipients(blob.download_as_text())
+        except Exception:
+            pass
+    path = _recipients_local_path()
+    if path.exists():
+        try:
+            return _parse_recipients(path.read_text(encoding="utf-8"))
+        except OSError:
+            return []
+    return []
+
+
+def _parse_recipients(text: str) -> list[str]:
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    values = raw.get("recipients") if isinstance(raw, dict) else raw
+    if not isinstance(values, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        addr = str(item).strip()
+        key = addr.lower()
+        if addr and key not in seen:
+            seen.add(key)
+            out.append(addr)
+    return out
+
+
+def save_recipients(recipients: list[str], *, bucket: str | None = None) -> str:
+    """Persist the list as {"recipients":[...]}. Returns the backend used
+    ("gcs" | "local"). Mirrors _persist: GCS preferred, local fallback."""
+    payload = json.dumps({"recipients": recipients}, indent=2, sort_keys=True)
+    gcs = _gcs_bucket(bucket)
+    if gcs is not None:
+        try:
+            gcs.blob(RECIPIENTS_OBJECT).upload_from_string(
+                payload, content_type="application/json"
+            )
+            return "gcs"
+        except Exception:
+            pass
+    path = _recipients_local_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+    return "local"
+
+
+def add_recipient(email: str, *, bucket: str | None = None) -> tuple[bool, str]:
+    """Validate and add one address (case-insensitive dedupe). Returns
+    (ok, message). Never writes an invalid or duplicate address."""
+    addr = (email or "").strip()
+    if not valid_email(addr):
+        return False, f"Not a valid email address: {addr or '(empty)'}"
+    current = load_recipients(bucket=bucket)
+    if any(addr.lower() == existing.lower() for existing in current):
+        return False, f"{addr} is already on the list"
+    current.append(addr)
+    save_recipients(current, bucket=bucket)
+    return True, f"Added {addr}"
+
+
+def remove_recipient(email: str, *, bucket: str | None = None) -> tuple[bool, str]:
+    """Remove one address (case-insensitive). Returns (ok, message)."""
+    addr = (email or "").strip()
+    current = load_recipients(bucket=bucket)
+    kept = [existing for existing in current if existing.lower() != addr.lower()]
+    if len(kept) == len(current):
+        return False, f"{addr or '(empty)'} was not on the list"
+    save_recipients(kept, bucket=bucket)
+    return True, f"Removed {addr}"
+
+
+def recipients_for_send(default_addr: str, *, bucket: str | None = None) -> list[str]:
+    """The full send set for a scout: the default operator address FIRST, then
+    everyone on the list, deduped (case-insensitive). Best-effort -- any failure
+    reading the list yields just [default_addr], so it can never break a send."""
+    out = [default_addr]
+    seen = {default_addr.strip().lower()}
+    try:
+        extra = load_recipients(bucket=bucket)
+    except Exception:
+        extra = []
+    for addr in extra:
+        key = addr.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(addr)
+    return out

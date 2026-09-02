@@ -265,6 +265,23 @@ def dashboard_app(root: Path = ROOT) -> FastAPI:
     def equities() -> str:
         return page("Equities Lane", equities_html(app.state.root))
 
+    @app.get("/scout-reports", response_class=HTMLResponse)
+    def scout_reports(request: Request) -> str:
+        # ANALYSIS/DISPLAY ONLY: renders the scouts' persisted daily plays.
+        # No order path, no trading gate is reachable from here.
+        day = request.query_params.get("day")
+        return page("Scout Reports", scout_reports_html(app.state.root, day))
+
+    @app.get("/scout-recipients", response_class=HTMLResponse)
+    def scout_recipients() -> str:
+        return page("Report Recipients", scout_recipients_html(app.state.root))
+
+    @app.post("/scout-recipients", response_class=HTMLResponse)
+    async def scout_recipients_action(request: Request) -> str:
+        form = await parse_form(request)
+        result = run_recipient_action(app.state.root, form)
+        return page("Report Recipients", scout_recipients_html(app.state.root, result))
+
     @app.get("/live-readiness", response_class=HTMLResponse)
     def live_readiness() -> str:
         return page("Live Readiness", live_readiness_html(app.state.root))
@@ -942,9 +959,248 @@ def equities_positions(root: Path) -> dict[str, Any]:
     }
 
 
+# --- Scout Reports + Report Recipients (ANALYSIS/DISPLAY + CONFIG ONLY) -------
+#
+# These read the scouts' persisted daily plays and manage the report
+# distribution list. They reach GCS through the entry_alerts store, whose google
+# import is LAZY and guarded, so a missing library/bucket degrades to the local
+# data/entry_alerts/ fallback rather than crashing the tab. Nothing here places,
+# reviews, or cancels an order, and no trading gate is reachable from here.
+
+
+def _scout_store() -> Any:
+    """Import the entry-alerts store lazily so a broken/absent optional
+    dependency degrades the tab to an empty state instead of failing app import."""
+    from .entry_alerts import store as scout_store  # noqa: PLC0415 (deliberate lazy import)
+
+    return scout_store
+
+
+def _entry_alerts_bucket() -> str | None:
+    """Resolve the shared entry-alerts GCS bucket (env ENTRY_ALERTS_BUCKET, then
+    config/entry_alerts.yaml gcs.bucket). None -> the local-file dev fallback."""
+    try:
+        from .entry_alerts.config import load_alerts_config, resolve_bucket  # noqa: PLC0415
+
+        return resolve_bucket(load_alerts_config())
+    except Exception:
+        return None
+
+
+def _fmt_level(value: Any) -> str:
+    """A price level for the report table: numeric -> trimmed, else the raw
+    string, else an em dash placeholder."""
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{float(value):g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _fmt_optional(value: Any) -> str:
+    return "—" if value is None or value == "" else str(value)
+
+
+def _fmt_return(value: Any) -> str:
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{float(value):+.1f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _verdict_cell(verdict: str) -> str:
+    label = verdict.strip().upper() or "PENDING"
+    cls = {"WIN": "PASS", "LOSS": "FAIL", "OPEN": "WARNING"}.get(label, "")
+    return f'<td class="{cls}">{escape(label)}</td>'
+
+
+def scout_reports_html(root: Path, selected_day: str | None = None) -> str:
+    bucket = _entry_alerts_bucket()
+    try:
+        store = _scout_store()
+        days = store.list_report_days(14, bucket=bucket)
+    except Exception:
+        days, store = [], None
+
+    intro = (
+        '<p class="muted">Read-only view of the scouts\' persisted daily plays '
+        "(options + small-cap). Every level is on the underlying. Plan-vs-actual "
+        "columns light up automatically once the settlement engine records "
+        "outcomes; until then they read <b>pending</b>. This page never trades.</p>"
+    )
+
+    if not days or store is None:
+        source = "GCS bucket " + escape(bucket) if bucket else "local data/entry_alerts"
+        return (
+            intro
+            + '<p class="warn">No scout report days found yet ('
+            + source
+            + "). The Options and Small-Cap scouts write a day file when they run; "
+            "this tab will populate on the next scout run.</p>"
+        )
+
+    active = selected_day if selected_day in days else days[0]
+    day_links = "".join(
+        f"<a href='/scout-reports?day={escape(d)}' class='badge' "
+        f"style=\"{'background:#2563eb;color:#fff;' if d == active else ''}text-decoration:none;\">{escape(d)}</a>"
+        for d in days
+    )
+
+    try:
+        raw = store.load_report_raw(active, bucket=bucket)
+        plays = store.report_plays(raw)
+        summary = store.report_summary(raw)
+    except Exception:
+        raw, plays, summary = None, [], {"plays": 0, "settled": 0}
+
+    if summary.get("settled"):
+        accuracy = f"accuracy: {summary.get('accuracy_pct')}% over {summary['settled']} settled play(s)"
+    else:
+        accuracy = "accuracy: pending first settled runs"
+    summary_line = (
+        f"<p><b>{escape(active)}</b> &middot; {summary.get('plays', 0)} play(s) "
+        f"&middot; {escape(accuracy)}</p>"
+    )
+
+    if not plays:
+        body_table = "<p>No plays recorded for this day.</p>"
+    else:
+        header = (
+            "<thead><tr>"
+            "<th>Rank</th><th>Source</th><th>Symbol</th><th>Direction</th>"
+            "<th>Entry</th><th>Target (ceiling)</th><th>Stop (floor)</th>"
+            "<th>Contract</th><th>Conviction</th>"
+            "<th>Actual</th><th>Verdict</th><th>Return</th>"
+            "</tr></thead>"
+        )
+        rows = []
+        for index, rec in enumerate(plays, start=1):
+            rank = rec.get("rank") or index
+            outcome = store.play_outcome(rec)
+            if outcome is None:
+                actual_cell = "<td>pending</td>"
+                verdict_cell = "<td>pending</td>"
+                return_cell = "<td>pending</td>"
+            else:
+                actual_cell = f"<td>{escape(_fmt_optional(outcome.get('actual')))}</td>"
+                verdict_cell = _verdict_cell(str(outcome.get("verdict", "")))
+                return_cell = (
+                    f"<td>{escape(_fmt_return(outcome.get('return_pct', outcome.get('return'))))}</td>"
+                )
+            rows.append(
+                "<tr>"
+                f"<td>{escape(rank)}</td>"
+                f"<td>{escape(rec.get('source', '—'))}</td>"
+                f"<td><b>{escape(rec.get('symbol', '—'))}</b></td>"
+                f"<td>{escape(str(rec.get('direction', '')).upper() or '—')}</td>"
+                f"<td>{escape(_fmt_level(rec.get('entry')))}</td>"
+                f"<td>{escape(_fmt_level(rec.get('target')))}</td>"
+                f"<td>{escape(_fmt_level(rec.get('stop')))}</td>"
+                f"<td>{escape(_fmt_optional(rec.get('contract') or rec.get('contract_ticker')))}</td>"
+                f"<td>{escape(_fmt_optional(rec.get('conviction')))}</td>"
+                f"{actual_cell}{verdict_cell}{return_cell}"
+                "</tr>"
+            )
+        body_table = f"<table>{header}<tbody>{''.join(rows)}</tbody></table>"
+
+    return (
+        intro
+        + section("Available Report Days", "The most recent days (newest first) that have a persisted plays file. Click one to view that day's report.")
+        + f"<p>{day_links}</p>"
+        + section("Day Report", "That day's ranked plays with the PLAN levels (entry / target / stop). The Actual, Verdict, and Return columns are scaffolded for the later settlement engine and read 'pending' until it records outcomes.")
+        + summary_line
+        + body_table
+    )
+
+
+def run_recipient_action(root: Path, form: dict[str, str]) -> dict[str, Any]:
+    """Add or remove one report recipient. Never raises: validation failures and
+    backend hiccups come back as a message the tab renders."""
+    action = str(form.get("action", "")).strip().lower()
+    email = str(form.get("email", "")).strip()
+    bucket = _entry_alerts_bucket()
+    try:
+        store = _scout_store()
+    except Exception:
+        return {"ok": False, "message": "Recipient store is unavailable."}
+    try:
+        if action == "add":
+            ok, message = store.add_recipient(email, bucket=bucket)
+        elif action == "remove":
+            ok, message = store.remove_recipient(email, bucket=bucket)
+        else:
+            ok, message = False, "Unknown action."
+    except Exception as exc:  # a backend write failure must not crash the tab
+        return {"ok": False, "message": f"Could not update recipients: {exc}"}
+    return {"ok": ok, "message": message}
+
+
+def scout_recipients_html(root: Path, result: dict[str, Any] | None = None) -> str:
+    bucket = _entry_alerts_bucket()
+    try:
+        store = _scout_store()
+        recipients = store.load_recipients(bucket=bucket)
+        available = True
+    except Exception:
+        recipients, available = [], False
+
+    banner = ""
+    if result and result.get("message"):
+        cls = "safe" if result.get("ok") else "error"
+        banner = f'<p class="{cls}">{escape(result["message"])}</p>'
+
+    intro = (
+        '<p class="muted">Everyone here receives the daily Options and Small-Cap '
+        "Scout emails, in addition to the default operator address "
+        f"(<b>{escape(store.DEFAULT_EMAIL) if available and hasattr(store, 'DEFAULT_EMAIL') else 'digitalsolomon.com@gmail.com'}</b>), "
+        "which is always included. Analysis emails only; this list has no trading "
+        "capability.</p>"
+    )
+
+    if not available:
+        return intro + '<p class="warn">The recipient store is unavailable right now.</p>'
+
+    where = "GCS bucket " + escape(bucket) if bucket else "local data/entry_alerts/recipients.json"
+    if recipients:
+        rows = "".join(
+            "<tr>"
+            f"<td>{escape(addr)}</td>"
+            "<td><form method='post' style='margin:0'>"
+            f"<input type='hidden' name='email' value='{escape(addr)}'>"
+            "<button class='danger' name='action' value='remove'>Remove</button>"
+            "</form></td></tr>"
+            for addr in recipients
+        )
+        table = f"<table><thead><tr><th>Recipient</th><th></th></tr></thead><tbody>{rows}</tbody></table>"
+    else:
+        table = "<p>No additional recipients yet. The default operator address still receives every report.</p>"
+
+    add_form = (
+        "<form method='post'>"
+        "<label>Add a recipient</label>"
+        "<input name='email' type='email' placeholder='name@example.com'>"
+        "<button name='action' value='add'>Add</button>"
+        "</form>"
+    )
+    return (
+        intro
+        + banner
+        + section("Current Recipients", "The addresses that receive the scout report emails alongside the default operator address. Remove one with its Remove button.")
+        + table
+        + section("Add Recipient", "Enter a valid email address and click Add. Invalid or duplicate addresses are rejected with a message.")
+        + add_form
+        + f"<p class='muted'>Recipients are stored in {where} as recipients.json.</p>"
+    )
+
+
 NAV_ITEMS = [
     ("/", "Status", "Safety Status"),
     ("/equities", "Equities Lane", "Equities Lane"),
+    ("/scout-reports", "Scout Reports", "Scout Reports"),
+    ("/scout-recipients", "Report Recipients", "Report Recipients"),
     ("/live-control", "Live Control Center", "Live Control Center"),
     ("/live-readiness", "Live Readiness", "Live Readiness"),
     ("/settings", "Settings", "Settings"),

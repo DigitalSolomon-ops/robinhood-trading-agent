@@ -257,6 +257,19 @@ def compose_email(
     return build_subject(plays, today), render_email_html(plays, today)
 
 
+def _recipient_set(to_addr: str, extra_recipients: list[str] | None) -> list[str]:
+    """The operator default FIRST, then any extra recipients, deduped
+    case-insensitively. Additive and order-stable."""
+    out = [to_addr]
+    seen = {to_addr.strip().lower()}
+    for addr in extra_recipients or []:
+        key = str(addr).strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(str(addr).strip())
+    return out
+
+
 def send_or_preview(
     plays: list[Play],
     config: dict[str, Any],
@@ -266,16 +279,20 @@ def send_or_preview(
     today: date | None = None,
     smtp_factory: Any = None,
     print_fn: Any = print,
+    extra_recipients: list[str] | None = None,
 ) -> EmailResult:
     """Compose the email, then either send it (Gmail SMTP + STARTTLS) or, in
     dry-run, print/write it WITHOUT opening any SMTP connection.
 
+    `to_addr` (the config/env default) stays the primary recipient; any
+    `extra_recipients` (the operator-managed report list) are added and deduped.
     `smtp_factory` is only for tests -- it must never be exercised in dry-run.
     """
     today = today or datetime.now(UTC).date()
     subject, body = compose_email(plays, config, today)
     to_addr = resolve_to_addr(config)
     from_addr = resolve_from_addr(config)
+    recipients = _recipient_set(to_addr, extra_recipients)
 
     if out_path:
         with open(out_path, "w", encoding="utf-8") as handle:
@@ -284,7 +301,7 @@ def send_or_preview(
     if dry_run:
         if print_fn is not None:
             print_fn(f"[DRY RUN] Subject: {subject}")
-            print_fn(f"[DRY RUN] To: {to_addr}  From: {from_addr}")
+            print_fn(f"[DRY RUN] To: {', '.join(recipients)}  From: {from_addr}")
             print_fn(f"[DRY RUN] {len(plays)} play(s). Not sending; no SMTP connection opened.")
             print_fn(body)
         return EmailResult(subject, body, sent=False, dry_run=True, to_addr=to_addr,
@@ -302,7 +319,7 @@ def send_or_preview(
     message = MIMEMultipart("alternative")
     message["Subject"] = subject
     message["From"] = from_addr
-    message["To"] = to_addr
+    message["To"] = ", ".join(recipients)
     message.attach(MIMEText("This is an HTML email; enable HTML to read the Options Scout report.", "plain", "utf-8"))
     message.attach(MIMEText(body, "html", "utf-8"))
 
@@ -319,11 +336,11 @@ def send_or_preview(
         if not use_ssl:
             server.starttls()
         server.login(from_addr, password)
-        server.sendmail(from_addr, [to_addr], message.as_string())
+        server.sendmail(from_addr, recipients, message.as_string())
     finally:
         try:
             server.quit()
         except Exception:
             pass
     return EmailResult(subject, body, sent=True, dry_run=False, to_addr=to_addr,
-                       detail=f"sent to {to_addr}")
+                       detail=f"sent to {', '.join(recipients)}")

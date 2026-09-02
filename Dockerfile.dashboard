@@ -8,9 +8,13 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Direct deps (fastapi/uvicorn/etc.) + Firestore for the shared arm store.
+# Direct deps (fastapi/uvicorn/etc.) + Firestore for the shared arm store +
+# Cloud Storage for the Scout Reports / Report Recipients tabs (reads the shared
+# entry-alerts bucket via ADC; the import stays lazy+guarded so a missing lib or
+# bucket degrades to the local fallback rather than crashing the tab).
 COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt "google-cloud-firestore>=2.11,<3"
+RUN pip install --no-cache-dir -r requirements.txt \
+    "google-cloud-firestore>=2.11,<3" "google-cloud-storage==2.18.2"
 
 COPY src/ ./src/
 COPY config/ ./config/
