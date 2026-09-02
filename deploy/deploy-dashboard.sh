@@ -15,9 +15,10 @@ IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${SERVICE}:latest"
 SA_NAME="ds-trader-sa"
 SA="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 
-echo "==> Enable APIs"
+echo "==> Enable APIs (idempotent; skip if already on / no admin rights)"
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
-  artifactregistry.googleapis.com firestore.googleapis.com --project="$PROJECT"
+  artifactregistry.googleapis.com firestore.googleapis.com --project="$PROJECT" \
+  || echo "   (skipped — APIs already enabled, or account lacks serviceusage.enable; safe to continue)"
 
 echo "==> Artifact Registry repo ($REPO)"
 gcloud artifacts repositories describe "$REPO" --location="$REGION" --project="$PROJECT" >/dev/null 2>&1 \
@@ -34,7 +35,8 @@ gcloud iam service-accounts describe "$SA" --project="$PROJECT" >/dev/null 2>&1 
   || gcloud iam service-accounts create "$SA_NAME" --project="$PROJECT" \
        --display-name="007 dashboard runtime"
 gcloud projects add-iam-policy-binding "$PROJECT" \
-  --member="serviceAccount:${SA}" --role="roles/datastore.user" >/dev/null
+  --member="serviceAccount:${SA}" --role="roles/datastore.user" >/dev/null \
+  || echo "   (skipped — binding already present, or account lacks setIamPolicy; safe to continue)"
 
 echo "==> Deploy Cloud Run service ($SERVICE)"
 gcloud run deploy "$SERVICE" --project="$PROJECT" --region="$REGION" \

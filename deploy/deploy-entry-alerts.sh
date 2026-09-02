@@ -31,7 +31,8 @@ TZONE="America/New_York"
 echo "==> Enabling required APIs"
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
   artifactregistry.googleapis.com cloudscheduler.googleapis.com \
-  secretmanager.googleapis.com storage.googleapis.com --project="$PROJECT"
+  secretmanager.googleapis.com storage.googleapis.com --project="$PROJECT" \
+  || echo "   (skipped — APIs already enabled, or account lacks serviceusage.enable; safe to continue)"
 
 echo "==> Artifact Registry repo ($REPO)"
 gcloud artifacts repositories describe "$REPO" --location="$REGION" --project="$PROJECT" >/dev/null 2>&1 \
@@ -60,12 +61,14 @@ if ! gcloud iam service-accounts describe "$SA" --project="$PROJECT" >/dev/null 
 fi
 for S in massive-api gmail-app-password; do
   gcloud secrets add-iam-policy-binding "$S" --project="$PROJECT" \
-    --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor" >/dev/null
+    --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor" >/dev/null \
+    || echo "   (skipped $S binding — already present, or account lacks secret setIamPolicy; safe to continue)"
 done
 
 echo "==> Grant the alerter SA read/write on the day-state bucket"
 gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" --project="$PROJECT" \
-  --member="serviceAccount:${SA}" --role="roles/storage.objectAdmin" >/dev/null
+  --member="serviceAccount:${SA}" --role="roles/storage.objectAdmin" >/dev/null \
+  || echo "   (skipped bucket binding — already present, or account lacks storage setIamPolicy; safe to continue)"
 
 echo "==> Deploy Cloud Run Job (secrets injected as env; ~10-min task timeout)"
 gcloud run jobs deploy "$JOB" --project="$PROJECT" --region="$REGION" \
