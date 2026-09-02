@@ -1,0 +1,39 @@
+# Lean container for the Scout Settlement / accuracy engine (Cloud Run Job).
+# ANALYSIS ONLY -- reads delayed public daily bars and writes a WIN/LOSS/OPEN
+# verdict per play back to the shared day-state. No trading-lane / crypto deps,
+# so the image cannot place an order even in principle. It never sends email.
+FROM python:3.11-slim
+
+WORKDIR /app
+# httpx + PyYAML for the Massive read and config; google-cloud-storage to
+# read/write the shared day-state objects the scouts wrote.
+RUN pip install --no-cache-dir \
+    "httpx==0.28.1" "PyYAML==6.0.3" "google-cloud-storage==2.18.2"
+
+# Copy every module imported at load:
+#   * src/__init__.py                    -- makes `src` a package
+#   * src/market_data_fields.py          -- imported by equity_intelligence.massive_client
+#   * src/market_hours.py                -- transitively imported by the reused config helpers
+#   * src/scout_email_branding.py        -- transitively importable via options_scout (no email sent here)
+#   * src/scout_settlement/              -- this routine
+#   * src/entry_alerts/                  -- store (day-state) + config (bucket resolution)
+#   * src/equity_intelligence/           -- MassiveClient (daily + minute bars)
+#   * src/options_scout/                 -- entry_alerts.config reuses its secret helper
+COPY src/__init__.py ./src/__init__.py
+COPY src/market_data_fields.py ./src/market_data_fields.py
+COPY src/market_hours.py ./src/market_hours.py
+COPY src/scout_email_branding.py ./src/scout_email_branding.py
+COPY assets/logo-email.png ./assets/logo-email.png
+COPY src/scout_settlement/ ./src/scout_settlement/
+COPY src/entry_alerts/ ./src/entry_alerts/
+COPY src/equity_intelligence/ ./src/equity_intelligence/
+COPY src/options_scout/ ./src/options_scout/
+COPY config/options_scout.yaml ./config/options_scout.yaml
+COPY config/entry_alerts.yaml ./config/entry_alerts.yaml
+
+# Secrets arrive as env (MASSIVE_API_KEY) injected by Cloud Run from Secret
+# Manager; never shell out to gcloud in-container. The GCS client uses the Cloud
+# Run runtime service-account ADC.
+ENV DS_VAULT_NO_GCLOUD=1 PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "-m", "src.scout_settlement"]

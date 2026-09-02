@@ -270,6 +270,59 @@ def _persist(state: DayState, *, bucket: str | None) -> str:
     return "local"
 
 
+def _persist_raw(raw: dict[str, Any], day: str, *, bucket: str | None) -> str:
+    """Write a RAW day document back verbatim -- preserving every field, including
+    optional per-play fields the DayState dataclass would drop (rank, contract,
+    and the settlement engine's `outcome`). GCS preferred, local fallback. Mirrors
+    _persist but for a raw dict rather than a DayState."""
+    text = json.dumps(raw, indent=2, sort_keys=True)
+    gcs = _gcs_bucket(bucket)
+    if gcs is not None:
+        try:
+            gcs.blob(_object_name(day)).upload_from_string(text, content_type="application/json")
+            return "gcs"
+        except Exception:
+            pass
+    path = _local_path(day)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return "local"
+
+
+def save_outcomes(
+    day: str, outcomes: dict[str, dict[str, Any]], *, bucket: str | None = None
+) -> str:
+    """Merge a settled `outcome` dict into named plays of a day document, PRESERVING
+    every existing field (levels, the fired set, and any other per-play fields).
+
+    Operates on the RAW document (never via DayState, which drops optional fields),
+    so recording an outcome cannot clobber a play's other data or the fired set. A
+    play id absent from the document is skipped. Returns the backend used
+    ("gcs"|"local"), or "skipped" when the day has no document / no plays, or
+    "unchanged" when nothing matched. Never raises on the normal missing-backend
+    paths.
+
+    INVARIANT: the settlement engine only writes to PAST days (a day needs a later
+    session before it can settle), while the scouts (save_plays) and the alerter
+    (mark_fired) only touch the CURRENT day. So this raw-merge never races a
+    DayState write that would drop the outcomes it just wrote."""
+    raw = load_report_raw(day, bucket=bucket)
+    if raw is None:
+        return "skipped"
+    plays = raw.get("plays")
+    if not isinstance(plays, dict):
+        return "skipped"
+    changed = False
+    for pid, outcome in outcomes.items():
+        rec = plays.get(pid)
+        if isinstance(rec, dict) and outcome is not None:
+            rec["outcome"] = outcome
+            changed = True
+    if not changed:
+        return "unchanged"
+    return _persist_raw(raw, day, bucket=bucket)
+
+
 def save_plays(records: list[PlayRecord], *, day: str, bucket: str | None = None) -> str:
     """Merge `records` into the day's active plays and persist, PRESERVING the
     fired set. Additive: re-saving the same play id overwrites its levels but

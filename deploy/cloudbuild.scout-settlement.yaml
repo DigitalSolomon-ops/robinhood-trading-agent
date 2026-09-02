@@ -1,0 +1,6 @@
+# Cloud Build config for the Scout Settlement image (non-default Dockerfile name).
+# Invoked by deploy/deploy-scout-settlement.sh with --substitutions=_IMAGE=...
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args: ["build", "-f", "Dockerfile.scout-settlement", "-t", "${_IMAGE}", "."]
+images: ["${_IMAGE}"]
