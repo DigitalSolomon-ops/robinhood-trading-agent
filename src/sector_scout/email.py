@@ -35,8 +35,14 @@ class EmailResult:
 
 
 def build_subject(table: dict[str, Any], today: date) -> str:
-    plays = [p for p in table.get("plays") or [] if p.get("ticket")]
-    return f"Sector Scout - {today.isoformat()} - {len(plays)} structures ranked by EV"
+    tradeable = [
+        p for p in table.get("plays") or []
+        if p.get("classification") != "Falling knife"
+    ]
+    with_ticket = sum(1 for p in tradeable if p.get("ticket"))
+    top = min(len(tradeable), 9)
+    quotes = f", {with_ticket} live tickets" if with_ticket else " (tickets pending market hours)"
+    return f"Sector Scout - {today.isoformat()} - Top {top} opportunities{quotes}"
 
 
 def build_message_with_docx(
