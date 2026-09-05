@@ -165,3 +165,25 @@ def test_no_order_path_in_package() -> None:
         for match in forbidden.finditer(text):
             hits.append(f"{path.name}: {match.group(0)}")
     assert not hits, hits
+
+
+def test_legend_present_in_both_renderings() -> None:
+    """The legend renders in the HTML and the DOCX from the ONE structure,
+    covering every group, and stays dash-free like everything else."""
+    from src.sector_scout.report import LEGEND
+
+    html_out = render_html(_sample_table(), CHANGELOG, "x")
+    assert "Legend: how to read this report" in html_out
+    for group, entries in LEGEND:
+        assert group in html_out, f"legend group missing from HTML: {group}"
+        for term, _ in entries:
+            assert term.split(" /")[0] in html_out
+    payload = render_docx_bytes(_sample_table(), CHANGELOG, "x")
+    if payload is not None:
+        import io
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+            text = zf.read("word/document.xml").decode("utf-8")
+        assert "Legend: how to read this report" in text
+        assert "Falling knife" in text and "EXPECTED VALUE" in text

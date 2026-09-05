@@ -48,6 +48,82 @@ DISCLAIMER = (
 )
 
 
+# The legend: every term the report uses, in plain language. ONE structure
+# rendered by both the HTML and the DOCX so the two can never disagree.
+LEGEND: list[tuple[str, list[tuple[str, str]]]] = [
+    ("Classifications (lens one: extremes)", [
+        ("Coiled", "washed out against its own history (low relative strength and "
+         "price percentile) but stabilising, and not expensive. A recovery setup, "
+         "expressed with a call debit spread."),
+        ("Falling knife", "the same depth but still falling. No structure is offered; "
+         "the falsifier states what would turn it Coiled."),
+        ("Extended", "near the top of its range with rich valuation or thinning "
+         "breadth. Expressed with a put debit spread."),
+        ("Leading and earning it", "near highs with valuation in line and earnings "
+         "growing into it. Trend continuation, expressed with calls."),
+        ("Mid range", "neither extreme; selected only when the continuation score is strong."),
+    ]),
+    ("Segment board columns", [
+        ("RS PCT", "rank percentile of the fund divided by SPY within its own history: "
+         "0 is the weakest it has ever been against the market in the data window, 100 "
+         "the strongest. The board sorts by this, weakest first; it is the leading axis."),
+        ("PRICE PCT", "the share of the fund's own monthly closes sitting below today's "
+         "price, over the labeled data window."),
+        ("3M / 12M", "total return over the last three and twelve months."),
+        ("CONT x/8", "the continuation score: beating SPY over 12 months +2, trend "
+         "accelerating +2, P/E at or below the universe median +2, within 15 percent of "
+         "the 200 day average +1, leader earnings improving +1."),
+        ("IV RANK", "where today's at-the-money implied volatility sits in its own "
+         "trailing year: 0 cheapest, 100 richest. Under 30 the report buys premium "
+         "(debit spreads); over 70 it expresses the same view as a credit spread. "
+         "Reads 'collecting (N/252)' until enough daily history accumulates."),
+        ("BETA", "sensitivity to TLT (long bonds). When several selected funds sit "
+         "above 0.5 they are one interest-rate trade, and the notes say so."),
+    ]),
+    ("Probability and edge", [
+        ("Model probability", "the Black-Scholes chance the fund finishes past the "
+         "spread's breakeven at expiry, computed from the legs' live implied volatility."),
+        ("Empirical base rate", "how often this same classification actually moved the "
+         "required amount within the window in this fund's own history, always with its "
+         "sample size. LOW CONFIDENCE below 10 occurrences."),
+        ("Divergence", "when the model and the base rate disagree by more than 15 "
+         "points it is flagged: the options market is pricing something the history "
+         "does not contain."),
+        ("EXPECTED VALUE", "model-average dollars per spread across every possible "
+         "finish, not just the extremes. Plays are ranked by this, not by comfort."),
+        ("R:R", "maximum gain divided by maximum loss."),
+    ]),
+    ("The order ticket", [
+        ("LIMIT (modeled fill)", "the price to offer: each leg's mark nudged toward "
+         "the touch by 40 percent of its half-spread, rounded to five cents. A model, "
+         "not a broker estimate. MIDPOINT and WORST CASE beside it show what patience "
+         "saves and what certainty costs."),
+        ("BREAKEVEN / MOVE REQ", "the underlying level, and the percent move to reach "
+         "it, where the spread starts paying at expiry."),
+        ("DELTA / NET DELTA", "share-equivalent exposure per contract; the net figure "
+         "is the whole spread's."),
+        ("IV", "that leg's implied volatility from the live snapshot."),
+        ("OI", "open interest: contracts outstanding, the liquidity that lets you exit."),
+        ("SPR%", "the bid-ask spread as a percent of mark: the cost of trading it."),
+        ("DTE", "calendar days to expiry."),
+        ("TAKE PROFIT / ROLL/CLOSE BY", "close at 65 percent of max gain; exit or roll "
+         "by the stated date, about 45 days before expiry, whichever comes first."),
+        ("THE FALSIFIER", "the specific price or event that ends the thesis. Exit "
+         "there, no debate: it is also what settlement grades a LOSS against."),
+    ]),
+    ("General", [
+        ("n/a", "the live number was missing (off market hours, thin data, or not on "
+         "the data plan) and is never invented."),
+        ("Breadth", "the share of the fund's constituents above their own 200 day "
+         "average; a strong fund with weak breadth is one mega cap dragging "
+         "stragglers, and gets demoted. The coverage percent shows how much of the "
+         "cache window has been collected so far."),
+        ("Settlement", "every published structure is graded later against its own "
+         "falsifier, target, and deadline; the running record prints in every email."),
+    ]),
+]
+
+
 def _e(text: Any) -> str:
     return html.escape(str(text))
 
@@ -487,6 +563,29 @@ def prepare_table(table: dict[str, Any]) -> dict[str, Any]:
     return table
 
 
+def _legend_html() -> str:
+    blocks: list[str] = []
+    for group, entries in LEGEND:
+        rows = "".join(
+            '<tr>'
+            f'<td style="padding:3px 10px 3px 0;vertical-align:top;white-space:nowrap;">'
+            f'<strong style="color:{JUDGMENT};font-size:11px;">{_e(term)}</strong></td>'
+            f'<td style="padding:3px 0;color:{INK};font-size:11px;line-height:1.55;">{_e(defn)}</td>'
+            '</tr>'
+            for term, defn in entries
+        )
+        blocks.append(
+            f'<div style="margin-top:10px;font-size:12px;font-weight:700;color:{STONE};'
+            f'letter-spacing:.4px;text-transform:uppercase;">{_e(group)}</div>'
+            '<table role="presentation" cellpadding="0" cellspacing="0" '
+            f'style="width:100%;margin-top:4px;">{rows}</table>'
+        )
+    return (
+        f'<div style="background:{PARCHMENT};border:1px solid {SAND};border-radius:8px;'
+        'padding:12px 14px;">' + "".join(blocks) + "</div>"
+    )
+
+
 def render_html(table: dict[str, Any], changelog: dict[str, Any], settlement_line: str) -> str:
     from .. import scout_email_branding as branding
 
@@ -533,6 +632,8 @@ def render_html(table: dict[str, Any], changelog: dict[str, Any], settlement_lin
       <div style="overflow-x:auto;"><table role="presentation" cellpadding="0" cellspacing="0" style="font-size:12px;">{calendar_rows}</table></div>
       {_h2("Settlement: the report grades itself")}
       <div style="font-size:13px;color:{INK};">{_e(settlement_line)}</div>
+      {_h2("Legend: how to read this report")}
+      {_legend_html()}
       {_h2("Method and provenance")}
       <div style="font-size:12px;color:{INK};line-height:1.6;">
         Correlations (selected set): <span style="font-family:JetBrains Mono,Consolas,monospace;">{_e(corr_html)}</span>
@@ -691,6 +792,12 @@ def render_docx_bytes(table: dict[str, Any], changelog: dict[str, Any], settleme
 
     head("Settlement")
     para(settlement_line)
+
+    head("Legend: how to read this report")
+    for group, entries in LEGEND:
+        head(group, 2)
+        for term, defn in entries:
+            para(f"{term}: {defn}", 9)
 
     head("Method, provenance and disclaimer")
     for note in table.get("notes") or []:
