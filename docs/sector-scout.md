@@ -142,6 +142,14 @@ context with zero weight (`factor_weights_earned` in the config).
 Nothing is promoted without a settled-sample backtest; record any promotion
 here with the run date and the sample it earned it on.
 
+**Operator decree (2026-09-04), recorded distinctly from earned weights:** the
+Top 9 opportunity score (CLASS/RS/PRICE/3M/12M/CONT/IV RANK/BETA, thesis-fit,
+0 to 100) ranks the report's plays by operator direction. It is a transparent
+presentation heuristic with every weight in `opportunity:` in the yaml and the
+breakdown printed beside every score; it has NOT passed the backtest bar and
+is not part of the factor-scoring machinery above. If settlement data later
+shows the score discriminates winners, promote it here with the sample.
+
 ## The fill model (read before quoting the limit)
 
 Massive has no broker high-fill-rate field. The ticket's limit price is a
