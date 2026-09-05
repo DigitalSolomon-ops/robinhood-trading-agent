@@ -118,3 +118,50 @@ def test_frozen_verdicts_stay_frozen(tmp_path: Path) -> None:
     later = [_bar(date(2026, 9, 11), 81.0, 70.0, 80.5)]
     summary = evaluate_open_calls(store, FakeBarsClient(bars + later), date(2026, 9, 12))
     assert summary.settled_loss == 1 and summary.settled_win == 0
+
+
+class _FakeBlob:
+    def __init__(self, store: dict, name: str) -> None:
+        self._store, self.name = store, name
+
+    def upload_from_filename(self, path: str) -> None:
+        self._store[self.name] = Path(path).read_bytes()
+
+    def download_to_filename(self, path: str) -> None:
+        Path(path).write_bytes(self._store[self.name])
+
+
+class _FakeBucket:
+    """Just enough of google.cloud.storage.Bucket for the breadth sync."""
+
+    def __init__(self) -> None:
+        self.blobs: dict[str, bytes] = {}
+
+    def list_blobs(self, prefix: str = ""):
+        return [_FakeBlob(self.blobs, n) for n in sorted(self.blobs) if n.startswith(prefix)]
+
+    def blob(self, name: str) -> _FakeBlob:
+        return _FakeBlob(self.blobs, name)
+
+
+def test_breadth_sync_round_trip(tmp_path: Path) -> None:
+    """Cloud Run regression: the breadth cache must persist through GCS --
+    up from one store, down into a fresh one (a new container's empty disk)."""
+    a = _store(tmp_path / "a")
+    a._bucket = _FakeBucket()
+    (a.breadth_dir / "2026-09-01.json.gz").write_bytes(b"day1")
+    (a.breadth_dir / "2026-09-02.json.gz").write_bytes(b"day2")
+    assert a.sync_breadth_up() == 2
+    assert a.sync_breadth_up() == 0  # idempotent: nothing new
+
+    b = _store(tmp_path / "b")   # fresh container, empty local disk
+    b._bucket = a._bucket
+    assert b.sync_breadth_down() == 2
+    assert (b.breadth_dir / "2026-09-01.json.gz").read_bytes() == b"day1"
+    assert b.sync_breadth_down() == 0  # idempotent
+
+
+def test_breadth_sync_noop_without_bucket(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    assert store.sync_breadth_down() == 0
+    assert store.sync_breadth_up() == 0

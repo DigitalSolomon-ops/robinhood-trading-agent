@@ -168,3 +168,62 @@ class StateStore:
 
     def save_open_calls(self, calls: list[dict[str, Any]]) -> str:
         return self._write(CALLS_FILE, calls)
+
+    # --- breadth cache sync (Cloud Run has no persistent disk) ------------------
+
+    def sync_breadth_down(self) -> int:
+        """Download breadth-cache day files present in GCS but absent locally.
+        Without this, a Cloud Run job starts with an empty cache every
+        execution and the breadth factor never converges. No-op (0) when no
+        bucket is configured. Failures download what they can -- coverage is
+        reported honestly either way."""
+        if self._bucket is None:
+            return 0
+        fetched = 0
+        try:
+            prefix = f"{self.prefix}/{BREADTH_SUBDIR}/"
+            for blob in self._bucket.list_blobs(prefix=prefix):
+                name = blob.name.rsplit("/", 1)[-1]
+                if not name.endswith(".json.gz"):
+                    continue
+                target = self.breadth_dir / name
+                if target.exists():
+                    continue
+                try:
+                    blob.download_to_filename(str(target))
+                    fetched += 1
+                except Exception:
+                    # A partial download must not poison the cache.
+                    try:
+                        target.unlink()
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+        return fetched
+
+    def sync_breadth_up(self, known_remote: set[str] | None = None) -> int:
+        """Upload local breadth-cache day files missing from GCS. Returns how
+        many uploaded; no-op when no bucket is configured."""
+        if self._bucket is None:
+            return 0
+        uploaded = 0
+        try:
+            prefix = f"{self.prefix}/{BREADTH_SUBDIR}/"
+            remote = known_remote
+            if remote is None:
+                remote = {
+                    b.name.rsplit("/", 1)[-1]
+                    for b in self._bucket.list_blobs(prefix=prefix)
+                }
+            for path in sorted(self.breadth_dir.glob("*.json.gz")):
+                if path.name in remote:
+                    continue
+                try:
+                    self._bucket.blob(prefix + path.name).upload_from_filename(str(path))
+                    uploaded += 1
+                except Exception:
+                    break  # a bucket outage: stop, local copies remain
+        except Exception:
+            pass
+        return uploaded

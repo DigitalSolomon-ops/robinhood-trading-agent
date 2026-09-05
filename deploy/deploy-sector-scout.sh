@@ -9,7 +9,11 @@ REGION="us-central1"
 JOB="sector-scout"
 REPO="scouts"
 IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${JOB}:latest"
-SA_NAME="sector-scout-sa"
+# Reuse the EXISTING options-scout runtime SA (house pattern; the settlement
+# job reuses entry-alerts-sa the same way). It already holds secretAccessor on
+# massive-api / gmail-app-password and write access to the entry-alerts bucket
+# the sector state rides in -- and the hands-off deploy SA cannot create SAs.
+SA_NAME="options-scout-sa"
 SA="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 SCHED_JOB="${JOB}-daily"
 # Daily at 6:00 ET pre-market (operator decision 2026-09-04). Known
@@ -36,8 +40,11 @@ gcloud builds submit --config=deploy/cloudbuild.sector-scout.yaml \
 
 echo "== Service account =="
 if ! gcloud iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1; then
+  # Guarded: the hands-off deploy identity cannot create SAs; the reused SA
+  # should already exist, so a create failure here must not abort the deploy.
   gcloud iam service-accounts create "$SA_NAME" --project "$PROJECT" \
-    --display-name="Sector Scout (analysis-only email job)"
+    --display-name="Sector Scout (analysis-only email job)" \
+    || echo "  (SA create skipped -- reusing existing $SA)"
   for i in $(seq 1 12); do
     gcloud iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1 && break
     echo "  waiting for SA propagation ($i/12)"; sleep 5
@@ -48,8 +55,11 @@ echo "== Secret access =="
 SECRETS="MASSIVE_API_KEY=massive-api:latest,GMAIL_APP_PASSWORD=gmail-app-password:latest"
 for S in massive-api gmail-app-password finnhub; do
   if gcloud secrets describe "$S" --project "$PROJECT" >/dev/null 2>&1; then
+    # Guarded: idempotent grant; the hands-off deploy identity lacks
+    # setIamPolicy and the reused SA already holds these from its own deploy.
     gcloud secrets add-iam-policy-binding "$S" --project "$PROJECT" \
-      --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor" >/dev/null
+      --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor" >/dev/null \
+      || echo "  (binding on $S skipped -- already granted; safe to continue)"
   else
     echo "  (secret $S not present; skipping)"
   fi
@@ -73,7 +83,8 @@ gcloud run jobs deploy "$JOB" \
 
 gcloud run jobs add-iam-policy-binding "$JOB" \
   --region "$REGION" --project "$PROJECT" \
-  --member="serviceAccount:${SA}" --role="roles/run.invoker" >/dev/null
+  --member="serviceAccount:${SA}" --role="roles/run.invoker" >/dev/null \
+  || echo "  (invoker binding skipped -- already granted; safe to continue)"
 
 echo "== Scheduler =="
 gcloud scheduler jobs delete "$SCHED_JOB" --location "$REGION" --project "$PROJECT" --quiet || true

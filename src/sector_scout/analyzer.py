@@ -319,10 +319,13 @@ def build_run_table(
     all_constituents = {t for seeds in seeds_map.values() for t in seeds}
     from .data import BreadthCache
 
+    store.sync_breadth_down()  # Cloud Run: pull the persisted cache first
     cache = BreadthCache(store.breadth_dir, all_constituents)
     fetched = cache.backfill(
         client, today, lookback, int(br_cfg.get("backfill_days_per_run", 40))
     )
+    if fetched:
+        store.sync_breadth_up()  # persist the new days for the next execution
     coverage = cache.coverage(today, lookback)
     if coverage < 0.999:
         notes.append(

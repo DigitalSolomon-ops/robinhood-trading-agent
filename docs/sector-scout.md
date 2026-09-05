@@ -155,7 +155,8 @@ bid) print beside it so the cost of certainty is visible.
    `digitalsolomon-creator`; `finnhub` is optional and wired conditionally.
 2. `bash deploy/deploy-sector-scout.sh` from `agent/`: builds
    `Dockerfile.sector-scout` via Cloud Build, deploys Cloud Run job
-   `sector-scout` (SA `sector-scout-sa`, `DS_VAULT_NO_GCLOUD=1`,
+   `sector-scout` (runtime SA `options-scout-sa`, reused per house pattern;
+   `DS_VAULT_NO_GCLOUD=1`,
    `MASSIVE_MIN_INTERVAL_SECONDS=13`, 1800s timeout), schedules
    `sector-scout-daily` at **6:00 ET weekdays, pre-market** (operator
    decision 2026-09-04). Accepted trade-off: option bid/ask is dark outside
