@@ -63,6 +63,23 @@ LEGEND: list[tuple[str, list[tuple[str, str]]]] = [
          "growing into it. Trend continuation, expressed with calls."),
         ("Mid range", "neither extreme; selected only when the continuation score is strong."),
     ]),
+    ("The Top 9 and the opportunity score", [
+        ("OPP / SCORE", "one cumulative 0 to 100 score per fund: classification up to "
+         "25 points, RS and price percentile fit up to 10 each (a Coiled fund earns "
+         "them for being washed out, others for strength), 3 month and 12 month "
+         "momentum up to 10 each, continuation up to 20 (inverted for bearish plays, "
+         "where weakness confirms exhaustion), premium cost fit up to 10, and rate "
+         "purity up to 5. The breakdown prints beside every score. An operator-set "
+         "ranking heuristic; every weight is config-tunable."),
+        ("IDEAL ENTRY", "the underlying price to work the entry at today: a pullback "
+         "into strength for bullish plays, a fade of strength for bearish ones, set a "
+         "fraction of one ATR from the last close."),
+        ("DAY FLOOR / DAY CEILING", "the session's expected range, one 14 day ATR "
+         "either side of the last close. Enter near the favorable edge; never chase "
+         "through the far edge."),
+        ("Price action", "the plain-English tape to wait for before entering, and the "
+         "level that voids the entry for the day."),
+    ]),
     ("Segment board columns", [
         ("RS PCT", "rank percentile of the fund divided by SPY within its own history: "
          "0 is the weakest it has ever been against the market in the data window, 100 "
@@ -265,7 +282,7 @@ def _board_html(funds: list[dict[str, Any]]) -> str:
     head_cells = "".join(
         f'<th style="text-align:left;padding:5px 6px;font-size:10px;color:{STONE};'
         f'letter-spacing:.5px;border-bottom:1px solid {SAND};">{h}</th>'
-        for h in ("FUND", "CLASS", "RS PCT", "PRICE PCT", "3M", "12M", "CONT", "IV RANK", "BETA")
+        for h in ("FUND", "OPP", "CLASS", "RS PCT", "PRICE PCT", "3M", "12M", "CONT", "IV RANK", "BETA")
     )
     rows_html: list[str] = []
     for f in funds:
@@ -281,9 +298,11 @@ def _board_html(funds: list[dict[str, Any]]) -> str:
             f"{ivr.get('iv_rank'):.0f}" if ivr.get("iv_rank") is not None
             else f"({ivr.get('days_collected', 0)}/252)"
         )
+        opp_score = (f.get("opportunity") or {}).get("score")
         rows_html.append(
             "<tr>"
             f'<td style="padding:4px 6px;font-weight:700;color:{INK};">{_e(f["symbol"])}</td>'
+            f'<td style="padding:4px 6px;font-weight:700;color:{GOLD};">{_num(opp_score, "{:g}")}</td>'
             f'<td style="padding:4px 6px;color:{color};font-weight:600;">{_e(cls)}</td>'
             f'<td style="padding:4px 6px;">{_num(ext.get("rs_pctile"), "{:.0f}")}</td>'
             f'<td style="padding:4px 6px;">{_num(ext.get("price_pctile"), "{:.0f}")}</td>'
@@ -563,6 +582,68 @@ def prepare_table(table: dict[str, Any]) -> dict[str, Any]:
     return table
 
 
+def _top9_block_html(rank: int, play: dict[str, Any]) -> str:
+    """One plain-English Top 9 entry: the opportunity, the play, the ideal
+    entry, and today's ceiling/floor with the price action to wait for."""
+    opp = play.get("opportunity") or {}
+    levels = play.get("day_levels") or {}
+    ticket = play.get("ticket") or {}
+    structure = ticket.get("structure") or play.get("intended_structure") or "no structure"
+    quotes_note = "" if ticket else " (live quotes pending market hours; sized ticket appears on a market-hours run)"
+    ext = play.get("_fund_row_extremes") or {}
+    cont = play.get("_fund_row_continuation") or {}
+
+    why = (
+        f"{play['fund']} is the number {rank} opportunity on the board with a score of "
+        f"{_num(opp.get('score'), '{:g}')} out of 100: it classifies "
+        f"{play.get('classification')}, sits at relative strength percentile "
+        f"{_num(ext.get('rs_pctile'), '{:.0f}')} and price percentile "
+        f"{_num(ext.get('price_pctile'), '{:.0f}')}, has moved "
+        f"{_pct(ext.get('ret_3m'))} over three months and {_pct(ext.get('ret_12m'))} over "
+        f"twelve, and carries a continuation score of {cont.get('score', 'n/a')}/8."
+    )
+    the_play = (
+        f"The play is a {structure}{quotes_note}, "
+        f"{'betting the recovery' if play.get('direction') == 'bullish' and play.get('classification') == 'Coiled' else 'riding the trend' if play.get('direction') == 'bullish' else 'fading the extension'}."
+    )
+    if levels:
+        entry_line = (
+            f"Ideal entry on the underlying: {_num(levels.get('ideal_entry'))}. "
+            f"Today's expected range: floor {_num(levels.get('day_floor'))}, ceiling "
+            f"{_num(levels.get('day_ceiling'))} (last close {_num(levels.get('reference_close'))}, "
+            f"ATR {_num(levels.get('atr'))})."
+        )
+    else:
+        entry_line = "Day levels: n/a this run."
+    action = play.get("price_action") or ""
+
+    chips = (
+        _chip("SCORE", _num(opp.get("score"), "{:g}"))
+        + _chip("DIRECTION", _e(play.get("direction", "n/a")), mono=False)
+        + _chip("IDEAL ENTRY", _num(levels.get("ideal_entry")))
+        + _chip("DAY FLOOR", _num(levels.get("day_floor")))
+        + _chip("DAY CEILING", _num(levels.get("day_ceiling")))
+    )
+    return (
+        f'<div style="border:1px solid {SAND};border-left:4px solid {GOLD};border-radius:8px;'
+        'padding:12px 14px;margin:10px 0;background:#ffffff;">'
+        f'<div style="font-size:15px;font-weight:800;color:{INK};">'
+        f'<span style="color:{GOLD};">#{rank}</span> {_e(play["fund"])} '
+        f'<span style="color:{STONE};font-size:12px;font-weight:400;">'
+        f'score {_e((play.get("opportunity") or {}).get("breakdown", ""))}</span></div>'
+        f'<div style="font-size:13px;color:{INK};line-height:1.65;margin-top:6px;">{_e(why)} '
+        f'{_e(the_play)}</div>'
+        f'<table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:8px;"><tr>{chips}</tr></table>'
+        f'<div style="font-size:13px;color:{INK};line-height:1.65;margin-top:8px;">'
+        f'<strong style="color:{JUDGMENT};">{_e(entry_line)}</strong></div>'
+        + (
+            f'<div style="font-size:13px;color:{INK};line-height:1.65;margin-top:6px;">{_e(action)}</div>'
+            if action else ""
+        )
+        + "</div>"
+    )
+
+
 def _legend_html() -> str:
     blocks: list[str] = []
     for group, entries in LEGEND:
@@ -593,6 +674,13 @@ def render_html(table: dict[str, Any], changelog: dict[str, Any], settlement_lin
     plays = table.get("plays") or []
 
     read = compose_read(table)
+    tradeable = [p for p in plays if p.get("classification") != "Falling knife"]
+    top9_blocks = "".join(
+        _top9_block_html(i + 1, p) for i, p in enumerate(tradeable[:9])
+    ) or (
+        f'<div style="font-size:13px;color:{STONE};">No tradeable opportunities '
+        "cleared the screen this run.</div>"
+    )
     play_blocks = "".join(_play_block_html(i + 1, p) for i, p in enumerate(plays))
     calendar_rows = "".join(
         f'<tr><td style="padding:3px 8px;font-weight:700;">{_e(r["ticker"])}</td>'
@@ -621,6 +709,13 @@ def render_html(table: dict[str, Any], changelog: dict[str, Any], settlement_lin
     <tr><td style="padding:18px;">
       {_h2("The read")}
       <div style="font-size:14px;line-height:1.7;color:{INK};">{_e(read)}</div>
+      {_h2("The Top 9: best opportunities on the board, ranked")}
+      <div style="font-size:12px;color:{STONE};margin-bottom:4px;">One cumulative score
+      across CLASS, RS PCT, PRICE PCT, 3M, 12M, CONT, IV RANK and BETA, scored by how
+      cleanly each column fits the trade the fund argues for. The breakdown prints on
+      every entry; the legend has the formula. Day levels are for TODAY's session, from
+      the last close and the 14 day average true range.</div>
+      {top9_blocks}
       {_h2("Change log")}
       {_changelog_html(changelog)}
       {_h2("The segment board (both lenses, sorted by relative strength ascending)")}
@@ -703,6 +798,33 @@ def render_docx_bytes(table: dict[str, Any], changelog: dict[str, Any], settleme
 
     head("The read")
     para(compose_read(table), 11)
+
+    head("The Top 9: best opportunities on the board, ranked")
+    tradeable = [
+        p for p in (table.get("plays") or [])
+        if p.get("classification") != "Falling knife"
+    ]
+    for i, play in enumerate(tradeable[:9], start=1):
+        opp = play.get("opportunity") or {}
+        levels = play.get("day_levels") or {}
+        ticket = play.get("ticket") or {}
+        structure = ticket.get("structure") or play.get("intended_structure") or "no structure"
+        head(f"#{i} {play.get('fund')} (score {opp.get('score', 'n/a')})", 2)
+        para(f"Score breakdown: {opp.get('breakdown', 'n/a')}", 9)
+        para(
+            f"{play.get('fund')} classifies {play.get('classification')}; the play is a "
+            f"{structure}" + ("" if ticket else " (live quotes pending market hours)") + ".",
+            10,
+        )
+        if levels:
+            para(
+                f"Ideal entry {levels.get('ideal_entry')}. Today's expected range: floor "
+                f"{levels.get('day_floor')}, ceiling {levels.get('day_ceiling')} (last close "
+                f"{levels.get('reference_close')}, ATR {levels.get('atr')}).",
+                10,
+            )
+        if play.get("price_action"):
+            para(str(play.get("price_action")), 10)
 
     head("Change log")
     if changelog.get("is_first_run"):

@@ -226,9 +226,32 @@ factors:
 # earned weight is recorded in docs/sector-scout.md, not here.
 factor_weights_earned: {}   # e.g. {breadth: 1.0} once the backtest proves it
 
+# --- the Top 9 opportunity ranking (operator-directed 2026-09-04) --------------
+# One cumulative score per fund across CLASS/RS/PRICE/3M/12M/CONT/IV RANK/BETA,
+# scored by THESIS FIT (a Coiled fund earns points for washout, a Leading fund
+# for strength). A transparent heuristic, not a backtest-earned weighting; the
+# breakdown prints beside every score and the docs ledger records the decree.
+opportunity:
+  class_points:
+    Coiled: 25
+    "Leading and earning it": 20
+    Extended: 15
+    "Mid range": 8
+    "Falling knife": 0
+  rs_price_max: 10       # points each for RS and PRICE percentile fit
+  ret_max: 10            # points each for the 3M and 12M momentum legs
+  ret3m_scale: 0.15      # 3M return that earns full points
+  ret12m_scale: 0.40     # 12M return that earns full points
+  cont_max: 20           # continuation score leg (inverted for bearish plays)
+  iv_max: 10             # premium-cost fit (cheap to buy / rich to sell)
+  beta_max: 5            # purity: low |rate beta| = the sector idea, not bonds
+  # Day-trade entry levels on the underlying, from the last close and ATR(14).
+  entry_atr_fraction: 0.35   # ideal entry sits this many ATRs into the pullback
+  day_range_atr: 1.0         # day ceiling/floor sit one ATR either side
+
 # --- selection ---------------------------------------------------------------
 selection:
-  max_plays: 6           # segment blocks in the report
+  max_plays: 9           # the Top 9 (ranked by the opportunity score)
   min_leaders_confirmed: 2
   shortlist_max: 10      # funds that get the leader-detail API budget
   leader_detail_budget: 2  # leaders per shortlisted fund getting details

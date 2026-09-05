@@ -39,6 +39,7 @@ from .factors import (
     skew_note,
     term_structure_note,
 )
+from ..options_scout.indicators import atr as atr_series
 from .lenses import (
     COILED,
     EXTENDED,
@@ -48,6 +49,7 @@ from .lenses import (
     continuation_read,
     extremes_read,
 )
+from .opportunity import day_levels, opportunity_read, price_action_plan
 from .state import StateStore
 from .structures import (
     Leg,
@@ -515,30 +517,32 @@ def build_run_table(
                 "excluded from selection and said so here"
             )
 
+    # Opportunity score for EVERY fund (the operator-directed cumulative
+    # ranking across CLASS/RS/PRICE/3M/12M/CONT/IV/BETA): it prints on the
+    # board and the Top 9 is ranked by it.
+    for row in fund_rows:
+        opp = opportunity_read(row, config)
+        row["opportunity"] = {
+            "score": opp.score,
+            "components": opp.components,
+            "direction": opp.direction,
+            "breakdown": opp.breakdown(),
+        }
+
     # Board sort: RS ascending (the calibration fix -- RS is the leading axis).
     fund_rows.sort(key=lambda r: r["extremes"]["rs_pctile"])
 
-    # --- selection --------------------------------------------------------------------
+    # --- selection: the Top N by opportunity score -----------------------------------
     sel_cfg = config.get("selection", {}) or {}
-    max_plays = int(sel_cfg.get("max_plays", 6))
+    max_plays = int(sel_cfg.get("max_plays", 9))
 
-    def _priority(row: dict[str, Any]) -> tuple[int, float]:
-        if row.get("breadth_demoted"):
-            return (9, 0.0)  # a breadth-demoted fund cannot re-enter selection
-        cls = row["classification"]
-        cont_score = (row.get("continuation") or {}).get("score", 0)
-        if cls == COILED:
-            return (0, -row["extremes"]["rs_pctile"])
-        if cont_score >= 6:
-            return (1, -cont_score)
-        if cls in (EXTENDED,):
-            return (2, row["extremes"]["rs_pctile"])
-        if cls == LEADING and cont_score >= 5:
-            return (3, -cont_score)
-        return (9, 0.0)
-
-    candidates = [r for r in fund_rows if _priority(r)[0] < 9]
-    candidates.sort(key=_priority)
+    candidates = [
+        r for r in fund_rows
+        if (r.get("opportunity") or {}).get("direction") is not None
+        and not r.get("breadth_demoted")
+    ]
+    candidates.sort(key=lambda r: -(r["opportunity"]["score"]))
+    knives = [r for r in fund_rows if r["classification"] == FALLING_KNIFE]
 
     # Correlation guard over the candidate set.
     corr_cfg = f_cfg.get("correlation", {}) or {}
@@ -573,15 +577,37 @@ def build_run_table(
     plays: list[dict[str, Any]] = []
     si_budget = int(si_cfg.get("max_funds", 10))
 
-    for row in primaries:
+    for row in primaries + [k for k in knives if k not in primaries]:
         fund = row["symbol"]
         hist = histories[fund]
         spot = hist.closes_daily[-1]
         cls = row["classification"]
         ivr = row["iv_rank"]
         cont = row.get("continuation") or {}
-        bullish = cls == COILED or (cont.get("score", 0) >= 5 and cls != EXTENDED)
-        direction = "bullish" if bullish else "bearish"
+        opp = row.get("opportunity") or {}
+        direction = opp.get("direction") or (
+            "bullish" if (cls == COILED or cont.get("score", 0) >= 5) else "bearish"
+        )
+        bullish = direction == "bullish"
+
+        # The intended structure is named even when live quotes are dark, so
+        # the pre-market Top 9 always states the play.
+        sell_premium_regime = (ivr.get("regime") or "") == "sell_premium"
+        if cls == FALLING_KNIFE:
+            intended = None
+        elif sell_premium_regime:
+            intended = "short put credit spread" if bullish else "short call credit spread"
+        else:
+            intended = "long call debit spread" if bullish else "long put debit spread"
+
+        # Today's actionable levels from the last close and ATR(14).
+        atr_arr = atr_series(hist.highs_daily, hist.lows_daily, hist.closes_daily, 14)
+        atr_val = atr_arr[-1] if atr_arr and atr_arr[-1] else None
+        levels = (
+            day_levels(spot, atr_val, direction, config)
+            if (atr_val is not None and cls != FALLING_KNIFE)
+            else None
+        )
 
         play: dict[str, Any] = {
             "fund": fund,
@@ -594,6 +620,22 @@ def build_run_table(
             "leaders": leaders_by_fund.get(fund, [])[:8],
             "dropped_seeds": dropped_by_fund.get(fund, []),
             "correlated_with": [s for s, p in collapsed.items() if p == fund],
+            "opportunity": opp,
+            "intended_structure": intended,
+            "day_levels": (
+                {
+                    "reference_close": levels.reference_close,
+                    "atr": levels.atr,
+                    "ideal_entry": levels.ideal_entry,
+                    "day_floor": levels.day_floor,
+                    "day_ceiling": levels.day_ceiling,
+                }
+                if levels
+                else None
+            ),
+            "price_action": (
+                price_action_plan(fund, cls, direction, levels) if levels else None
+            ),
         }
 
         if cls == FALLING_KNIFE:
@@ -816,8 +858,16 @@ def build_run_table(
         )
         plays.append(play)
 
-    # Rank plays by EV (edge), not comfort; structures without EV sink last.
-    plays.sort(key=lambda p: (p.get("expected_value") is not None, p.get("expected_value") or 0), reverse=True)
+    # Rank plays by the cumulative opportunity score (operator-directed
+    # 2026-09-04); EV stays printed on every play. Knives sink last.
+    plays.sort(
+        key=lambda p: (
+            p.get("classification") != FALLING_KNIFE,
+            (p.get("opportunity") or {}).get("score") or 0.0,
+            p.get("expected_value") or 0.0,
+        ),
+        reverse=True,
+    )
 
     # --- earnings calendar inside the window (best-effort Finnhub) ---------------------
     calendar: list[dict[str, Any]] = []

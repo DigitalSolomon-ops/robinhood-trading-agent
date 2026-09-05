@@ -54,6 +54,8 @@ def _sample_table() -> dict:
                 "iv_rank": {"iv_rank": 25.0, "current_iv": 0.23, "days_collected": 90,
                             "window_days": 252, "regime": "buy_premium"},
                 "rate_beta": -0.1,
+                "opportunity": {"score": 74.5, "direction": "bullish",
+                                "components": {"class": 20.0}, "breakdown": "74.5 = class 20"},
             },
         ],
         "plays": [
@@ -68,6 +70,12 @@ def _sample_table() -> dict:
                 "dropped_seeds": ["CTRA"],
                 "correlated_with": ["XOP"],
                 "structure": "long call debit spread",
+                "opportunity": {"score": 74.5, "direction": "bullish",
+                                "components": {"class": 20.0}, "breakdown": "74.5 = class 20"},
+                "intended_structure": "long call debit spread",
+                "day_levels": {"reference_close": 64.0, "atr": 1.2, "ideal_entry": 63.58,
+                               "day_floor": 62.8, "day_ceiling": 65.2},
+                "price_action": "Price action we are looking for in XLE: an orderly pullback toward 63.58 that holds above 62.8, then a push back through 64. A close below 62.8 voids the entry for the day.",
                 "ticket": {
                     "structure": "long call debit spread", "direction": "bullish",
                     "legs": [leg, short], "dte_calendar": 182,
@@ -187,3 +195,15 @@ def test_legend_present_in_both_renderings() -> None:
             text = zf.read("word/document.xml").decode("utf-8")
         assert "Legend: how to read this report" in text
         assert "Falling knife" in text and "EXPECTED VALUE" in text
+
+
+def test_top9_section_renders_with_levels() -> None:
+    """The report culminates in the Top 9: score with breakdown, the play,
+    the ideal entry, and today's ceiling/floor with the price action."""
+    html_out = render_html(_sample_table(), CHANGELOG, "x")
+    assert "The Top 9: best opportunities on the board, ranked" in html_out
+    assert "74.5 = class 20" in html_out          # score breakdown prints
+    assert "63.58" in html_out                     # ideal entry
+    assert "62.8" in html_out and "65.2" in html_out  # day floor / ceiling
+    assert "voids the entry" in html_out           # price-action plan
+    assert ">OPP<" in html_out                     # board column present
