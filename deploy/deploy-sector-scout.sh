@@ -69,8 +69,8 @@ if gcloud secrets describe finnhub --project "$PROJECT" >/dev/null 2>&1; then
 fi
 
 echo "== Cloud Run job =="
-# 1800s: the stock-side entitlement is ~5 req/min, so a run with breadth
-# backfill legitimately takes ~25 minutes.
+# 3600s: the stock-side entitlement is ~5 req/min, so a run with breadth
+# backfill legitimately takes 25-45 minutes (a verified local run took ~29).
 gcloud run jobs deploy "$JOB" \
   --image "$IMAGE" \
   --region "$REGION" --project "$PROJECT" \
@@ -78,7 +78,7 @@ gcloud run jobs deploy "$JOB" \
   --set-env-vars="DS_VAULT_NO_GCLOUD=1,MASSIVE_MIN_INTERVAL_SECONDS=13" \
   --set-secrets="$SECRETS" \
   --max-retries=1 \
-  --task-timeout=1800s \
+  --task-timeout=3600s \
   --memory=512Mi
 
 gcloud run jobs add-iam-policy-binding "$JOB" \
