@@ -1,0 +1,36 @@
+# Sector Scout daily email -- ANALYSIS ONLY container.
+#
+# Deliberately lean: the image can only compose and send the report. It copies
+# no trading lane, no broker client, no order path, so the container is
+# INCAPABLE of ordering. python-docx renders the attachment.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    "httpx==0.28.1" \
+    "PyYAML==6.0.3" \
+    "google-cloud-storage==2.18.2" \
+    "python-docx==1.2.0"
+
+# Explicit COPY list -- never `COPY . .` (the image must stay incapable of
+# ordering; the deny-list is the file list).
+COPY src/__init__.py src/__init__.py
+COPY src/market_data_fields.py src/market_data_fields.py
+COPY src/market_hours.py src/market_hours.py
+COPY src/scout_email_branding.py src/scout_email_branding.py
+COPY assets/logo-email.png assets/logo-email.png
+COPY src/options_scout/ src/options_scout/
+COPY src/sector_scout/ src/sector_scout/
+COPY src/scout_enrichment/ src/scout_enrichment/
+COPY src/scout_settlement/ src/scout_settlement/
+COPY src/equity_intelligence/ src/equity_intelligence/
+COPY src/entry_alerts/ src/entry_alerts/
+COPY config/options_scout.yaml config/options_scout.yaml
+COPY config/sector_scout.yaml config/sector_scout.yaml
+COPY config/entry_alerts.yaml config/entry_alerts.yaml
+
+ENV DS_VAULT_NO_GCLOUD=1 \
+    PYTHONUNBUFFERED=1
+
+ENTRYPOINT ["python", "-m", "src.sector_scout"]

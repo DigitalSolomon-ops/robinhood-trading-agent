@@ -4,6 +4,14 @@ Local, rules-based Robinhood Crypto Trading API agent. It is designed to execute
 
 Crypto trading can lose money quickly. Keep live trading disabled until you have reviewed the code, tested paper behavior, and confirmed the official Robinhood API details for your account.
 
+## Analysis-only scout lanes (never trade)
+
+Three sibling research lanes share this repo but have no order path at all:
+
+- **Options Scout** (`docs/options-scout.md`): daily ranked candidate options plays across 19 liquid single names, 10 trading-day horizon.
+- **Small-Cap Scout** (`docs/smallcap-scout.md`): the small-cap screen.
+- **Sector Scout** (`docs/sector-scout.md`): sector-first six-month options research; picks the market segment, the leaders inside it, and a dated spread per play with probability of profit, expected value, and a written strategy. Daily HTML email + DOCX attachment. `python -m src.main sector-scout-email --dry-run`.
+
 ## Safety Defaults
 
 - Default mode is `TRADING_MODE=paper`.

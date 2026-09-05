@@ -2182,6 +2182,15 @@ def build_parser() -> argparse.ArgumentParser:
     scout_parser.add_argument("--dry-run", action="store_true", help="compose and print the email; do not send")
     scout_parser.add_argument("--top", type=int, default=None, help="how many ranked plays to include")
     scout_parser.add_argument("--out", default=None, help="write the composed HTML to this path")
+    # ANALYSIS-ONLY sector-first six-month options research report. Sibling to
+    # options-scout-email: same email path, different question, different clock.
+    sector_parser = sub.add_parser(
+        "sector-scout-email",
+        help="ANALYSIS ONLY: email the sector-first six-month options research report (never trades).",
+    )
+    sector_parser.add_argument("--dry-run", action="store_true", help="compose and print the email; do not send")
+    sector_parser.add_argument("--top", type=int, default=None, help="how many segment plays to include")
+    sector_parser.add_argument("--out", default=None, help="write the composed HTML to this path")
     return parser
 
 
@@ -2279,6 +2288,12 @@ def main(argv: list[str] | None = None) -> int:
         from src.options_scout import run_options_scout_email
 
         result = run_options_scout_email(dry_run=args.dry_run, top_n=args.top, out_path=args.out)
+        if not args.dry_run:
+            print(result.detail)
+    elif args.command == "sector-scout-email":
+        from src.sector_scout import run_sector_scout_email
+
+        result = run_sector_scout_email(dry_run=args.dry_run, top_n=args.top, out_path=args.out)
         if not args.dry_run:
             print(result.detail)
     elif args.command == "run-paper":

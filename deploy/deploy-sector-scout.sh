@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# Deploy the Sector Scout daily email as a Cloud Run Job + Cloud Scheduler.
+# ANALYSIS ONLY -- the image contains no order path (see Dockerfile.sector-scout).
+# Run from agent/:  bash deploy/deploy-sector-scout.sh
+set -euo pipefail
+
+PROJECT="digitalsolomon-creator"
+REGION="us-central1"
+JOB="sector-scout"
+REPO="scouts"
+IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${JOB}:latest"
+SA_NAME="sector-scout-sa"
+SA="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
+SCHED_JOB="${JOB}-daily"
+# Daily at 6:00 ET pre-market (operator decision 2026-09-04). Known
+# trade-off, accepted: option bid/ask is dark outside market hours, so the
+# pre-market report carries the full board/strategy/probability read with
+# prev-close premiums, and tickets show n/a quotes until a market-hours run
+# (verified live: the lane refuses to fabricate a quote).
+CRON="0 6 * * 1-5"
+TZONE="America/New_York"
+
+echo "== APIs =="
+gcloud services enable run.googleapis.com cloudbuild.googleapis.com \
+  artifactregistry.googleapis.com cloudscheduler.googleapis.com \
+  secretmanager.googleapis.com --project "$PROJECT" || echo "(enable skipped)"
+
+echo "== Artifact Registry repo =="
+gcloud artifacts repositories describe "$REPO" --location="$REGION" --project "$PROJECT" \
+  >/dev/null 2>&1 || gcloud artifacts repositories create "$REPO" \
+  --repository-format=docker --location="$REGION" --project "$PROJECT"
+
+echo "== Build =="
+gcloud builds submit --config=deploy/cloudbuild.sector-scout.yaml \
+  --substitutions=_IMAGE="$IMAGE" --project "$PROJECT" .
+
+echo "== Service account =="
+if ! gcloud iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1; then
+  gcloud iam service-accounts create "$SA_NAME" --project "$PROJECT" \
+    --display-name="Sector Scout (analysis-only email job)"
+  for i in $(seq 1 12); do
+    gcloud iam service-accounts describe "$SA" --project "$PROJECT" >/dev/null 2>&1 && break
+    echo "  waiting for SA propagation ($i/12)"; sleep 5
+  done
+fi
+
+echo "== Secret access =="
+SECRETS="MASSIVE_API_KEY=massive-api:latest,GMAIL_APP_PASSWORD=gmail-app-password:latest"
+for S in massive-api gmail-app-password finnhub; do
+  if gcloud secrets describe "$S" --project "$PROJECT" >/dev/null 2>&1; then
+    gcloud secrets add-iam-policy-binding "$S" --project "$PROJECT" \
+      --member="serviceAccount:${SA}" --role="roles/secretmanager.secretAccessor" >/dev/null
+  else
+    echo "  (secret $S not present; skipping)"
+  fi
+done
+if gcloud secrets describe finnhub --project "$PROJECT" >/dev/null 2>&1; then
+  SECRETS="${SECRETS},FINNHUB_API_KEY=finnhub:latest"
+fi
+
+echo "== Cloud Run job =="
+# 1800s: the stock-side entitlement is ~5 req/min, so a run with breadth
+# backfill legitimately takes ~25 minutes.
+gcloud run jobs deploy "$JOB" \
+  --image "$IMAGE" \
+  --region "$REGION" --project "$PROJECT" \
+  --service-account "$SA" \
+  --set-env-vars="DS_VAULT_NO_GCLOUD=1,MASSIVE_MIN_INTERVAL_SECONDS=13" \
+  --set-secrets="$SECRETS" \
+  --max-retries=1 \
+  --task-timeout=1800s \
+  --memory=512Mi
+
+gcloud run jobs add-iam-policy-binding "$JOB" \
+  --region "$REGION" --project "$PROJECT" \
+  --member="serviceAccount:${SA}" --role="roles/run.invoker" >/dev/null
+
+echo "== Scheduler =="
+gcloud scheduler jobs delete "$SCHED_JOB" --location "$REGION" --project "$PROJECT" --quiet || true
+gcloud scheduler jobs create http "$SCHED_JOB" \
+  --location "$REGION" --project "$PROJECT" \
+  --schedule="$CRON" --time-zone="$TZONE" \
+  --http-method=POST \
+  --uri="https://${REGION}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${PROJECT}/jobs/${JOB}:run" \
+  --oauth-service-account-email="$SA"
+
+echo ""
+echo "Deployed. Verify with:"
+echo "  gcloud run jobs execute $JOB --region $REGION --project $PROJECT"

@@ -1,0 +1,262 @@
+# Sector Scout -- ANALYSIS ONLY.
+#
+# Sector-first options research on a ~six-month horizon: pick the market
+# segment, then the leaders inside it, then a specific dated options structure
+# with a calculated probability of profit and expected value. It NEVER trades,
+# never places, reviews, or cancels an order, and never touches a trading gate.
+# Every tunable lives here so nothing is hardcoded in the analyzer.
+#
+# Data: Massive (formerly Polygon.io). The stocks entitlement on the current
+# plan caps history at ~2 years and ~5 requests/minute (the data layer
+# throttles and caches); the paid Options plan authorizes per-contract
+# snapshots with premium, open interest, greeks and IV. The five-year ratio
+# history endpoint is NOT on the current plan (verified 403 on 2026-09-04), so
+# the valuation overlay is cross-sectional and says so in the method section.
+
+# --- universe ----------------------------------------------------------------
+# Layer 1: the eleven GICS sector SPDRs. Layer 2: industry and theme funds.
+# Every fund has liquid listed options. Benchmark SPY is pulled every run.
+benchmark: SPY
+rate_proxy: TLT   # duration beta is measured against this
+
+universe:
+  sectors:      # layer 1
+    - XLK
+    - XLF
+    - XLV
+    - XLY
+    - XLP
+    - XLE
+    - XLI
+    - XLB
+    - XLU
+    - XLRE
+    - XLC
+  industries:   # layer 2
+    - SMH
+    - IGV
+    - CIBR
+    - XBI
+    - IHI
+    - KRE
+    - KIE
+    - XOP
+    - OIH
+    - URA
+    - TAN
+    - LIT
+    - COPX
+    - GDX
+    - XME
+    - ITB
+    - XRT
+    - JETS
+    - IYT
+    - XAR
+    - PAVE
+    - MOO
+    - KWEB
+
+# Seed constituent lists: 8 per fund. Seeds are SEEDS -- every leader that
+# reaches the report is confirmed live that run; a ticker that does not resolve
+# is dropped and NAMED in the report, never substituted.
+seed_leaders:
+  XLK:  [MSFT, AAPL, NVDA, AVGO, ORCL, CRM, CSCO, AMD]
+  XLF:  [BRK.B, JPM, V, MA, BAC, WFC, GS, SPGI]
+  XLV:  [LLY, UNH, JNJ, ABBV, MRK, TMO, ABT, AMGN]
+  XLY:  [AMZN, TSLA, HD, MCD, BKNG, LOW, TJX, SBUX]
+  XLP:  [PG, COST, WMT, KO, PEP, PM, MDLZ, CL]
+  XLE:  [XOM, CVX, COP, EOG, SLB, MPC, PSX, WMB]
+  XLI:  [GE, CAT, RTX, UBER, HON, UNP, ETN, DE]
+  XLB:  [LIN, SHW, APD, ECL, FCX, NEM, DOW, NUE]
+  XLU:  [NEE, SO, DUK, CEG, SRE, AEP, D, EXC]
+  XLRE: [PLD, AMT, EQIX, WELL, SPG, PSA, O, CCI]
+  XLC:  [META, GOOGL, NFLX, TMUS, DIS, CMCSA, T, VZ]
+  SMH:  [NVDA, TSM, AVGO, AMD, ASML, QCOM, AMAT, MU]
+  IGV:  [MSFT, CRM, ORCL, ADBE, PLTR, NOW, INTU, PANW]
+  CIBR: [CRWD, PANW, ZS, FTNT, OKTA, QLYS, NET, CHKP]
+  XBI:  [VRTX, REGN, GILD, AMGN, MRNA, BIIB, ALNY, SRPT]
+  IHI:  [ISRG, ABT, MDT, SYK, BSX, EW, ZBH, DXCM]
+  KRE:  [TFC, PNC, USB, FITB, HBAN, RF, CFG, KEY]
+  KIE:  [PGR, CB, TRV, AIG, MET, PRU, ALL, AFL]
+  XOP:  [EOG, COP, DVN, FANG, OXY, APA, EQT, PR]
+  OIH:  [SLB, HAL, BKR, FTI, WFRD, NOV, CHX, RIG]
+  URA:  [CCJ, NXE, UEC, DNN, LEU, UUUU, OKLO, SMR]
+  TAN:  [FSLR, ENPH, SEDG, RUN, NXT, SHLS, ARRY, CSIQ]
+  LIT:  [ALB, SQM, LAC, ENS, FLNC, EOSE, SLDP, QS]
+  COPX: [FCX, SCCO, TECK, HBM, ERO, TGB, CMMC, NEXA]
+  GDX:  [NEM, GOLD, AEM, WPM, FNV, KGC, AU, RGLD]
+  XME:  [FCX, NUE, STLD, CLF, AA, X, ATI, CRS]
+  ITB:  [DHI, LEN, NVR, PHM, TOL, KBH, MTH, BLDR]
+  XRT:  [ANF, BBY, DKS, ULTA, TSCO, WSM, RL, GPS]
+  JETS: [DAL, UAL, AAL, LUV, ALK, JBLU, SKYW, ALGT]
+  IYT:  [UNP, UPS, FDX, CSX, NSC, ODFL, JBHT, LSTR]
+  XAR:  [LMT, RTX, NOC, GD, LHX, HWM, AXON, BA]
+  PAVE: [ETN, PWR, MLM, VMC, URI, CAT, DE, EMR]
+  MOO:  [DE, ADM, CTVA, NTR, CF, MOS, BG, TSN]
+  KWEB: [BABA, PDD, JD, TCEHY, BIDU, NTES, TME, BILI]
+
+# --- history -------------------------------------------------------------------
+history:
+  # Requested lookback. The stocks entitlement caps actual history (~2 years on
+  # the current plan); the data layer discovers the effective window per run and
+  # the report LABELS every percentile with the window it was computed over.
+  years: 5
+  # Stock-side request spacing (seconds). The observed limit is ~5 req/min.
+  min_interval_seconds: 13
+
+# --- lens one: extremes (mean reversion) --------------------------------------
+extremes:
+  # Rank percentiles over monthly closes (share of history below current).
+  coiled_price_pctile_max: 25
+  coiled_rs_pctile_max: 30
+  extended_price_pctile_min: 85
+  extended_rs_pctile_min: 80
+  # Trend stabilisation for Coiled vs Falling knife: price above the 50-day SMA
+  # OR the 3-month return positive counts as stabilising.
+  # Calibration (2026-09-04 run): with the index near highs, RELATIVE STRENGTH
+  # is the leading axis and absolute price percentile the secondary filter.
+  # The board sorts by RS ascending and the report states this calibration.
+  rs_is_leading_axis: true
+
+# --- lens two: continuation (trend persistence) --------------------------------
+continuation:
+  # Gate 3 exhaustion checks.
+  rsi_weekly_max: 75
+  max_pct_above_sma200: 25
+  # Score components (out of 8).
+  score:
+    beat_spy_12m: 2
+    positive_acceleration: 2
+    pe_at_or_below_universe_median: 2
+    within_15pct_of_sma200: 1
+    improving_leader_earnings: 1
+  within_sma200_pct: 15
+
+# --- probability / EV ----------------------------------------------------------
+probability:
+  risk_free_rate: 0.04     # annualized, for Black-Scholes d2
+  # Divergence between Black-Scholes and the empirical base rate worth calling
+  # out in the strategy narrative (percentage points).
+  divergence_flag_points: 15
+
+# --- base rate (empirical, replayed over available history) --------------------
+base_rate:
+  min_occurrences: 10      # below this the label is LOW CONFIDENCE
+  # Forward window for a "hit" when replaying a classification historically,
+  # in months (mirrors the option horizon).
+  forward_months: 6
+
+# --- structures / order ticket ---------------------------------------------------
+structures:
+  target_dte: 180
+  dte_min: 150
+  dte_max: 240
+  coiled_long_delta: 0.35
+  continuation_long_delta: 0.60
+  # Chain scan band around spot (fractions) and the realized-vol lookback for
+  # the six-month measured move.
+  chain_strike_band: [0.6, 1.6]
+  expected_move_lookback_days: 63
+  # Credit-spread construction (sell-premium IV regime).
+  credit_short_delta: 0.30
+  credit_width_pct: 0.05
+  credit_width_min: 5.0
+  # Bullish falsifier: min(200-day SMA, spot * (1 - this)).
+  falsifier_drawdown_fraction: 0.10
+  # Short leg for a continuation call spread sits above the six-month measured
+  # move (fund close * (1 + expected_move)).
+  # IV-rank routing: below buy_premium_max, debit structures; above
+  # sell_premium_min, express the same view as a credit spread; between, the
+  # classification decides.
+  iv_rank_buy_premium_max: 30
+  iv_rank_sell_premium_min: 70
+  # Modeled fill estimate: mark +/- this fraction of the half-spread (Massive
+  # has no broker high-fill-rate field; the docs say this is a model).
+  fill_model_half_spread_fraction: 0.40
+  limit_price_rounding: 0.05
+  take_profit_fraction: 0.65   # of max gain
+  roll_or_close_days_before_expiry: 45
+  # Contracts scanned per leg while hunting the target delta.
+  delta_scan_max_contracts: 12
+
+# --- selection factors -----------------------------------------------------------
+factors:
+  breadth:
+    # Grouped-daily cache: one Massive call returns the whole market for a day.
+    # Coverage builds across runs; the report states partial coverage plainly.
+    lookback_days: 260            # constituent 200d SMA + 52w range need this
+    backfill_days_per_run: 40     # bounded backfill per run (rate-limit budget)
+    demotion_pct_above_200d: 40   # below this, Extended/Continuation is demoted
+  iv_rank:
+    # IV rank needs a self-collected ATM IV history (no historical IV on the
+    # plan). Until min_days accumulate the report shows "collecting (N/252)".
+    window_days: 252
+    min_days: 60
+    # Which expiry/strikes define "ATM IV" for the daily collection.
+    atm_dte_lo: 20
+    atm_dte_hi: 45
+    atm_strike_band: [0.85, 1.15]
+  correlation:
+    lookback_months: 12
+    single_position_threshold: 0.80
+  rate_beta:
+    lookback_months: 12
+    shared_exposure_threshold: 0.5
+    shared_exposure_min_funds: 3
+  short_interest:
+    enabled: true                 # context only, never a scoring input
+    readings: 3
+    max_funds: 10                 # rate-limit budget: shortlisted funds only
+  earnings_revisions:
+    # Forward estimates are NOT on the current Massive plan; the fallback is
+    # the trailing beat streak (Finnhub via scout_enrichment when a key exists)
+    # and the method section says so.
+    mode: trailing_fallback
+  term_structure_skew:
+    enabled: true                 # context only
+    skew_delta: 0.25
+    cheap_rich_pts: 2.0           # IV-point gap that reads cheap/rich
+    heavy_put_skew_pts: 4.0       # put-minus-call gap that reads heavy
+  seasonality:
+    enabled: true                 # context only; sample is <= window years
+# Factor discipline: a factor carries scoring weight ONLY once the backtest
+# shows it improves hit rate on a sample above base_rate.min_occurrences.
+# Until then it ships as reported context with zero weight. Which factors have
+# earned weight is recorded in docs/sector-scout.md, not here.
+factor_weights_earned: {}   # e.g. {breadth: 1.0} once the backtest proves it
+
+# --- selection ---------------------------------------------------------------
+selection:
+  max_plays: 6           # segment blocks in the report
+  min_leaders_confirmed: 2
+  shortlist_max: 10      # funds that get the leader-detail API budget
+  leader_detail_budget: 2  # leaders per shortlisted fund getting details
+
+# --- change log ----------------------------------------------------------------
+changelog:
+  reprice_threshold_pct: 10   # limit move that counts as a material re-price
+
+# --- state / persistence --------------------------------------------------------
+state:
+  # Local fallback base directory (GCS bucket used when configured, matching
+  # the entry-alerts store pattern). Holds run tables (change log), the
+  # self-collected IV history, the breadth cache, and open six-month calls.
+  local_dir: data/sector_scout
+  gcs_prefix: sector-scout
+
+# --- settlement -------------------------------------------------------------------
+settlement:
+  # Six-month calls are graded on whichever comes first: falsifier, take
+  # profit, roll-or-close date, expiry. Open calls re-evaluate every daily run.
+  enabled: true
+
+# --- email -------------------------------------------------------------------------
+email:
+  # Recipient is the operator ONLY -- deliberately no second recipient and no
+  # report-recipients list on this lane.
+  from_addr: "digitalsolomon.com@gmail.com"
+  to_addr: "digitalsolomon.com@gmail.com"
+  smtp_host: "smtp.gmail.com"
+  smtp_port: 465   # implicit SSL
+  attach_docx: true
