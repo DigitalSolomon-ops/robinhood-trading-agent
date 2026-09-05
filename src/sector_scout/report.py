@@ -177,17 +177,29 @@ def compose_read(table: dict[str, Any]) -> str:
     for calls, best for puts, the single best risk-to-reward named with its
     structure."""
     plays = table.get("plays") or []
-    with_ticket = [p for p in plays if p.get("ticket")]
-    bullish = [p for p in with_ticket if p.get("direction") == "bullish"]
-    bearish = [p for p in with_ticket if p.get("direction") == "bearish"]
+    tradeable = [p for p in plays if p.get("classification") != "Falling knife"]
+    with_ticket = [p for p in tradeable if p.get("ticket")]
+    bullish = [p for p in tradeable if p.get("direction") == "bullish"]
+    bearish = [p for p in tradeable if p.get("direction") == "bearish"]
     sentences: list[str] = []
+
+    def _structure_of(play: dict[str, Any]) -> str:
+        name = (play.get("ticket") or {}).get("structure") or play.get("intended_structure")
+        if play.get("ticket"):
+            return f"expressed as a {name}"
+        return f"to be expressed as a {name} (live quotes pending market hours)"
 
     if bullish:
         top = bullish[0]
+        ev_tail = (
+            f" with expected value {_num(top.get('expected_value'), '{:+,.0f}')} dollars per spread"
+            if top.get("expected_value") is not None
+            else ""
+        )
         sentences.append(
-            f"The best segment for calls is {top['fund']} ({top['classification']}), "
-            f"expressed as a {top['structure']} with expected value "
-            f"{_num(top.get('expected_value'), '{:+,.0f}')} dollars per spread."
+            f"The best segment for calls is {top['fund']} ({top['classification']}, "
+            f"opportunity score {_num((top.get('opportunity') or {}).get('score'), '{:g}')}), "
+            f"{_structure_of(top)}{ev_tail}."
         )
     else:
         sentences.append("No segment cleared the screen for calls this run.")
@@ -195,7 +207,7 @@ def compose_read(table: dict[str, Any]) -> str:
         top = bearish[0]
         sentences.append(
             f"The best segment for puts is {top['fund']} ({top['classification']}), "
-            f"expressed as a {top['structure']}."
+            f"{_structure_of(top)}."
         )
     else:
         sentences.append("No segment set up for puts this run.")
