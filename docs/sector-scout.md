@@ -198,3 +198,33 @@ a 10 trading-day horizon". Sector Scout answers "which industry should I be in
 for the next six months, who leads it, and what is the ideal contract". Both
 share the branding module, the secret resolvers, the settlement math, and the
 honesty rules. Neither modifies the other.
+
+## The Robinhood snapshot handoff (deployed 2026-09-07)
+
+The connector that carries Robinhood equities/options data is session-bound
+to a Claude agent (docs/rh-equities-binding.md), so the cloud job never calls
+Robinhood. The wiring is a producer/consumer handoff over the state store:
+
+1. **Producer** -- the scheduled agent task `sector-scout-rh-snapshot-fill`
+   (local machine, weekdays ~12:07 ET, runs while the Claude desktop app is
+   open) services the manifest from `sector-scout-manifest` via the connector,
+   assembles the snapshot JSON (schema in `robinhood_source.py`, fields
+   verbatim), and publishes it with
+   `python -m src.main sector-scout-snapshot-push --snapshot <file>`.
+   The push validates the schema first, refuses NaN/Infinity, refuses a blob
+   older than the one stored (`--force` overrides), and exits nonzero unless
+   the write reached GCS. Auth: `GOOGLE_APPLICATION_CREDENTIALS` in `agent/.env`
+   points at the local-runner-sa key (needs `roles/storage.objectAdmin` on the
+   entry-alerts bucket -- objectCreator alone cannot overwrite the blob).
+2. **Consumer** -- the Cloud Run job (`0 13 * * 1-5` America/New_York) calls
+   `run_sector_scout_email` with no snapshot path; the runner pulls
+   `sector-scout/rh_snapshot.json` from the store (fresher of GCS and local),
+   schema-checks it, and passes it to the analyzer. Missing, stale (>20h,
+   `robinhood.snapshot_max_age_hours`), or malformed blobs degrade to the
+   Massive-only path with the age/absence stated in the report -- the email
+   never crashes on a bad blob and never presents stale fields as live.
+
+Freshness math: 13:00 ET run minus the 20h cap means any push after 17:00 ET
+the previous day counts as fresh; the 12:07 ET same-morning fill leaves ~50
+minutes of slack. A skipped fill (machine off, connector absent) is a designed
+degradation, not an incident.
