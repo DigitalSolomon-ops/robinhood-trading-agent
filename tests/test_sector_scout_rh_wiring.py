@@ -247,6 +247,92 @@ def test_narrative_backs_valuation_claims_with_numbers() -> None:
     assert "2.0y" in text                        # percentiles labeled with the window
 
 
+def test_state_store_snapshot_push_and_materialize_round_trip(tmp_path: Path) -> None:
+    """The scheduled-agent handoff: push publishes the blob into the store,
+    materialize returns a loadable path, and the loaded snapshot survives
+    the schema check. No bucket configured -- the local layer alone must
+    round-trip (GCS is layered on top by the same _read/_write pair)."""
+    from src.sector_scout.state import StateStore
+
+    src = tmp_path / "filled.json"
+    save_snapshot(
+        {"generated_at": datetime.now(UTC).isoformat(),
+         "fundamentals": RH_FUNDAMENTALS, "fundamentals_not_found": []},
+        src,
+    )
+    store = StateStore(tmp_path / "state", None, "sector-scout")
+    assert store.materialize_rh_snapshot() is None      # nothing pushed yet
+    wrote = store.push_rh_snapshot(src)
+    assert wrote == "local"                             # no bucket in tests
+    path = store.materialize_rh_snapshot()
+    assert path is not None
+    snap = load_snapshot(path)
+    assert snap is not None
+    assert snap.fundamental("NVDA", "pe_ratio") == 29.120421
+
+
+def test_malformed_blob_degrades_to_none_never_raises(tmp_path: Path) -> None:
+    """2026-09-07 review finding: a schema-version-1 blob with structurally
+    bad nested data (null inside constituent_weekly_closes) must load as
+    None -- the daily email degrades Robinhood-less, it never crashes."""
+    from src.sector_scout.state import StateStore
+
+    bad = {
+        "schema_version": 1,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "constituent_weekly_closes": {"XLE": [100.0, None, 101.0]},
+    }
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps(bad), encoding="utf-8")
+    assert load_snapshot(path) is None
+
+    # And through the store handoff: a poisoned pushed blob materializes but
+    # still refuses to load, rather than raising inside the runner.
+    store = StateStore(tmp_path / "state", None, "sector-scout")
+    (store.local / "rh_snapshot.json").write_text(json.dumps(bad), encoding="utf-8")
+    fetched = store.materialize_rh_snapshot()
+    assert fetched is not None
+    assert load_snapshot(fetched) is None
+
+
+def test_nonfinite_values_never_surface_as_numbers(tmp_path: Path) -> None:
+    """NaN/Infinity JSON tokens fail the load gate entirely; string "inf" in
+    a quote or fundamentals field reads as absent, never as a live number."""
+    nan_blob = ('{"schema_version": 1, "generated_at": "2026-09-07T12:00:00+00:00", '
+                '"fundamentals": {"NVDA": {"pe_ratio": NaN}}}')
+    path = tmp_path / "nan.json"
+    path.write_text(nan_blob, encoding="utf-8")
+    assert load_snapshot(path) is None
+
+    snap = _snapshot(fundamentals={"NVDA": {"pe_ratio": "inf"}, "XOM": {"pe_ratio": "NaN"}})
+    assert snap.fundamental("NVDA", "pe_ratio") is None
+    assert snap.fundamental("XOM", "pe_ratio") is None
+
+    leg = leg_from_rh_quote(
+        "buy", "call", _inst(100),
+        {**_quote(4.0, 4.4, 4.2), "implied_volatility": "inf", "theta": "NaN"},
+        snapshot_at="t",
+    )
+    assert leg is not None and leg.iv is None and leg.theta is None
+
+
+def test_push_refuses_older_blob_unless_forced(tmp_path: Path) -> None:
+    """A rerun of yesterday's fill must not shadow today's blob."""
+    from src.sector_scout.state import StateStore
+
+    store = StateStore(tmp_path / "state", None, "sector-scout")
+    newer = tmp_path / "newer.json"
+    older = tmp_path / "older.json"
+    save_snapshot({"generated_at": datetime.now(UTC).isoformat(),
+                   "fundamentals": RH_FUNDAMENTALS}, newer)
+    save_snapshot({"generated_at": (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+                   "fundamentals": RH_FUNDAMENTALS}, older)
+    assert store.push_rh_snapshot(newer) == "local"
+    assert store.push_rh_snapshot(older) == "refused_older_than_stored"
+    assert store.push_rh_snapshot(older, force=True) == "local"
+    assert store.push_rh_snapshot(tmp_path / "missing.json") == "refused_unreadable_or_nonfinite"
+
+
 def test_gate_inputs_label_never_claims_robinhood_without_indicators() -> None:
     """A FRESH snapshot with no indicator rows still computed its gates
     locally -- the meta line must say local, not robinhood (found live on the

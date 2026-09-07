@@ -99,11 +99,9 @@ def leg_from_rh_quote(
     close, and the ticket labels it."""
 
     def _f(key: str) -> float | None:
-        raw = quote.get(key)
-        try:
-            return float(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            return None
+        from .robinhood_source import finite_float
+
+        return finite_float(quote.get(key))
 
     bid, ask = _f("bid_price"), _f("ask_price")
     mark = _f("adjusted_mark_price") or _f("mark_price")

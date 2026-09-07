@@ -45,14 +45,6 @@ def run_sector_scout_email(
     if top_n is not None:
         config = {**config, "selection": {**(config.get("selection") or {}), "max_plays": int(top_n)}}
 
-    rh = None
-    if rh_snapshot_path:
-        from .robinhood_source import load_snapshot
-
-        rh = load_snapshot(rh_snapshot_path)
-        if rh is None and print_fn is not None:
-            print_fn(f"[sector-scout] snapshot at {rh_snapshot_path} unreadable; running Robinhood-less")
-
     client = client or SectorDataClient(min_interval=resolve_min_interval(config))
     now = datetime.now(UTC)
     today = now.date()
@@ -62,6 +54,27 @@ def run_sector_scout_email(
         resolve_bucket(config),
         (config.get("state") or {}).get("gcs_prefix", "sector-scout"),
     )
+
+    # The Robinhood snapshot: an explicit path wins (local runs); otherwise
+    # the state store is consulted -- the scheduled agent session pushes the
+    # blob there before the daily run, and Cloud Run picks it up here. Absent
+    # or stale, the lane runs Robinhood-less / age-labeled and says so.
+    from .robinhood_source import load_snapshot
+
+    rh = None
+    if rh_snapshot_path:
+        rh = load_snapshot(rh_snapshot_path)
+        if rh is None and print_fn is not None:
+            print_fn(f"[sector-scout] snapshot at {rh_snapshot_path} unreadable; running Robinhood-less")
+    else:
+        fetched = store.materialize_rh_snapshot()
+        if fetched is not None:
+            rh = load_snapshot(fetched)
+            if print_fn is not None:
+                print_fn(
+                    "[sector-scout] Robinhood snapshot pulled from the state store"
+                    + ("" if rh is not None else " but failed the schema check; running Robinhood-less")
+                )
 
     # 1. Settle yesterday's open calls first, so the email reports the record.
     settlement = evaluate_open_calls(store, client, today)

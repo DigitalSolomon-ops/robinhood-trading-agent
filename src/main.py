@@ -2202,6 +2202,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="print the Robinhood snapshot manifest (the connector calls an agent must make)",
     )
     manifest_parser.add_argument("--out", default=None, help="write the manifest JSON to this path")
+    # Publishes a connector-filled snapshot to the state store (local + GCS)
+    # so the Cloud Run job picks it up. Schema-checked BEFORE the write: a
+    # malformed file is refused rather than shadowing a good blob.
+    push_parser = sub.add_parser(
+        "sector-scout-snapshot-push",
+        help="validate a Robinhood snapshot JSON and publish it to the sector-scout state store",
+    )
+    push_parser.add_argument("--snapshot", required=True, help="path to the snapshot JSON to publish")
+    push_parser.add_argument(
+        "--force", action="store_true",
+        help="overwrite even when the stored blob is newer than this file",
+    )
     return parser
 
 
@@ -2324,6 +2336,38 @@ def main(argv: list[str] | None = None) -> int:
             print(f"manifest written to {args.out}")
         else:
             print(text)
+    elif args.command == "sector-scout-snapshot-push":
+        from src.sector_scout.config import load_sector_config, resolve_state_dir
+        from src.sector_scout.robinhood_source import load_snapshot
+        from src.sector_scout.state import StateStore, resolve_bucket
+
+        snap = load_snapshot(args.snapshot)
+        if snap is None:
+            print(f"REFUSED: {args.snapshot} is unreadable or fails the schema check; nothing pushed")
+            return 1
+        config = load_sector_config()
+        store = StateStore(
+            resolve_state_dir(config),
+            resolve_bucket(config),
+            (config.get("state") or {}).get("gcs_prefix", "sector-scout"),
+        )
+        wrote = store.push_rh_snapshot(args.snapshot, force=args.force)
+        if wrote.startswith("refused"):
+            print(f"REFUSED ({wrote}): nothing pushed"
+                  + (" -- pass --force to overwrite a newer stored blob"
+                     if wrote == "refused_older_than_stored" else ""))
+            return 1
+        if wrote == "failed":
+            print("FAILED: snapshot not persisted anywhere (local write failed, GCS not reached)")
+            return 1
+        print(
+            f"snapshot pushed ({wrote}); generated_at {snap.generated_at} "
+            f"({snap.age_label()}), {len(snap.fundamentals)} fundamentals, "
+            f"{len(snap.option_quotes)} option quotes"
+        )
+        if "gcs" not in wrote:
+            print("WARNING: local only -- GCS not reached; the Cloud Run job will not see this push")
+            return 1
     elif args.command == "run-paper":
         run_mode("paper", args.once)
     elif args.command == "run-paper-loop":

@@ -13,6 +13,11 @@ data/*.sqlite
 data/*.sqlite3
 data/private/
 data/proving_runs/
+# Lane state directories (run tables, breadth cache, pushed RH snapshots).
+# GCS is the durable copy; the local mirrors are transient operational state.
+data/sector_scout/
+data/entry_alerts/
+state/
 __pycache__/
 *.pyc
 .venv/

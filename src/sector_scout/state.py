@@ -24,6 +24,7 @@ RUNS_SUBDIR = "runs"
 CALLS_FILE = "open_calls.json"
 IV_FILE = "iv_history.json"
 BREADTH_SUBDIR = "breadth"
+RH_SNAPSHOT_FILE = "rh_snapshot.json"
 
 
 def resolve_bucket(config: dict[str, Any]) -> str | None:
@@ -38,6 +39,21 @@ def resolve_bucket(config: dict[str, Any]) -> str | None:
         return _rb(load_alerts_config())
     except Exception:
         return None
+
+
+def _generated_ts(payload: dict[str, Any]) -> float:
+    """generated_at as an epoch, 0.0 when absent/unparseable (so a blob with
+    no timestamp never blocks a real push)."""
+    from datetime import UTC, datetime
+
+    raw = str(payload.get("generated_at") or "")
+    try:
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _gcs_bucket(bucket_name: str | None):
@@ -168,6 +184,42 @@ class StateStore:
 
     def save_open_calls(self, calls: list[dict[str, Any]]) -> str:
         return self._write(CALLS_FILE, calls)
+
+    # --- the Robinhood snapshot (a scheduled agent session pushes it) -----------
+
+    def materialize_rh_snapshot(self) -> Path | None:
+        """Pull the connector-filled Robinhood snapshot (the FRESHER of the
+        GCS blob and any local copy, via _read) into the local state dir and
+        return its path; None when neither side has one. Staleness is judged
+        downstream by RhSnapshot.is_fresh -- an old snapshot still loads and
+        the report states its age rather than pretending it is absent."""
+        payload = self._read(RH_SNAPSHOT_FILE)
+        if not isinstance(payload, dict):
+            return None
+        path = self.local / RH_SNAPSHOT_FILE
+        try:
+            path.write_text(json.dumps(payload, indent=1, default=str), encoding="utf-8")
+        except OSError:
+            return None
+        return path
+
+    def push_rh_snapshot(self, source: Path, *, force: bool = False) -> str:
+        """Publish a snapshot file to the store (local always, GCS when
+        configured). The caller validates the schema FIRST (load_snapshot)
+        so a malformed file can never shadow a good blob. Two extra refusals
+        here (review findings, 2026-09-07): non-finite numerics never
+        persist, and a push OLDER than the stored blob is refused unless
+        forced -- a rerun of yesterday's fill must not shadow today's."""
+        try:
+            payload = json.loads(Path(source).read_text(encoding="utf-8"))
+            json.dumps(payload, allow_nan=False)
+        except (OSError, ValueError):
+            return "refused_unreadable_or_nonfinite"
+        if not force:
+            existing = self._read(RH_SNAPSHOT_FILE)
+            if isinstance(existing, dict) and _generated_ts(existing) > _generated_ts(payload):
+                return "refused_older_than_stored"
+        return self._write(RH_SNAPSHOT_FILE, payload)
 
     # --- breadth cache sync (Cloud Run has no persistent disk) ------------------
 

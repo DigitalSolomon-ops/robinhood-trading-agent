@@ -25,12 +25,26 @@ no client. The broker-guard AST test covers it like every other module here.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 SNAPSHOT_SCHEMA_VERSION = 1
+
+
+def finite_float(raw: Any) -> float | None:
+    """float(raw) only when the result is a FINITE number -- a connector
+    field carrying "NaN"/"inf" (as string or token) reads as absent, never
+    as a fabricated live value."""
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
 
 # Connector batch limits (from the tool contracts, verified live 2026-09-07).
 FUNDAMENTALS_BATCH = 10
@@ -79,11 +93,7 @@ class RhSnapshot:
         row = self.fundamentals.get(symbol.upper())
         if not row:
             return None
-        raw = row.get(key)
-        try:
-            return float(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            return None
+        return finite_float(row.get(key))
 
     def fundamental_str(self, symbol: str, key: str) -> str | None:
         row = self.fundamentals.get(symbol.upper())
@@ -94,11 +104,7 @@ class RhSnapshot:
         row = self.indicators.get(symbol.upper())
         if not row:
             return None
-        raw = row.get(key)
-        try:
-            return float(raw) if raw is not None else None
-        except (TypeError, ValueError):
-            return None
+        return finite_float(row.get(key))
 
     def quote_field(self, instrument_id: str, key: str) -> Any:
         row = self.option_quotes.get(instrument_id)
@@ -106,8 +112,10 @@ class RhSnapshot:
 
 
 def load_snapshot(path: str | Path) -> RhSnapshot | None:
-    """Load and shape-check a snapshot file. Unreadable or wrong-version
-    snapshots return None -- the lane then runs Robinhood-less and says so."""
+    """Load and shape-check a snapshot file. Unreadable, wrong-version,
+    non-finite (NaN/Infinity tokens), or structurally malformed snapshots ALL
+    return None -- the lane then runs Robinhood-less and says so. The email
+    must degrade, never crash, on a bad blob (review finding, 2026-09-07)."""
     p = Path(path)
     if not p.exists():
         return None
@@ -119,6 +127,19 @@ def load_snapshot(path: str | Path) -> RhSnapshot | None:
         return None
     if not raw.get("generated_at"):
         return None
+    try:
+        # Python's json parses NaN/Infinity tokens by default; a snapshot
+        # carrying them would surface as fabricated live numbers downstream.
+        json.dumps(raw, allow_nan=False)
+    except ValueError:
+        return None
+    try:
+        return _shape(raw)
+    except (TypeError, ValueError, AttributeError, KeyError):
+        return None
+
+
+def _shape(raw: dict[str, Any]) -> RhSnapshot:
     return RhSnapshot(
         generated_at=str(raw["generated_at"]),
         fundamentals={str(k).upper(): v for k, v in (raw.get("fundamentals") or {}).items() if isinstance(v, dict)},
