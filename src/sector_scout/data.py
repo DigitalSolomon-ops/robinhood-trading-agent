@@ -93,6 +93,24 @@ def monthly_end_indices(dates: list[date]) -> list[int]:
     return out
 
 
+def weekly_end_indices(dates: list[date]) -> list[int]:
+    """The DAILY index of each ISO week's last bar, aligned 1:1 with the
+    weekly closes from resample_last_per_period(weekly=True). Same
+    no-lookahead anchor as monthly_end_indices, at the weekly resolution the
+    2-year percentiles now run on (2026-09-07)."""
+    out: list[int] = []
+    last_key: tuple[int, int] | None = None
+    for i, d in enumerate(dates):
+        iso = d.isocalendar()
+        key = (iso.year, iso.week)
+        if key != last_key:
+            out.append(i)
+            last_key = key
+        else:
+            out[-1] = i
+    return out
+
+
 @dataclass(frozen=True)
 class FundHistory:
     """One fund's aligned price history, resampled locally."""
@@ -105,6 +123,7 @@ class FundHistory:
     closes_weekly: list[float]
     closes_monthly: list[float]
     monthly_indices: list[int]  # daily index of each monthly close, 1:1 aligned
+    weekly_indices: list[int]   # daily index of each weekly close, 1:1 aligned
     first_date: date
     last_date: date
 
@@ -197,6 +216,7 @@ class SectorDataClient(MassiveClient):
             closes_weekly=resample_last_per_period(closes, dates, weekly=True),
             closes_monthly=resample_last_per_period(closes, dates, weekly=False),
             monthly_indices=monthly_end_indices(dates),
+            weekly_indices=weekly_end_indices(dates),
             first_date=dates[0],
             last_date=dates[-1],
         )

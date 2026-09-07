@@ -16,12 +16,10 @@ IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/${REPO}/${JOB}:latest"
 SA_NAME="options-scout-sa"
 SA="${SA_NAME}@${PROJECT}.iam.gserviceaccount.com"
 SCHED_JOB="${JOB}-daily"
-# Daily at 6:00 ET pre-market (operator decision 2026-09-04). Known
-# trade-off, accepted: option bid/ask is dark outside market hours, so the
-# pre-market report carries the full board/strategy/probability read with
-# prev-close premiums, and tickets show n/a quotes until a market-hours run
-# (verified live: the lane refuses to fabricate a quote).
-CRON="0 6 * * 1-5"
+# Daily IN SESSION (2026-09-07 brief: roughly 15:00-19:00 UTC). 13:00 ET
+# keeps quotes live for the ticket half of the report; the send gate ships
+# the board-only short form on any run that cannot price a structure.
+CRON="0 13 * * 1-5"
 TZONE="America/New_York"
 
 echo "== APIs =="

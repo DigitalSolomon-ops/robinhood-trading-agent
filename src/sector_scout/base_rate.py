@@ -1,20 +1,23 @@
 """Empirical base rate for a Sector Scout play, replayed over the available
 history with the SAME lens functions the live report used.
 
-For every play: at each historical month-end where the fund carried the same
-classification (and, for continuation plays, passed the same gates), did the
-underlying move the required percent in the required direction within the
-matching forward window? The fraction always travels with its sample size and
-is shrunk by occurrences / (occurrences + min_occurrences), exactly the
-scout_backtest discipline. Below min_occurrences it is labeled LOW CONFIDENCE.
+WEEKLY RESOLUTION (2026-09-07): percentiles moved to weekly bars, so the
+replay walks WEEK-ends -- ~104 observations across the 2-year window instead
+of ~24 month-ends. `weekly_indices` (from data.weekly_end_indices) maps each
+weekly close to the exact daily index of that week's last bar, preserving
+the no-lookahead guarantee: the truncated daily series ends ON the week-end
+being classified, and unresolvable weeks are SKIPPED, never clamped.
 
-The report prints this NEXT TO the Black-Scholes number, and a divergence
-above the configured threshold is called out in the strategy narrative: that
-gap is itself a finding, usually the options market pricing something the
-history does not contain.
+The fraction always travels with its sample size and is shrunk by
+occurrences / (occurrences + min_occurrences), exactly the scout_backtest
+discipline. Below min_occurrences it is labeled LOW CONFIDENCE.
 
-Honesty note: the stocks entitlement caps history (~2 years verified live),
+Honesty notes: the stocks entitlement caps history (~2 years verified live),
 so the sample is what the plan allows and the label says which window it is.
+The replay classifies on price/RS structure alone (valuation is unknowable
+historically on this plan), which can only loosen the match, never invent
+hits. Steps default to every 4th week so adjacent, near-identical setups do
+not inflate the sample.
 
 ANALYSIS ONLY -- no order path.
 """
@@ -25,6 +28,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from .lenses import classify, extremes_read
+
+WEEKS_PER_MONTH = 13.0 / 3.0  # 52 weeks / 12 months
 
 
 @dataclass(frozen=True)
@@ -64,9 +69,9 @@ def replay_base_rate(
     closes_daily: list[float],
     highs_daily: list[float],
     lows_daily: list[float],
-    closes_monthly: list[float],
-    spy_closes_monthly: list[float],
-    monthly_indices: list[int],
+    closes_weekly: list[float],
+    spy_closes_weekly: list[float],
+    weekly_indices: list[int],
     target_classification: str,
     bullish: bool,
     required_move_pct: float,
@@ -74,30 +79,19 @@ def replay_base_rate(
     min_occurrences: int,
     window_label: str,
     cfg: dict[str, Any],
-    step_months: int = 1,
+    step_weeks: int = 4,
 ) -> BaseRate:
-    """Walk month-ends through history; where the SAME classification held,
-    test whether the forward window reached the required move. The valuation /
-    earnings overlay is unknowable historically on this plan, so the replay
-    classifies on price/RS structure alone -- which can only make the match
-    LOOSER, never invent hits; the method section states this.
-
-    NO LOOKAHEAD: `monthly_indices` (from data.monthly_end_indices) maps each
-    monthly close to the exact daily index of that month's last bar, so the
-    truncated daily series ends ON the month-end being classified. Months
-    whose index cannot be resolved are SKIPPED, never clamped -- clamping
-    substituted the full series (including the graded forward window) and
-    inflated the base rate (review finding, 2026-09-04)."""
-    n_months = min(len(closes_monthly), len(spy_closes_monthly), len(monthly_indices))
+    """Walk week-ends through history; where the SAME classification held,
+    test whether the forward window reached the required move."""
+    n_weeks = min(len(closes_weekly), len(spy_closes_weekly), len(weekly_indices))
+    forward_weeks = max(1, round(forward_months * WEEKS_PER_MONTH))
     occurrences = 0
     hits = 0
 
-    # Need enough daily history behind each month-end for SMAs and enough
-    # ahead of it for the forward window.
-    for m in range(6, n_months - forward_months, step_months):
-        daily_idx = monthly_indices[m]
+    for w in range(26, n_weeks - forward_weeks, max(step_weeks, 1)):
+        daily_idx = weekly_indices[w]
         if daily_idx >= len(closes_daily):
-            continue  # unresolvable month: skip, never clamp
+            continue  # unresolvable week: skip, never clamp
         hist_daily = closes_daily[: daily_idx + 1]
         if len(hist_daily) < 60:
             continue
@@ -105,9 +99,9 @@ def replay_base_rate(
             closes_daily=hist_daily,
             highs_daily=highs_daily[: daily_idx + 1],
             lows_daily=lows_daily[: daily_idx + 1],
-            closes_monthly=closes_monthly[: m + 1],
-            spy_closes_monthly=spy_closes_monthly[: m + 1],
-            weekly_closes=hist_daily[::5] or hist_daily,
+            closes_weekly_pct=closes_weekly[: w + 1],
+            spy_closes_weekly_pct=spy_closes_weekly[: w + 1],
+            weekly_closes=closes_weekly[: w + 1],
             window_label=window_label,
             cfg=cfg,
         )
@@ -118,8 +112,8 @@ def replay_base_rate(
         )
         if hist_class != target_classification:
             continue
-        base = closes_monthly[m]
-        future = closes_monthly[m + 1 : m + 1 + forward_months]
+        base = closes_weekly[w]
+        future = closes_weekly[w + 1 : w + 1 + forward_weeks]
         if base <= 0 or not future:
             continue
         occurrences += 1

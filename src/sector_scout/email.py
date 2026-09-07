@@ -35,13 +35,28 @@ class EmailResult:
 
 
 def build_subject(table: dict[str, Any], today: date) -> str:
+    if table.get("send_mode") == "board_only":
+        return f"Sector Scout - {today.isoformat()} - board only (no structure priced)"
     tradeable = [
         p for p in table.get("plays") or []
         if p.get("classification") != "Falling knife"
+        and p.get("passes_floor") is not False
     ]
-    with_ticket = sum(1 for p in tradeable if p.get("ticket"))
+    live = sum(
+        1 for p in tradeable
+        if p.get("ticket") and p.get("pricing_basis") == "live"
+    )
+    prior = sum(
+        1 for p in tradeable
+        if p.get("ticket") and p.get("pricing_basis") != "live"
+    )
     top = min(len(tradeable), 9)
-    quotes = f", {with_ticket} live tickets" if with_ticket else " (tickets pending market hours)"
+    if live:
+        quotes = f", {live} live tickets" + (f" + {prior} prior-session" if prior else "")
+    elif prior:
+        quotes = f", {prior} tickets at prior-session pricing"
+    else:
+        quotes = " (no tickets priced)"
     return f"Sector Scout - {today.isoformat()} - Top {top} opportunities{quotes}"
 
 

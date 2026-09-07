@@ -34,11 +34,24 @@ def run_sector_scout_email(
     client: Any = None,
     config: dict[str, Any] | None = None,
     print_fn: Any = print,
+    rh_snapshot_path: str | None = None,
 ) -> EmailResult:
-    """Analyze the universe and send (or preview) the Sector Scout report."""
+    """Analyze the universe and send (or preview) the Sector Scout report.
+
+    `rh_snapshot_path` points at a connector-filled Robinhood snapshot
+    (robinhood_source.py); absent or unreadable, the lane runs Robinhood-less
+    and the report says so."""
     config = config if config is not None else load_sector_config()
     if top_n is not None:
         config = {**config, "selection": {**(config.get("selection") or {}), "max_plays": int(top_n)}}
+
+    rh = None
+    if rh_snapshot_path:
+        from .robinhood_source import load_snapshot
+
+        rh = load_snapshot(rh_snapshot_path)
+        if rh is None and print_fn is not None:
+            print_fn(f"[sector-scout] snapshot at {rh_snapshot_path} unreadable; running Robinhood-less")
 
     client = client or SectorDataClient(min_interval=resolve_min_interval(config))
     now = datetime.now(UTC)
@@ -54,7 +67,18 @@ def run_sector_scout_email(
     settlement = evaluate_open_calls(store, client, today)
 
     # 2. Build the computed table (the single source of truth).
-    table = build_run_table(client, config, store, today=today, now=now)
+    table = build_run_table(client, config, store, today=today, now=now, rh=rh)
+
+    # P0-1 send gate: zero priced structures means the board-only short form,
+    # never nine elaborate empty plays. The reason states itself at the top.
+    if int(table.get("structures_priced") or 0) < 1:
+        table["send_mode"] = "board_only"
+        table.setdefault("notes", []).insert(
+            0,
+            "SEND GATE: no structure priced this run "
+            f"(Robinhood snapshot: {table.get('rh_snapshot_status', 'absent')}); "
+            "sending the board-only short form.",
+        )
 
     # 3. Change log vs the previous stored run.
     prior = store.load_previous_run_table(today)

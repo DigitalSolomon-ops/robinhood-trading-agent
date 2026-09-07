@@ -108,27 +108,32 @@ def extremes_read(
     closes_daily: list[float],
     highs_daily: list[float],
     lows_daily: list[float],
-    closes_monthly: list[float],
-    spy_closes_monthly: list[float],
+    closes_weekly_pct: list[float],
+    spy_closes_weekly_pct: list[float],
     weekly_closes: list[float],
     window_label: str,
     cfg: dict[str, Any],
 ) -> ExtremesRead | None:
-    """Compute lens one. Monthly arrays must be aligned (same months) between
+    """Compute lens one. PERCENTILES ARE ON WEEKLY BARS: two years of weekly
+    closes is ~104 observations against ~24 monthly ones, four times the
+    resolution at no extra cost (2026-09-07 fix). Every percentile this
+    produces is a 2-YEAR percentile and must be labeled as such downstream --
+    the window excludes the 2022 drawdown entirely, which the method section
+    states as a plan limitation. Weekly arrays must be tail-aligned between
     the fund and SPY; the data layer guarantees that."""
-    if len(closes_daily) < 60 or len(closes_monthly) < 6:
+    if len(closes_daily) < 60 or len(closes_weekly_pct) < 26:
         return None
     current = closes_daily[-1]
 
-    price_pct = rank_percentile(closes_monthly[:-1], current)
+    price_pct = rank_percentile(closes_weekly_pct[:-1], current)
 
-    n = min(len(closes_monthly), len(spy_closes_monthly))
+    n = min(len(closes_weekly_pct), len(spy_closes_weekly_pct))
     ratio = [
-        closes_monthly[-n + i] / spy_closes_monthly[-n + i]
+        closes_weekly_pct[-n + i] / spy_closes_weekly_pct[-n + i]
         for i in range(n)
-        if spy_closes_monthly[-n + i] > 0
+        if spy_closes_weekly_pct[-n + i] > 0
     ]
-    rs_pct = rank_percentile(ratio[:-1], ratio[-1]) if len(ratio) >= 6 else 50.0
+    rs_pct = rank_percentile(ratio[:-1], ratio[-1]) if len(ratio) >= 26 else 50.0
 
     hi = max(highs_daily)
     lo = min(lows_daily)
@@ -176,9 +181,18 @@ def continuation_read(
     universe_median_pe: float | None,
     leader_earnings_improving: bool | None,
     cfg: dict[str, Any],
+    rh_sma50: float | None = None,
+    rh_sma200: float | None = None,
+    rh_weekly_rsi: float | None = None,
 ) -> ContinuationRead | None:
-    """Compute lens two: gates then the score out of 8. Score components come
-    from config (continuation.score) so the weights are never hardcoded."""
+    """Compute lens two: gates then the score out of 8. THE GATES ARE A HARD
+    FILTER: the analyzer refuses a long candidacy to any fund failing one
+    (2026-09-07 fix -- SMH ranked bullish while failing two of three).
+
+    Gate inputs prefer Robinhood's server-side SMA/RSI when a snapshot
+    carries them (operator direction: the gate reads a trustworthy number);
+    the local computation is the fallback and the historical replay's only
+    option. Score components come from config so weights are never hardcoded."""
     if len(closes_daily) < 260:
         return None
     cont = cfg.get("continuation", {}) or {}
@@ -190,15 +204,18 @@ def continuation_read(
     r12 = pct_return(closes_daily, 252)
     gate1 = all(r is not None and r > 0 for r in (r3, r6, r12))
 
-    sma50 = sma_series(closes_daily, 50)[-1]
-    sma200 = sma_series(closes_daily, 200)[-1]
+    sma50 = rh_sma50 if rh_sma50 is not None else sma_series(closes_daily, 50)[-1]
+    sma200 = rh_sma200 if rh_sma200 is not None else sma_series(closes_daily, 200)[-1]
     gate2 = (
         sma50 is not None and sma200 is not None
         and current >= sma50 and current >= sma200
     )
 
-    wk_rsi_arr = rsi_series(weekly_closes, 14)
-    weekly_rsi = wk_rsi_arr[-1] if wk_rsi_arr else None
+    if rh_weekly_rsi is not None:
+        weekly_rsi = rh_weekly_rsi
+    else:
+        wk_rsi_arr = rsi_series(weekly_closes, 14)
+        weekly_rsi = wk_rsi_arr[-1] if wk_rsi_arr else None
     pct_above = ((current / sma200) - 1.0) * 100.0 if sma200 else None
     rsi_max = float(cont.get("rsi_weekly_max", 75))
     above_max = float(cont.get("max_pct_above_sma200", 25))

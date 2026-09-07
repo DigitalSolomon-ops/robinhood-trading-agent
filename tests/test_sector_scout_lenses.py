@@ -112,7 +112,7 @@ def test_xbi_largest_mover_is_weakest_when_pace_decays() -> None:
 
 
 def test_ihi_is_the_only_coiled_fund() -> None:
-    spy_monthly = SPY[::21]
+    spy_weekly = SPY[::5]
     classifications: dict[str, str] = {}
     for symbol, (phases, *_rest) in {**FIXTURES, "IHI": (IHI_PHASES, 0, 0, None, 0)}.items():
         closes = phased(N, phases)
@@ -120,8 +120,8 @@ def test_ihi_is_the_only_coiled_fund() -> None:
             closes_daily=closes,
             highs_daily=[c * 1.01 for c in closes],
             lows_daily=[c * 0.99 for c in closes],
-            closes_monthly=closes[::21],
-            spy_closes_monthly=spy_monthly,
+            closes_weekly_pct=closes[::5],
+            spy_closes_weekly_pct=spy_weekly,
             weekly_closes=closes[::5],
             window_label="2.0y",
             cfg=CFG,
@@ -164,14 +164,14 @@ def test_fairly_valued_stabilising_deep_fund_is_coiled() -> None:
     """Review regression (2026-09-04): cheap=False, rich=False (fairly valued)
     must still classify Coiled when deep and stabilising -- the bar is
     not-expensive, not cheap."""
-    spy_monthly = SPY[::21]
+    spy_weekly = SPY[::5]
     closes = phased(N, IHI_PHASES)
     ext = extremes_read(
         closes_daily=closes,
         highs_daily=[c * 1.01 for c in closes],
         lows_daily=[c * 0.99 for c in closes],
-        closes_monthly=closes[::21],
-        spy_closes_monthly=spy_monthly,
+        closes_weekly_pct=closes[::5],
+        spy_closes_weekly_pct=spy_weekly,
         weekly_closes=closes[::5],
         window_label="2.0y",
         cfg=CFG,

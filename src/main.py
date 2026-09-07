@@ -2191,6 +2191,17 @@ def build_parser() -> argparse.ArgumentParser:
     sector_parser.add_argument("--dry-run", action="store_true", help="compose and print the email; do not send")
     sector_parser.add_argument("--top", type=int, default=None, help="how many segment plays to include")
     sector_parser.add_argument("--out", default=None, help="write the composed HTML to this path")
+    sector_parser.add_argument(
+        "--rh-snapshot", default=None,
+        help="path to a connector-filled Robinhood snapshot JSON (see sector-scout-manifest)",
+    )
+    # Emits the batched connector-call manifest an agent session services to
+    # fill a Robinhood snapshot. ANALYSIS ONLY -- prints JSON, calls nothing.
+    manifest_parser = sub.add_parser(
+        "sector-scout-manifest",
+        help="print the Robinhood snapshot manifest (the connector calls an agent must make)",
+    )
+    manifest_parser.add_argument("--out", default=None, help="write the manifest JSON to this path")
     return parser
 
 
@@ -2293,9 +2304,26 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "sector-scout-email":
         from src.sector_scout import run_sector_scout_email
 
-        result = run_sector_scout_email(dry_run=args.dry_run, top_n=args.top, out_path=args.out)
+        result = run_sector_scout_email(
+            dry_run=args.dry_run, top_n=args.top, out_path=args.out,
+            rh_snapshot_path=args.rh_snapshot,
+        )
         if not args.dry_run:
             print(result.detail)
+    elif args.command == "sector-scout-manifest":
+        import json as _json
+
+        from src.sector_scout.config import load_sector_config
+        from src.sector_scout.robinhood_source import build_manifest
+
+        manifest = build_manifest(load_sector_config())
+        text = _json.dumps(manifest, indent=1)
+        if args.out:
+            with open(args.out, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            print(f"manifest written to {args.out}")
+        else:
+            print(text)
     elif args.command == "run-paper":
         run_mode("paper", args.once)
     elif args.command == "run-paper-loop":

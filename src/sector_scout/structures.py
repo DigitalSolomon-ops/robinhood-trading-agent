@@ -48,7 +48,12 @@ EXECUTION_RULES = (
 
 @dataclass(frozen=True)
 class Leg:
-    """One leg of the structure, with its live snapshot economics."""
+    """One leg of the structure, with its live snapshot economics.
+
+    The Robinhood fields (fill-rate prices, broker chance of profit, volume,
+    adjusted mark) populate when the leg was priced from a connector
+    snapshot; the Massive path leaves them None and the ticket says which
+    basis priced it."""
 
     action: str                 # "buy" | "sell"
     option_type: str            # "call" | "put"
@@ -61,13 +66,122 @@ class Leg:
     delta: float | None
     iv: float | None
     open_interest: float | None
-    snapshot_at: str            # ISO timestamp of the Massive snapshot
+    snapshot_at: str            # ISO timestamp of the pricing snapshot
+    theta: float | None = None
+    vega: float | None = None
+    volume: float | None = None
+    adjusted_mark: float | None = None
+    high_fill_rate_buy: float | None = None
+    high_fill_rate_sell: float | None = None
+    chance_of_profit_long: float | None = None
+    pricing_basis: str = "live"   # "live" | "prior_session_close"
+    source: str = "massive"       # "robinhood" | "massive"
 
     @property
     def spread_pct_of_mark(self) -> float | None:
         if self.bid is None or self.ask is None or not self.mark:
             return None
         return round((self.ask - self.bid) / self.mark * 100.0, 1)
+
+
+def leg_from_rh_quote(
+    action: str,
+    option_type: str,
+    instrument: dict[str, Any],
+    quote: dict[str, Any],
+    *,
+    snapshot_at: str,
+) -> Leg | None:
+    """Build a Leg from a Robinhood option-quote row (connector field names,
+    verbatim). Returns None when even a settled mark is absent -- n/a, never
+    fabricated. Pricing basis: 'live' when a two-sided quote is present,
+    otherwise 'prior_session_close' priced from adjusted mark / official
+    close, and the ticket labels it."""
+
+    def _f(key: str) -> float | None:
+        raw = quote.get(key)
+        try:
+            return float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    bid, ask = _f("bid_price"), _f("ask_price")
+    mark = _f("adjusted_mark_price") or _f("mark_price")
+    close_obj = quote.get("close") or {}
+    close_price = None
+    try:
+        close_price = float(close_obj.get("price")) if close_obj.get("price") else None
+    except (TypeError, ValueError):
+        close_price = None
+
+    live = bid is not None and ask is not None and (bid > 0 or ask > 0)
+    if not live and mark is None and close_price is None:
+        return None
+    price_mark = mark if mark is not None else close_price
+    basis = "live" if live else "prior_session_close"
+
+    strike = instrument.get("strike_price") or quote.get("strike_price")
+    expiry = instrument.get("expiration_date") or quote.get("expiration_date") or ""
+    try:
+        strike_f = float(strike)
+    except (TypeError, ValueError):
+        return None
+
+    return Leg(
+        action=action,
+        option_type=option_type,
+        ticker=str(instrument.get("id") or quote.get("instrument_id") or ""),
+        strike=strike_f,
+        expiry=str(expiry),
+        bid=bid,
+        ask=ask,
+        mark=price_mark,
+        delta=_f("delta"),
+        iv=_f("implied_volatility"),
+        open_interest=_f("open_interest"),
+        snapshot_at=str(quote.get("updated_at") or snapshot_at),
+        theta=_f("theta"),
+        vega=_f("vega"),
+        volume=_f("volume"),
+        adjusted_mark=_f("adjusted_mark_price"),
+        high_fill_rate_buy=_f("high_fill_rate_buy_price"),
+        high_fill_rate_sell=_f("high_fill_rate_sell_price"),
+        chance_of_profit_long=_f("chance_of_profit_long"),
+        pricing_basis=basis,
+        source="robinhood",
+    )
+
+
+def liquidity_violations(leg: Leg, cfg: dict[str, Any]) -> list[str]:
+    """The contract-level liquidity gate: open interest, spread width, and
+    volume. A leg failing any of these makes the structure unfillable in
+    practice (2026-09-04: IHI legs with OI 0 and 9, spread wider than the
+    debit). Volume is today's session (a single-snapshot proxy for the
+    five-session rule; the docs say so)."""
+    st = cfg.get("structures", {}) or {}
+    liq = st.get("liquidity", {}) or {}
+    min_oi = float(liq.get("min_open_interest", 250))
+    max_spread_pct = float(liq.get("max_spread_pct_of_mid", 10))
+    out: list[str] = []
+    if leg.open_interest is None or leg.open_interest < min_oi:
+        out.append(
+            f"strike {leg.strike:g}: open interest "
+            f"{int(leg.open_interest) if leg.open_interest is not None else 'n/a'} "
+            f"below the {int(min_oi)} floor"
+        )
+    if leg.bid is not None and leg.ask is not None and (leg.bid + leg.ask) > 0:
+        mid = (leg.bid + leg.ask) / 2.0
+        if mid > 0:
+            spread_pct = (leg.ask - leg.bid) / mid * 100.0
+            if spread_pct > max_spread_pct:
+                out.append(
+                    f"strike {leg.strike:g}: bid-ask spread {spread_pct:.0f}% of mid, "
+                    f"wider than the {max_spread_pct:.0f}% cap"
+                )
+    if liq.get("require_volume", True) and (leg.volume is None or leg.volume <= 0):
+        if leg.pricing_basis == "live":
+            out.append(f"strike {leg.strike:g}: no volume this session")
+    return out
 
 
 @dataclass(frozen=True)
@@ -78,9 +192,9 @@ class OrderTicket:
     direction: str              # "bullish" | "bearish"
     legs: tuple[Leg, ...]
     dte_calendar: int
-    limit_price: float          # modeled high-fill-rate estimate, NOT midpoint
+    limit_price: float          # fill-rate-derived when available, NOT midpoint
     midpoint: float
-    worst_case: float           # long ask - short bid (cost of certainty)
+    worst_case: float | None    # long ask - short bid (n/a on settled-mark pricing)
     order_type: str             # "net debit" | "net credit"
     max_loss: float             # dollars per spread
     max_gain: float
@@ -92,6 +206,16 @@ class OrderTicket:
     roll_or_close_date: str
     execution_rules: tuple[str, ...]
     fill_model_note: str
+    # --- Robinhood-quote analytics (None on the Massive path) ----------------
+    pricing_basis: str = "live"           # "live" | "prior_session_close"
+    limit_basis: str = "modeled"          # "fill_rate_fields" | "modeled"
+    broker_chance_of_profit_long: float | None = None  # long leg, broker's own
+    theta_pct_of_debit_60d: float | None = None        # % of cost lost in 60 quiet days
+    vega_crush_pnl: float | None = None                # $/spread if IV falls 20%, spot flat
+    implied_move_pct: float | None = None              # ATM straddle / spot, to expiry
+    move_required_vs_implied: float | None = None      # move_required / implied move
+    exit_underlying_at_take_profit: float | None = None  # at-expiry mapping
+    liquidity_notes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -179,12 +303,15 @@ def build_debit_spread_ticket(
     today: date,
     cfg: dict[str, Any],
     rate: float,
+    implied_move_pct: float | None = None,
 ) -> tuple[OrderTicket, SpreadProbability] | None:
     """Assemble the ticket + probability block for a debit vertical. Returns
-    None when a required live number is missing -- n/a, never fabricated."""
+    None when even a settled mark is missing -- n/a, never fabricated.
+    Two-sided quotes make it LIVE pricing; marks alone make it
+    PRIOR-SESSION pricing, labeled as such (a pre-market run still prices a
+    ticket from settled closes, per P0-1)."""
     st = cfg.get("structures", {}) or {}
-    if None in (long_leg.mark, short_leg.mark, long_leg.bid, long_leg.ask,
-                short_leg.bid, short_leg.ask):
+    if long_leg.mark is None or short_leg.mark is None:
         return None
 
     frac = float(st.get("fill_model_half_spread_fraction", 0.40))
@@ -195,10 +322,31 @@ def build_debit_spread_ticket(
     midpoint = round(long_leg.mark - short_leg.mark, 2)
     if midpoint <= 0:
         return None
-    fill_long = _fill_estimate(long_leg.mark, long_leg.bid, long_leg.ask, buying=True, fraction=frac)
-    fill_short = _fill_estimate(short_leg.mark, short_leg.bid, short_leg.ask, buying=False, fraction=frac)
-    limit = _round_to(max(fill_long - fill_short, 0.01), step)
-    worst = round(long_leg.ask - short_leg.bid, 2)
+    # THE LIMIT: the broker's own fill-rate estimates when the legs carry
+    # them (high_fill_rate_buy on the long minus high_fill_rate_sell on the
+    # short); the modeled mark +/- fraction-of-half-spread only as fallback,
+    # and the ticket says which basis produced it.
+    if long_leg.high_fill_rate_buy is not None and short_leg.high_fill_rate_sell is not None:
+        limit = _round_to(max(long_leg.high_fill_rate_buy - short_leg.high_fill_rate_sell, 0.01), step)
+        limit_basis = "fill_rate_fields"
+    elif None not in (long_leg.bid, long_leg.ask, short_leg.bid, short_leg.ask):
+        fill_long = _fill_estimate(long_leg.mark, long_leg.bid, long_leg.ask, buying=True, fraction=frac)
+        fill_short = _fill_estimate(short_leg.mark, short_leg.bid, short_leg.ask, buying=False, fraction=frac)
+        limit = _round_to(max(fill_long - fill_short, 0.01), step)
+        limit_basis = "modeled"
+    else:
+        limit = _round_to(max(midpoint, 0.01), step)  # settled marks only
+        limit_basis = "prior_session_midpoint"
+    worst = (
+        round(long_leg.ask - short_leg.bid, 2)
+        if (long_leg.ask is not None and short_leg.bid is not None)
+        else None
+    )
+    pricing_basis = (
+        "live"
+        if (long_leg.pricing_basis == "live" and short_leg.pricing_basis == "live")
+        else "prior_session_close"
+    )
 
     expiry_d = date.fromisoformat(long_leg.expiry)
     dte = (expiry_d - today).days
@@ -233,6 +381,49 @@ def build_debit_spread_ticket(
         r.format(tp_pct=tp_frac * 100.0, roll_date=roll_date, roll_days=roll_days)
         for r in EXECUTION_RULES
     )
+
+    # --- Robinhood-quote analytics (each None when its inputs are) -----------
+    # Theta as a fraction of the debit: "loses X% of its cost over 60 quiet
+    # days" is the sentence that makes decay concrete.
+    theta_pct_60d = None
+    if long_leg.theta is not None and short_leg.theta is not None and limit > 0:
+        net_theta = long_leg.theta - short_leg.theta  # both negative for longs
+        theta_pct_60d = round(abs(net_theta) * 60.0 / limit * 100.0, 1)
+    # Vega crush: P&L per spread if IV falls 20 percent of itself, spot flat.
+    vega_crush = None
+    if (long_leg.vega is not None and short_leg.vega is not None
+            and long_leg.iv is not None):
+        net_vega = long_leg.vega - short_leg.vega
+        iv_drop_points = long_leg.iv * 0.20 * 100.0  # vega is per 1 IV point
+        vega_crush = round(-net_vega * iv_drop_points * 100.0, 0)
+    # The exit level: the underlying price where the spread's AT-EXPIRY value
+    # equals entry debit + 65% of max gain (labeled at-expiry mapping).
+    exit_value = limit + tp_frac * (prob.max_gain / 100.0)
+    if direction == "bullish":
+        exit_underlying = round(long_leg.strike + exit_value, 2)
+    else:
+        exit_underlying = round(long_leg.strike - exit_value, 2)
+    move_vs_implied = None
+    if implied_move_pct is not None and implied_move_pct > 0:
+        move_vs_implied = round(abs(move_req) / (implied_move_pct * 100.0), 2)
+
+    if limit_basis == "fill_rate_fields":
+        fill_note = (
+            "Limit derived from the broker's high-fill-rate estimates "
+            "(long buy estimate minus short sell estimate), rounded to five cents; "
+            "midpoint and worst case shown for comparison."
+        )
+    elif limit_basis == "modeled":
+        fill_note = (
+            f"Limit modeled as mark +/- {frac * 100:.0f}% of the half-spread per leg "
+            "(fill-rate fields unavailable on this pricing basis)."
+        )
+    else:
+        fill_note = (
+            "Prior-session pricing: limit set at the settled-mark midpoint; live "
+            "quotes were dark when this snapshot was taken. Re-price before entering."
+        )
+
     ticket = OrderTicket(
         structure=structure_name,
         direction=direction,
@@ -251,9 +442,19 @@ def build_debit_spread_ticket(
         take_profit_level=round(prob.max_gain * tp_frac, 2),
         roll_or_close_date=roll_date,
         execution_rules=rules,
-        fill_model_note=(
-            f"Limit modeled as mark +/- {frac * 100:.0f}% of the half-spread per leg "
-            "(no broker fill-rate field on Massive); midpoint and worst-case shown for comparison."
+        fill_model_note=fill_note,
+        pricing_basis=pricing_basis,
+        limit_basis=limit_basis,
+        broker_chance_of_profit_long=long_leg.chance_of_profit_long,
+        theta_pct_of_debit_60d=theta_pct_60d,
+        vega_crush_pnl=vega_crush,
+        implied_move_pct=(
+            round(implied_move_pct * 100.0, 2) if implied_move_pct is not None else None
+        ),
+        move_required_vs_implied=move_vs_implied,
+        exit_underlying_at_take_profit=exit_underlying,
+        liquidity_notes=tuple(
+            liquidity_violations(long_leg, cfg) + liquidity_violations(short_leg, cfg)
         ),
     )
     return ticket, prob
@@ -272,8 +473,7 @@ def build_credit_spread_ticket(
     """Credit vertical for the sell-premium IV regime (short put spread when
     bullish, short call spread when bearish)."""
     st = cfg.get("structures", {}) or {}
-    if None in (short_leg.mark, long_leg.mark, short_leg.bid, short_leg.ask,
-                long_leg.bid, long_leg.ask):
+    if short_leg.mark is None or long_leg.mark is None:
         return None
     frac = float(st.get("fill_model_half_spread_fraction", 0.40))
     step = float(st.get("limit_price_rounding", 0.05))
@@ -283,10 +483,27 @@ def build_credit_spread_ticket(
     midpoint = round(short_leg.mark - long_leg.mark, 2)
     if midpoint <= 0:
         return None
-    fill_short = _fill_estimate(short_leg.mark, short_leg.bid, short_leg.ask, buying=False, fraction=frac)
-    fill_long = _fill_estimate(long_leg.mark, long_leg.bid, long_leg.ask, buying=True, fraction=frac)
-    limit = _round_to(max(fill_short - fill_long, 0.01), step)
-    worst = round(short_leg.bid - long_leg.ask, 2)
+    if short_leg.high_fill_rate_sell is not None and long_leg.high_fill_rate_buy is not None:
+        limit = _round_to(max(short_leg.high_fill_rate_sell - long_leg.high_fill_rate_buy, 0.01), step)
+        limit_basis = "fill_rate_fields"
+    elif None not in (short_leg.bid, short_leg.ask, long_leg.bid, long_leg.ask):
+        fill_short = _fill_estimate(short_leg.mark, short_leg.bid, short_leg.ask, buying=False, fraction=frac)
+        fill_long = _fill_estimate(long_leg.mark, long_leg.bid, long_leg.ask, buying=True, fraction=frac)
+        limit = _round_to(max(fill_short - fill_long, 0.01), step)
+        limit_basis = "modeled"
+    else:
+        limit = _round_to(max(midpoint, 0.01), step)
+        limit_basis = "prior_session_midpoint"
+    worst = (
+        round(short_leg.bid - long_leg.ask, 2)
+        if (short_leg.bid is not None and long_leg.ask is not None)
+        else None
+    )
+    pricing_basis = (
+        "live"
+        if (short_leg.pricing_basis == "live" and long_leg.pricing_basis == "live")
+        else "prior_session_close"
+    )
 
     expiry_d = date.fromisoformat(short_leg.expiry)
     dte = (expiry_d - today).days
@@ -335,11 +552,29 @@ def build_credit_spread_ticket(
         roll_or_close_date=roll_date,
         execution_rules=rules,
         fill_model_note=(
-            f"Limit modeled as mark +/- {frac * 100:.0f}% of the half-spread per leg "
-            "(no broker fill-rate field on Massive); midpoint and worst-case shown for comparison."
+            "Credit limit from the broker fill-rate fields."
+            if limit_basis == "fill_rate_fields"
+            else f"Credit limit modeled as mark -/+ {frac * 100:.0f}% of the half-spread per leg."
+            if limit_basis == "modeled"
+            else "Prior-session pricing: credit set at the settled-mark midpoint; re-price before entering."
+        ),
+        pricing_basis=pricing_basis,
+        limit_basis=limit_basis,
+        liquidity_notes=tuple(
+            liquidity_violations(short_leg, cfg) + liquidity_violations(long_leg, cfg)
         ),
     )
     return ticket, prob
+
+
+def implied_move_from_straddle(
+    call_mark: float | None, put_mark: float | None, spot: float
+) -> float | None:
+    """The implied move to expiry as a FRACTION of spot: ATM straddle price
+    over spot. None when either side lacks a mark -- n/a, never invented."""
+    if call_mark is None or put_mark is None or spot <= 0:
+        return None
+    return (call_mark + put_mark) / spot
 
 
 def measured_move_strike(spot: float, expected_move_pct: float) -> float:

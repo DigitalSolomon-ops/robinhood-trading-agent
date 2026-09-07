@@ -182,10 +182,12 @@ def test_legend_present_in_both_renderings() -> None:
 
     html_out = render_html(_sample_table(), CHANGELOG, "x")
     assert "Legend: how to read this report" in html_out
+    import html as _html
+
     for group, entries in LEGEND:
-        assert group in html_out, f"legend group missing from HTML: {group}"
+        assert _html.escape(group) in html_out, f"legend group missing from HTML: {group}"
         for term, _ in entries:
-            assert term.split(" /")[0] in html_out
+            assert _html.escape(term.split(" /")[0]) in html_out, term
     payload = render_docx_bytes(_sample_table(), CHANGELOG, "x")
     if payload is not None:
         import io
@@ -201,7 +203,7 @@ def test_top9_section_renders_with_levels() -> None:
     """The report culminates in the Top 9: score with breakdown, the play,
     the ideal entry, and today's ceiling/floor with the price action."""
     html_out = render_html(_sample_table(), CHANGELOG, "x")
-    assert "The Top 9: best opportunities on the board, ranked" in html_out
+    assert "best opportunities on the board, ranked" in html_out
     assert "74.5 = class 20" in html_out          # score breakdown prints
     assert "63.58" in html_out                     # ideal entry
     assert "62.8" in html_out and "65.2" in html_out  # day floor / ceiling

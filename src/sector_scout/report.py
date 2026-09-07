@@ -90,12 +90,27 @@ LEGEND: list[tuple[str, list[tuple[str, str]]]] = [
         ("CONT x/8", "the continuation score: beating SPY over 12 months +2, trend "
          "accelerating +2, P/E at or below the universe median +2, within 15 percent of "
          "the 200 day average +1, leader earnings improving +1."),
-        ("IV RANK", "where today's at-the-money implied volatility sits in its own "
-         "trailing year: 0 cheapest, 100 richest. Under 30 the report buys premium "
-         "(debit spreads); over 70 it expresses the same view as a credit spread. "
-         "Reads 'collecting (N/252)' until enough daily history accumulates."),
-        ("BETA", "sensitivity to TLT (long bonds). When several selected funds sit "
-         "above 0.5 they are one interest-rate trade, and the notes say so."),
+        ("GATES", "the three continuation gates per fund: M momentum (3, 6 and 12 "
+         "month returns all positive), S structure (above the 50 and 200 day), E no "
+         "exhaustion (weekly RSI under 75, within 25 percent of the 200 day). A "
+         "struck-through letter is a failed gate; any failure VOIDS the continuation "
+         "score and bars the fund from long candidacy."),
+        ("VOID", "the continuation score was voided because a gate failed; the gate "
+         "letters show which."),
+        ("SUPP", "suppressed by the correlation guard: this fund moves with the named "
+         "primary (correlation above 0.80) and is one position with it, not a second "
+         "idea."),
+        ("RVOL PCT", "the REALIZED volatility percentile: where the current 20 day "
+         "realized volatility ranks within its own 2 year history. An interim signal "
+         "while the implied-volatility history accumulates; it is never printed as IV "
+         "rank because it is not implied volatility."),
+        ("BETA", "sensitivity to TLT (long bonds). A clustering diagnostic with zero "
+         "scoring weight: when several selected funds sit above 0.5 they are one "
+         "interest-rate trade, and the notes say so."),
+        ("2-year percentiles", "every percentile is computed on WEEKLY bars over the "
+         "labeled data window (about 104 observations). A reading of 100 means the "
+         "highest in two years, nothing longer; the window excludes the 2022 drawdown "
+         "entirely, a known limitation of the data plan."),
     ]),
     ("Probability and edge", [
         ("Model probability", "the Black-Scholes chance the fund finishes past the "
@@ -123,8 +138,28 @@ LEGEND: list[tuple[str, list[tuple[str, str]]]] = [
         ("OI", "open interest: contracts outstanding, the liquidity that lets you exit."),
         ("SPR%", "the bid-ask spread as a percent of mark: the cost of trading it."),
         ("DTE", "calendar days to expiry."),
-        ("TAKE PROFIT / ROLL/CLOSE BY", "close at 65 percent of max gain; exit or roll "
-         "by the stated date, about 45 days before expiry, whichever comes first."),
+        ("TAKE PROFIT / EXIT LEVEL / ROLL/CLOSE BY", "close at 65 percent of max gain; "
+         "the exit level is the underlying price where the spread's at-expiry value "
+         "reaches that target; exit or roll by the stated date, about 45 days before "
+         "expiry, whichever comes first."),
+        ("PRICING / LIMIT BASIS", "live means two-sided quotes priced the legs; "
+         "prior-session means settled marks did (re-price before entering). The limit "
+         "comes from the broker's high-fill-rate estimates when present, else the "
+         "modeled mark adjustment, and says which."),
+        ("BROKER P(profit)", "the broker's own chance-of-profit figure for the LONG "
+         "leg, shipped beside the Black-Scholes spread probability; they measure "
+         "different things and are labeled."),
+        ("THETA 60d", "the percent of the position's cost lost over the next 60 days "
+         "if the underlying does not move."),
+        ("IV -20% P&L", "the profit or loss per spread if implied volatility falls 20 "
+         "percent of itself with the underlying unchanged; at 180 days vega dominates "
+         "theta."),
+        ("MOVE vs IMPLIED", "the move the structure needs, as a multiple of the move "
+         "the ATM straddle implies to the same expiry. Above 1.0 the trade needs an "
+         "outlier and is flagged."),
+        ("LIQUIDITY GATE", "a leg with open interest under 250, a spread wider than "
+         "10 percent of mid, or no session volume fails fillability; the structure "
+         "prints for reference, never as an entry."),
         ("THE FALSIFIER", "the specific price or event that ends the thesis. Exit "
          "there, no debate: it is also what settlement grades a LOSS against."),
     ]),
@@ -290,38 +325,68 @@ def _changelog_html(cl: dict[str, Any]) -> str:
     return "".join(parts)
 
 
-def _board_html(funds: list[dict[str, Any]]) -> str:
+def _gates_cell(cont: dict[str, Any]) -> str:
+    """The three gate results, visible per fund (P1-1): M momentum,
+    S structure, E no-exhaustion; pass renders solid, fail renders struck."""
+    if not cont:
+        return "n/a"
+    bits = []
+    for key, letter in (("gate_momentum", "M"), ("gate_structure", "S"),
+                        ("gate_no_exhaustion", "E")):
+        ok = bool(cont.get(key))
+        color = CEDAR if ok else CLARET
+        deco = "" if ok else "text-decoration:line-through;"
+        bits.append(f'<span style="color:{color};{deco}">{letter}</span>')
+    return "".join(bits)
+
+
+def _cont_cell(cont: dict[str, Any]) -> str:
+    if not cont:
+        return "n/a"
+    if cont.get("score") is None:
+        return (
+            f'<span style="color:{CLARET};">VOID</span>'
+            if cont.get("score_voided_by_gates")
+            else "n/a"
+        )
+    return f"{cont.get('score')}/8"
+
+
+def _board_html(funds: list[dict[str, Any]], data_window: str) -> str:
+    w = _e(data_window)
     head_cells = "".join(
         f'<th style="text-align:left;padding:5px 6px;font-size:10px;color:{STONE};'
         f'letter-spacing:.5px;border-bottom:1px solid {SAND};">{h}</th>'
-        for h in ("FUND", "OPP", "CLASS", "RS PCT", "PRICE PCT", "3M", "12M", "CONT", "IV RANK", "BETA")
+        for h in ("FUND", "OPP", "CLASS", f"RS PCT ({w})", f"PRICE PCT ({w})",
+                  "3M", "12M", "GATES", "CONT", "RVOL PCT", "BETA")
     )
     rows_html: list[str] = []
     for f in funds:
         ext = f.get("extremes") or {}
         cont = f.get("continuation") or {}
-        ivr = f.get("iv_rank") or {}
         cls = f.get("classification") or "n/a"
         color = {
             "Coiled": CEDAR, "Falling knife": CLARET, "Extended": GOLD,
             "Leading and earning it": JUDGMENT,
         }.get(cls, STONE)
-        iv_txt = (
-            f"{ivr.get('iv_rank'):.0f}" if ivr.get("iv_rank") is not None
-            else f"({ivr.get('days_collected', 0)}/252)"
-        )
         opp_score = (f.get("opportunity") or {}).get("score")
+        supp = (
+            f' <span style="color:{CLARET};font-size:9px;">SUPP&gt;{_e(f["suppressed_by"])}</span>'
+            if f.get("suppressed_by") else ""
+        )
+        rvol = f.get("realized_vol_pctile")
         rows_html.append(
             "<tr>"
-            f'<td style="padding:4px 6px;font-weight:700;color:{INK};">{_e(f["symbol"])}</td>'
+            f'<td style="padding:4px 6px;font-weight:700;color:{INK};">{_e(f["symbol"])}{supp}</td>'
             f'<td style="padding:4px 6px;font-weight:700;color:{GOLD};">{_num(opp_score, "{:g}")}</td>'
             f'<td style="padding:4px 6px;color:{color};font-weight:600;">{_e(cls)}</td>'
             f'<td style="padding:4px 6px;">{_num(ext.get("rs_pctile"), "{:.0f}")}</td>'
             f'<td style="padding:4px 6px;">{_num(ext.get("price_pctile"), "{:.0f}")}</td>'
             f'<td style="padding:4px 6px;">{_pct(ext.get("ret_3m"))}</td>'
             f'<td style="padding:4px 6px;">{_pct(ext.get("ret_12m"))}</td>'
-            f'<td style="padding:4px 6px;">{cont.get("score", "n/a")}/8</td>'
-            f'<td style="padding:4px 6px;">{iv_txt}</td>'
+            f'<td style="padding:4px 6px;">{_gates_cell(cont)}</td>'
+            f'<td style="padding:4px 6px;">{_cont_cell(cont)}</td>'
+            f'<td style="padding:4px 6px;">{_num(rvol, "{:.0f}")}</td>'
             f'<td style="padding:4px 6px;">{_num(f.get("rate_beta"), "{:+.2f}")}</td>'
             "</tr>"
         )
@@ -333,66 +398,123 @@ def _board_html(funds: list[dict[str, Any]]) -> str:
 
 
 def _strategy_beats(play: dict[str, Any]) -> str:
-    """The four required beats, in order, in plain prose, from the data."""
+    """The four required beats, in order, in plain prose -- READING ONLY THE
+    VALUES THE RUN HAS (P1-4). A null input yields a sentence saying the
+    input is missing, or no sentence; no branch may assert rich / thinning /
+    persistent / exhausted (or any qualitative claim) that is not backed by
+    a non-null number in this same play dict. A test enforces the rule."""
     ext_row = play.get("_fund_row_extremes") or {}
     cont = play.get("_fund_row_continuation") or {}
+    valuation = play.get("_fund_row_valuation") or {}
     ivr = play.get("iv_rank") or {}
     ticket = play.get("ticket") or {}
     legs = ticket.get("legs") or []
     long_leg = legs[0] if legs else {}
     cls = play.get("classification")
     bullish = play.get("direction") == "bullish"
+    window = _e(ext_row.get("window_label", "the available window"))
 
+    # Beat 1: why this sector -- position facts only.
     breadth_val = (play.get("breadth") or {}).get("pct_above_200d")
-    breadth_txt = _pct(breadth_val) if breadth_val is not None else "n/a"
+    breadth_txt = (
+        f"breadth reads {_pct(breadth_val)} of constituents above their own 200 day average"
+        if breadth_val is not None
+        else "breadth is not yet computable this run (cache still building)"
+    )
     why_sector = (
-        f"Why this sector: {play['fund']} classifies {cls} with relative strength "
-        f"percentile {_num(ext_row.get('rs_pctile'), '{:.0f}')} and price percentile "
-        f"{_num(ext_row.get('price_pctile'), '{:.0f}')} over {_e(ext_row.get('window_label', 'the available window'))}; "
-        f"breadth reads {breadth_txt} of constituents above their own 200 day average."
+        f"Why this sector: {play['fund']} classifies {cls} with a {window} relative "
+        f"strength percentile of {_num(ext_row.get('rs_pctile'), '{:.0f}')} and a {window} "
+        f"price percentile of {_num(ext_row.get('price_pctile'), '{:.0f}')} (weekly bars); "
+        f"{breadth_txt}."
     )
-    if bullish:
-        why_direction = (
-            f"Why this direction: calls, because the {cls} classification argues "
-            + ("recovery from a washed out base with stabilising trend"
-               if cls == "Coiled"
-               else "trend persistence with the continuation gates passing")
-            + f" (continuation score {cont.get('score', 'n/a')}/8)."
+
+    # Beat 2: why this direction -- claims only from present values.
+    score = cont.get("score")
+    fund_pe = valuation.get("leader_median_pe")
+    uni_pe = valuation.get("universe_median_pe")
+    if bullish and cls == "Coiled":
+        r3 = ext_row.get("ret_3m")
+        stab = (
+            f"the 3 month return has turned positive ({_pct(r3)})"
+            if (r3 is not None and r3 > 0)
+            else "price has reclaimed the 50 day average"
+            if ext_row.get("above_sma50")
+            else "the stabilisation test passed"
         )
+        why_direction = (
+            f"Why this direction: calls, because the fund sits in the bottom of its {window} "
+            f"range while {stab}; the trade is the recovery."
+        )
+    elif bullish:
+        gate_txt = (
+            f"all three continuation gates pass and the score is {score}/8"
+            if score is not None
+            else "the continuation gates pass"
+        )
+        why_direction = f"Why this direction: calls, because {gate_txt}."
     else:
+        accel = cont.get("accel")
+        rich_txt = ""
+        if fund_pe is not None and uni_pe is not None and fund_pe > uni_pe:
+            rich_txt = (
+                f", with the leader-median P/E at {_num(fund_pe, '{:.1f}')} against a "
+                f"universe median of {_num(uni_pe, '{:.1f}')}"
+            )
         why_direction = (
-            f"Why this direction: puts, because {cls} height with valuation rich and "
-            "breadth thinning argues exhaustion rather than persistence."
+            f"Why this direction: puts, because the fund sits at the top of its {window} "
+            f"range with acceleration {_num(accel, '{:+.2f}')} (negative: the pace is "
+            f"decaying) and price below the 50 day average{rich_txt}."
         )
+
+    # Beat 3: why now -- the timing evidence that exists.
+    bits: list[str] = []
     accel = cont.get("accel")
-    why_now = (
-        "Why now: "
-        + (f"acceleration {_num(accel, '{:+.2f}')} (3 month pace vs the 12 month), "
-           if accel is not None else "")
-        + f"price {'above' if ext_row.get('above_sma50') else 'below'} the 50 day and "
-        f"{'above' if ext_row.get('above_sma200') else 'below'} the 200 day, weekly RSI "
-        f"{_num(ext_row.get('weekly_rsi'), '{:.0f}')}, and the catalyst calendar inside the window."
+    if accel is not None:
+        bits.append(f"acceleration {_num(accel, '{:+.2f}')} (3 month pace against the 12 month)")
+    bits.append(
+        f"price {'above' if ext_row.get('above_sma50') else 'below'} the 50 day and "
+        f"{'above' if ext_row.get('above_sma200') else 'below'} the 200 day"
     )
+    wk_rsi = ext_row.get("weekly_rsi")
+    if wk_rsi is not None:
+        bits.append(f"weekly RSI {_num(wk_rsi, '{:.0f}')}")
+    why_now = "Why now: " + ", ".join(bits) + "."
+
+    # Beat 4: why this contract -- only when a contract exists.
+    if not ticket:
+        why_contract = (
+            "Why this contract: no contract priced this run "
+            f"({_e(play.get('skipped_reason') or 'pricing unavailable')}); the intended "
+            f"structure is a {_e(play.get('intended_structure') or 'vertical spread')} and the "
+            "ticket appears when quotes price."
+        )
+        return " ".join((why_sector, why_direction, why_now, why_contract))
+
     delta_val = long_leg.get("delta")
     if delta_val is None:
-        moneyness = "positioned near the target delta (greeks pending market hours)"
+        moneyness = "selected strike-nearest the reference level (greeks were dark; prior-session pricing)"
     elif abs(delta_val) >= 0.5:
         moneyness = "slightly in the money for immediate participation"
     else:
-        moneyness = "out of the money for leverage on the recovery"
+        moneyness = "out of the money for leverage"
+    theta_txt = ""
+    if ticket.get("theta_pct_of_debit_60d") is not None:
+        theta_txt = (
+            f" It loses about {_num(ticket.get('theta_pct_of_debit_60d'), '{:.0f}')}% of its "
+            "cost over the next 60 days if nothing happens."
+        )
+    iv_txt = ""
+    if ivr.get("iv_rank") is not None:
+        iv_txt = (
+            f"; IV rank {_num(ivr.get('iv_rank'), '{:.0f}')} routed the structure "
+            f"({'buy premium' if ivr.get('regime') == 'buy_premium' else 'sell premium' if ivr.get('regime') == 'sell_premium' else 'either'})"
+        )
     why_contract = (
         f"Why this contract: the {ticket.get('dte_calendar', 'n/a')} DTE monthly sits in the "
         f"{play.get('_dte_band', '150 to 240')} day band where six month theses get room while "
         "daily theta stays a fraction of a front month's; the long leg at "
         f"{_num(long_leg.get('strike'), '{:g}')} (delta {_num(delta_val, '{:.2f}')}) is "
-        + moneyness
-        + f"; IV rank {ivr.get('iv_rank') if ivr.get('iv_rank') is not None else 'is still collecting'}"
-        + (" says premium is cheap, so a debit structure buys it"
-           if ivr.get("regime") == "buy_premium"
-           else " says premium is rich, so the view is expressed as a credit spread"
-           if ivr.get("regime") == "sell_premium"
-           else "; the classification chose the structure")
-        + "."
+        + moneyness + iv_txt + "." + theta_txt
     )
     return " ".join((why_sector, why_direction, why_now, why_contract))
 
@@ -472,8 +594,29 @@ def _ticket_html(play: dict[str, Any]) -> str:
     )
     chips3 = (
         _chip("TAKE PROFIT $", _num(ticket.get("take_profit_level"), "{:,.0f}"))
+        + _chip("EXIT LEVEL (underlying, at expiry)", _num(ticket.get("exit_underlying_at_take_profit")))
         + _chip("ROLL/CLOSE BY", _e(ticket.get("roll_or_close_date", "n/a")))
     )
+    theta_pct = ticket.get("theta_pct_of_debit_60d")
+    chips4 = (
+        _chip("PRICING", _e(ticket.get("pricing_basis", "n/a")), mono=False)
+        + _chip("LIMIT BASIS", _e(ticket.get("limit_basis", "n/a")), mono=False)
+        + _chip("BROKER P(profit) long leg", _pct(ticket.get("broker_chance_of_profit_long")))
+        + _chip("THETA 60d", (_num(theta_pct, "{:.0f}") + "% of cost") if theta_pct is not None else "n/a")
+        + _chip("IV -20% P&L", _num(ticket.get("vega_crush_pnl"), "{:+,.0f}"))
+        + _chip("MOVE vs IMPLIED", _num(ticket.get("move_required_vs_implied"), "{:.2f}") + "x"
+                if ticket.get("move_required_vs_implied") is not None else "n/a")
+    )
+    liquidity_html = ""
+    liq_notes = ticket.get("liquidity_notes") or []
+    if liq_notes:
+        items = "".join(f"<li>{_e(n)}</li>" for n in liq_notes)
+        liquidity_html = (
+            f'<div style="background:#fdf0f0;border:1px solid {CLARET};border-radius:4px;'
+            f'padding:6px 8px;margin-top:6px;font-size:12px;color:{CLARET};">'
+            f"<strong>LIQUIDITY GATE:</strong> this structure fails the fillability test "
+            f"and is shown for reference, not entry.<ul style=\"margin:4px 0 0 16px;padding:0;\">{items}</ul></div>"
+        )
     rules = "".join(f"<li>{_e(r)}</li>" for r in ticket.get("execution_rules") or [])
     snap_at = legs[0].get("snapshot_at") if legs else "n/a"
     return (
@@ -496,6 +639,8 @@ def _ticket_html(play: dict[str, Any]) -> str:
         f'<table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:8px;"><tr>{chips1}</tr></table>'
         f'<table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:6px;"><tr>{chips2}</tr></table>'
         f'<table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:6px;"><tr>{chips3}</tr></table>'
+        f'<table role="presentation" cellpadding="0" cellspacing="0" style="margin-top:6px;"><tr>{chips4}</tr></table>'
+        f"{liquidity_html}"
         f'<div style="font-size:11px;color:{STONE};margin-top:6px;">{_e(ticket.get("fill_model_note", ""))} '
         f"Snapshot captured {_e(snap_at)}.</div>"
         f'<div style="font-size:12px;color:{INK};margin-top:6px;"><strong>Standing rules:</strong>'
@@ -587,6 +732,7 @@ def prepare_table(table: dict[str, Any]) -> dict[str, Any]:
         )
         play["_fund_row_extremes"] = row.get("extremes") or {}
         play["_fund_row_continuation"] = row.get("continuation") or {}
+        play["_fund_row_valuation"] = row.get("valuation") or {}
         play["_dte_band"] = (
             f"{band.get('dte_min', 150)} to {band.get('dte_max', 240)}"
         )
@@ -686,14 +832,66 @@ def render_html(table: dict[str, Any], changelog: dict[str, Any], settlement_lin
     plays = table.get("plays") or []
 
     read = compose_read(table)
-    tradeable = [p for p in plays if p.get("classification") != "Falling knife"]
+    board_only = table.get("send_mode") == "board_only"
+
+    # Top 9: tradeable plays that pass the EV/probability floors (P2-6). The
+    # board can come back with three names, or none, and says so.
+    listed = [
+        p for p in plays
+        if p.get("classification") != "Falling knife"
+        and (p.get("passes_floor") is not False)
+    ]
+    floored_out = [p["fund"] for p in plays if p.get("passes_floor") is False]
     top9_blocks = "".join(
-        _top9_block_html(i + 1, p) for i, p in enumerate(tradeable[:9])
+        _top9_block_html(i + 1, p) for i, p in enumerate(listed[:9])
     ) or (
-        f'<div style="font-size:13px;color:{STONE};">No tradeable opportunities '
-        "cleared the screen this run.</div>"
+        f'<div style="font-size:13px;color:{STONE};">No opportunity cleared the '
+        "screen and the floors this run. That is the honest answer, not a gap.</div>"
     )
-    play_blocks = "".join(_play_block_html(i + 1, p) for i, p in enumerate(plays))
+    floor_note = (
+        f'<div style="font-size:11px;color:{STONE};margin-top:4px;">Below the EV/probability '
+        f"floors and not listed: {_e(', '.join(floored_out))}.</div>"
+        if floored_out else ""
+    )
+    if board_only:
+        top9_section = (
+            _h2("No tradeable structures this session: board only")
+            + f'<div style="font-size:13px;color:{INK};">'
+            + _e((table.get("notes") or ["send gate engaged"])[0])
+            + "</div>"
+        )
+    else:
+        top9_section = (
+            _h2(f"The Top {min(len(listed), 9)}: best opportunities on the board, ranked")
+            + f'<div style="font-size:12px;color:{STONE};margin-bottom:4px;">One cumulative score '
+            "over the LIVE columns (" + _e(", ".join(table.get("contributing_columns") or []))
+            + "), scored by how cleanly each column fits the trade the fund argues for and "
+            "renormalised to 100. " + _e(table.get("excluded_columns_note") or "")
+            + " Correlated duplicates are collapsed to one position (marked SUPP on the board)."
+            " Day levels are for TODAY's session, from the last close and the 14 day average "
+            "true range.</div>"
+            + top9_blocks
+            + floor_note
+        )
+    play_blocks = (
+        "" if board_only
+        else "".join(_play_block_html(i + 1, p) for i, p in enumerate(plays))
+    )
+
+    # Watch list: Extended funds whose short has not triggered, and knives.
+    watch_rows_html = ""
+    for w in table.get("watch") or []:
+        watch_rows_html += (
+            f'<div style="border-left:3px solid {GOLD};padding:6px 10px;margin:6px 0;'
+            f'font-size:13px;color:{INK};background:{PARCHMENT};">'
+            f'<strong>{_e(w.get("fund"))}</strong> ({_e(w.get("classification"))}, '
+            f'spot {_num(w.get("spot"))}): {_e(w.get("reason") or "no trade")} '
+            f'<span style="color:{JUDGMENT};">{_e(w.get("trigger") or "")}</span></div>'
+        )
+    watch_section = (
+        (_h2("Watch: classified, no trade yet") + watch_rows_html)
+        if (watch_rows_html and not board_only) else ""
+    )
     calendar_rows = "".join(
         f'<tr><td style="padding:3px 8px;font-weight:700;">{_e(r["ticker"])}</td>'
         f'<td style="padding:3px 8px;">{_e(r["earnings_date"])}</td></tr>'
@@ -706,7 +904,8 @@ def render_html(table: dict[str, Any], changelog: dict[str, Any], settlement_lin
     window = table.get("window") or {}
     subtitle = (
         f"{table.get('run_date')} | window {window.get('start')} to {window.get('end')}"
-        f" | data window {table.get('data_window')} | analysis only"
+        f" | {table.get('percentile_basis') or (str(table.get('data_window')) + ' data window')}"
+        " | analysis only"
     )
     body = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
@@ -721,20 +920,17 @@ def render_html(table: dict[str, Any], changelog: dict[str, Any], settlement_lin
     <tr><td style="padding:18px;">
       {_h2("The read")}
       <div style="font-size:14px;line-height:1.7;color:{INK};">{_e(read)}</div>
-      {_h2("The Top 9: best opportunities on the board, ranked")}
-      <div style="font-size:12px;color:{STONE};margin-bottom:4px;">One cumulative score
-      across CLASS, RS PCT, PRICE PCT, 3M, 12M, CONT, IV RANK and BETA, scored by how
-      cleanly each column fits the trade the fund argues for. The breakdown prints on
-      every entry; the legend has the formula. Day levels are for TODAY's session, from
-      the last close and the 14 day average true range.</div>
-      {top9_blocks}
+      {top9_section}
       {_h2("Change log")}
       {_changelog_html(changelog)}
       {_h2("The segment board (both lenses, sorted by relative strength ascending)")}
-      <div style="font-size:11px;color:{STONE};margin-bottom:6px;">{_e(table.get("calibration_note", ""))}</div>
-      {_board_html(table.get("funds") or [])}
-      {_h2("The plays, ranked by expected value")}
-      {play_blocks or '<div style="font-size:13px;color:' + STONE + ';">No structures this run.</div>'}
+      <div style="font-size:11px;color:{STONE};margin-bottom:6px;">{_e(table.get("calibration_note", ""))}
+      Robinhood snapshot: {_e(table.get("rh_snapshot_status", "absent"))}. Gate inputs:
+      {_e((table.get("funds") or [{}])[0].get("gate_inputs_source", "local"))}.</div>
+      {_board_html(table.get("funds") or [], table.get("data_window") or "2y")}
+      {"" if board_only else _h2("The plays, ranked by opportunity score")}
+      {play_blocks if not board_only else ""}
+      {watch_section}
       {_h2("Six month calendar (leader earnings inside the option window)")}
       <div style="overflow-x:auto;"><table role="presentation" cellpadding="0" cellspacing="0" style="font-size:12px;">{calendar_rows}</table></div>
       {_h2("Settlement: the report grades itself")}
@@ -871,7 +1067,11 @@ def render_docx_bytes(table: dict[str, Any], changelog: dict[str, Any], settleme
         cells[3].text = _num(ext.get("price_pctile"), "{:.0f}")
         cells[4].text = _pct(ext.get("ret_3m"))
         cells[5].text = _pct(ext.get("ret_12m"))
-        cells[6].text = f"{cont.get('score', 'n/a')}/8"
+        score = (cont or {}).get("score")
+        cells[6].text = (
+            f"{score}/8" if score is not None
+            else "VOID" if (cont or {}).get("score_voided_by_gates") else "n/a"
+        )
         cells[7].text = _num(f.get("rate_beta"), "{:+.2f}")
 
     head("The plays")
@@ -917,6 +1117,16 @@ def render_docx_bytes(table: dict[str, Any], changelog: dict[str, Any], settleme
                 "points; the options market is pricing something the history does not contain."
             )
         para("THE FALSIFIER. " + str(play.get("falsifier") or play.get("skipped_reason") or "n/a"))
+
+    watch = table.get("watch") or []
+    if watch:
+        head("Watch: classified, no trade yet")
+        for w in watch:
+            para(
+                f"{w.get('fund')} ({w.get('classification')}, spot {w.get('spot')}): "
+                f"{w.get('reason') or 'no trade'} {w.get('trigger') or ''}",
+                10,
+            )
 
     head("Six month calendar")
     for row in table.get("calendar") or []:

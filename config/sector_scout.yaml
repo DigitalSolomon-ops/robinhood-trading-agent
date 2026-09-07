@@ -164,6 +164,12 @@ structures:
   credit_width_min: 5.0
   # Bullish falsifier: min(200-day SMA, spot * (1 - this)).
   falsifier_drawdown_fraction: 0.10
+  # Contract-level liquidity gate (2026-09-04: IHI legs had OI 0 and 9 with
+  # a spread wider than the debit). Violations print on the ticket.
+  liquidity:
+    min_open_interest: 250
+    max_spread_pct_of_mid: 10
+    require_volume: true   # today's session volume (single-snapshot proxy)
   # Short leg for a continuation call spread sits above the six-month measured
   # move (fund close * (1 + expected_move)).
   # IV-rank routing: below buy_premium_max, debit structures; above
@@ -241,17 +247,34 @@ opportunity:
   rs_price_max: 10       # points each for RS and PRICE percentile fit
   ret_max: 10            # points each for the 3M and 12M momentum legs
   ret3m_scale: 0.15      # 3M return that earns full points
+  ret3m_scale_coiled: 0.08   # a stabilising turn needs less to count
   ret12m_scale: 0.40     # 12M return that earns full points
   cont_max: 20           # continuation score leg (inverted for bearish plays)
-  iv_max: 10             # premium-cost fit (cheap to buy / rich to sell)
-  beta_max: 5            # purity: low |rate beta| = the sector idea, not bonds
+  bearish_accel_penalty_max: 5   # points an Extended short LOSES for accel > 0
+  accel_scale: 0.5
+  # IV carries NO scoring weight until a real implied-vol history exists;
+  # BETA carries none ever (clustering diagnostic). The score renormalises
+  # over the live columns and the report states which they are (P2-1, P2-5).
   # Day-trade entry levels on the underlying, from the last close and ATR(14).
   entry_atr_fraction: 0.35   # ideal entry sits this many ATRs into the pullback
   day_range_atr: 1.0         # day ceiling/floor sit one ATR either side
 
+# --- Robinhood snapshot (the connector-filled data source) --------------------
+# The equities/options surface exists only through the session-bound MCP
+# connector (docs/rh-equities-binding.md, re-verified 2026-09-07): an agent
+# session fills the manifest (sector-scout-manifest) and the lane consumes
+# the snapshot. Stale snapshots degrade to n/a, never presented as live.
+robinhood:
+  snapshot_max_age_hours: 20
+
 # --- selection ---------------------------------------------------------------
 selection:
   max_plays: 9           # the Top 9 (ranked by the opportunity score)
+  # P2-6: floors a play must clear to be LISTED. The board can come back
+  # with three names, or none -- a daily Top 9 by construction teaches the
+  # reader to discount the ranking.
+  min_expected_value: 0.0     # dollars per spread; EV below this is not listed
+  min_prob_profit: 0.20       # Black-Scholes probability floor
   min_leaders_confirmed: 2
   shortlist_max: 10      # funds that get the leader-detail API budget
   leader_detail_budget: 2  # leaders per shortlisted fund getting details
