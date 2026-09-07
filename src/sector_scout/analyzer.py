@@ -168,6 +168,19 @@ def confirm_leaders(
 # --- option-chain reads: Robinhood snapshot first, Massive fallback -----------
 
 
+def gate_inputs_label(
+    rh_sma50: float | None, rh_sma200: float | None, rh_weekly_rsi: float | None
+) -> str:
+    """"robinhood" only when the snapshot ACTUALLY carried a gate indicator --
+    a fresh snapshot with no indicators means the gates computed locally, and
+    the label must say so (the P1-4 rule applied to metadata)."""
+    return (
+        "robinhood"
+        if any(v is not None for v in (rh_sma50, rh_sma200, rh_weekly_rsi))
+        else "local"
+    )
+
+
 def _rh_pick_expiry(rh: RhSnapshot, fund: str, today: date, cfg: dict[str, Any]) -> str | None:
     chain = rh.chains.get(fund.upper()) or {}
     expirations = [str(e) for e in chain.get("expiration_dates") or []]
@@ -522,6 +535,9 @@ def build_run_table(
             notes.append(f"{fund}: insufficient history for the lenses; excluded")
             continue
 
+        rh_sma50 = rh_fresh.indicator(fund, "sma_50") if rh_fresh else None
+        rh_sma200 = rh_fresh.indicator(fund, "sma_200") if rh_fresh else None
+        rh_weekly_rsi = rh_fresh.indicator(fund, "rsi_14_weekly") if rh_fresh else None
         cont = continuation_read(
             closes_daily=hist.closes_daily,
             spy_closes_daily=spy.closes_daily,
@@ -530,9 +546,9 @@ def build_run_table(
             universe_median_pe=None,
             leader_earnings_improving=None,
             cfg=config,
-            rh_sma50=rh_fresh.indicator(fund, "sma_50") if rh_fresh else None,
-            rh_sma200=rh_fresh.indicator(fund, "sma_200") if rh_fresh else None,
-            rh_weekly_rsi=rh_fresh.indicator(fund, "rsi_14_weekly") if rh_fresh else None,
+            rh_sma50=rh_sma50,
+            rh_sma200=rh_sma200,
+            rh_weekly_rsi=rh_weekly_rsi,
         )
 
         ivr = iv_rank_read(
@@ -562,7 +578,7 @@ def build_run_table(
                 "realized_vol_pctile": realized_vol_percentile(hist.closes_daily),
                 "rate_beta": beta,
                 "classification": None,
-                "gate_inputs_source": "robinhood" if rh_fresh else "local",
+                "gate_inputs_source": gate_inputs_label(rh_sma50, rh_sma200, rh_weekly_rsi),
             }
         )
 

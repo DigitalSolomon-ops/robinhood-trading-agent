@@ -9,7 +9,7 @@ import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
-from src.sector_scout.analyzer import confirm_leaders
+from src.sector_scout.analyzer import confirm_leaders, gate_inputs_label
 from src.sector_scout.report import _strategy_beats
 from src.sector_scout.robinhood_source import (
     RhSnapshot,
@@ -245,6 +245,15 @@ def test_narrative_backs_valuation_claims_with_numbers() -> None:
     text = _strategy_beats(play)
     assert "31.0" in text and "22.0" in text     # the claim carries its numbers
     assert "2.0y" in text                        # percentiles labeled with the window
+
+
+def test_gate_inputs_label_never_claims_robinhood_without_indicators() -> None:
+    """A FRESH snapshot with no indicator rows still computed its gates
+    locally -- the meta line must say local, not robinhood (found live on the
+    2026-09-06 dry run, where the fill skipped indicators by design)."""
+    assert gate_inputs_label(None, None, None) == "local"
+    assert gate_inputs_label(101.2, None, None) == "robinhood"
+    assert gate_inputs_label(None, None, 47.3) == "robinhood"
 
 
 def test_manifest_batches_respect_tool_limits() -> None:
