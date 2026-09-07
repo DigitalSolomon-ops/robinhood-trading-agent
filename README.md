@@ -1,32 +1,72 @@
-# Digital Solomon Crypto Agent
+# Solomon Trader — Robinhood trading & research agent
 
-Local, rules-based Robinhood Crypto Trading API agent. It is designed to execute only predefined strategy signals that pass a strict risk manager. It is not an AI trader and should not be treated as investment advice.
+A rules-based trading and market-research system for Robinhood, in two halves
+with deliberately different privileges:
 
-Crypto trading can lose money quickly. Keep live trading disabled until you have reviewed the code, tested paper behavior, and confirmed the official Robinhood API details for your account.
+- **Trading lanes** (crypto, equities, defined-risk options) execute only
+  predefined strategy signals that pass a strict risk manager. Nothing here is
+  an AI trader, and nothing here is investment advice.
+- **Scout lanes** (research only, **no order path at all**) screen the market
+  on cloud schedules and email a ranked, written research report each morning.
 
-## Analysis-only scout lanes (never trade)
+Trading can lose money quickly. Keep live trading disabled until you have
+reviewed the code, tested paper behavior, and confirmed the current Robinhood
+API details for your account.
 
-Three sibling research lanes share this repo but have no order path at all:
+## Safety architecture
 
-- **Options Scout** (`docs/options-scout.md`): daily ranked candidate options plays across 19 liquid single names, 10 trading-day horizon.
-- **Small-Cap Scout** (`docs/smallcap-scout.md`): the small-cap screen.
-- **Sector Scout** (`docs/sector-scout.md`): sector-first six-month options research; picks the market segment, the leaders inside it, and a dated spread per play with probability of profit, expected value, and a written strategy. Daily HTML email + DOCX attachment. `python -m src.main sector-scout-email --dry-run`.
+The design goal is that a container which should not trade *cannot* trade, and
+a lane that may trade must pass through independent brakes:
 
-## Safety Defaults
+- **Analysis images are incapable of ordering.** The scout Dockerfiles use an
+  explicit COPY allow-list — the broker/order code is physically absent from
+  the image, not disabled by a flag (`deploy/../Dockerfile.sector-scout`).
+- **Kill switch** (`src/kill_switch.py`): the presence of a `STOP_TRADING`
+  file blocks new orders before every action. `python -m src.main stop`
+  creates it.
+- **Layered enables:** live submission requires `TRADING_MODE=live` in `.env`
+  AND `TRADING_ENABLED=true` AND `config/trading_rules.yaml`
+  `trading.enabled: true` + `trading.mode: live` AND no `STOP_TRADING` file.
+  Default everywhere is paper/off.
+- **Fail-closed options gates** (`src/option_risk_gates.py`): every options
+  strategy maps to a required Robinhood approval level; an unknown or
+  unreadable level refuses, never permits. Opening sells that can't be proven
+  covered are classified unsupported.
+- **Dry-run mode** (`run-dry`) prepares live order payloads and never submits.
+- **Live-readiness gate** (`src/equity_readiness.py`): the equities lane's
+  go/no-go — runs the full test suite and evaluates every gate against it
+  before a live session is even considered.
 
-- Default mode is `TRADING_MODE=paper`.
-- `.env.example` sets `TRADING_ENABLED=false`.
-- `config/trading_rules.yaml` sets `trading.enabled: false`.
-- `python -m src.main run-live` refuses to start unless `.env` explicitly contains `TRADING_MODE=live`.
-- Live submissions require `TRADING_ENABLED=true`, no `STOP_TRADING` file, valid API credentials, and `config/trading_rules.yaml` with `trading.enabled: true` and `trading.mode: live`.
+## Lanes
+
+Six scheduled Cloud Run Jobs plus an IAP-guarded dashboard service, GCP
+project-scoped, all deployed from `deploy/` (one `cloudbuild.*.yaml` +
+`deploy-*.sh` pair each):
+
+| Lane | Schedule (ET) | Trades? | What it does |
+|---|---|---|---|
+| Sector Scout | 13:00 weekdays | never | Sector-first six-month options research: segment → leaders → dated spread per play with probability of profit, EV, and a written strategy. HTML email + DOCX. `docs/sector-scout.md` |
+| Options Scout | 08:00 weekdays | never | Daily ranked candidate options plays across 19 liquid single names. `docs/options-scout.md` |
+| Small-Cap Scout | 07:30 weekdays | never | The small-cap screen. `docs/smallcap-scout.md` |
+| Entry Alerts | every 10 min, 9–16 weekdays | never | Intraday entry-condition watcher. |
+| Scout Settlement | 18:00 weekdays | never | Scores predicted vs. realized; feeds `src/scout_calibration/`. |
+| Options Trader | every 30 min, 9–16 weekdays | gated | The defined-risk options lane, behind every brake above. |
+
+The spread model (`src/sector_scout/probability.py`) computes probability of
+profit and expected value in closed form (Black–Scholes intermediate-region
+integration, stdlib only); model numbers are published alongside empirical
+base rates, and divergence past threshold is reported as a finding.
+
+Rate-limit discipline against the Massive market-data API is deterministic
+pacing, not reactive retry: a minimum request interval sized to the
+entitlement, capped-exponential backoff that outlasts the 60s window, and a
+task timeout raised because a throttled run legitimately takes 25–45 minutes
+(`src/equity_intelligence/massive_client.py`).
 
 ## Install
 
-The project lives at `C:\Users\marcu\Projects\Robinhood Trading Agent\agent`. The `.venv`
-is already built there; these steps only need repeating on a fresh machine.
-
 ```console
-cd "C:\Users\marcu\Projects\Robinhood Trading Agent\agent"
+git clone <this repo> && cd agent
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
@@ -35,37 +75,27 @@ python -m src.main init
 
 On macOS or Linux, activate with `source .venv/bin/activate`.
 
-## Create Robinhood Crypto API Credentials
+## Robinhood Crypto API credentials
 
-Robinhood's official Crypto Trading API docs say credentials are created from crypto account settings on web classic:
-
-1. Open Robinhood web classic.
-2. Go to crypto account settings: https://robinhood.com/account/crypto
-3. Create Crypto Trading API credentials.
-4. Store the API key as `ROBINHOOD_API_KEY`.
-5. Store your base64 Ed25519 private key as `ROBINHOOD_PRIVATE_KEY`.
-
-Authenticated requests use signed headers:
-
-- `x-api-key`
-- `x-signature`
-- `x-timestamp`
-
-The implemented signature follows Robinhood's documented message format:
+Robinhood's Crypto Trading API credentials are created from crypto account
+settings on web classic (https://robinhood.com/account/crypto). Store the API
+key as `ROBINHOOD_API_KEY` and the base64 Ed25519 private key as
+`ROBINHOOD_PRIVATE_KEY`. Authenticated requests carry `x-api-key`,
+`x-signature`, `x-timestamp`, signing the documented message format:
 
 ```text
 {api_key}{timestamp}{path}{method}{body}
 ```
 
-Do not use a Robinhood username or password with this project.
+Do not use a Robinhood username or password with this project. Secrets resolve
+env-first, then Google Secret Manager by name at runtime; nothing is logged or
+written to disk.
 
 ## Configure `.env`
 
 ```console
 copy .env.example .env
 ```
-
-Then edit `.env`:
 
 ```dotenv
 ROBINHOOD_API_KEY=
@@ -76,112 +106,65 @@ TRADING_ENABLED=false
 POLL_INTERVAL_SECONDS=60
 ```
 
-Leave `TRADING_ENABLED=false` until you intentionally want to allow rule-approved orders. With defaults, the bot logs decisions and risk blocks but places no orders.
+Leave `TRADING_ENABLED=false` until you intentionally want to allow
+rule-approved orders. With defaults, the bot logs decisions and risk blocks
+and places no orders.
 
-**Risk caps are not set here.** They live in `config/trading_rules.yaml` under `risk:`. No code
-reads `MAX_DAILY_LOSS_USD`, `MAX_TRADE_AMOUNT_USD` or `MAX_OPEN_POSITIONS`; they were removed
-from `.env` because they read as authoritative and are not.
+**Risk caps are not set here.** They live in `config/trading_rules.yaml` under
+`risk:`. No code reads `MAX_DAILY_LOSS_USD` etc. from `.env`; they were
+removed because they read as authoritative and are not.
 
-When the dashboard runs behind Cloud IAP, two further keys switch on the edge guards in
-`src/web_security.py`: `IAP_AUDIENCE` (the backend service the assertion must be minted for) and
-`PUBLIC_ORIGIN` (the origin state-changing requests must come from). Neither is set locally.
+When the dashboard runs behind Cloud IAP, `IAP_AUDIENCE` and `PUBLIC_ORIGIN`
+switch on the edge guards in `src/web_security.py`. Neither is set locally.
 
-## Run Paper Mode
-
-```console
-python -m src.main run-paper --once
-```
-
-To run continuously:
+## Run
 
 ```console
-python -m src.main run-paper
+python -m src.main run-paper --once   # paper mode (default)
+python -m src.main run-dry --once     # builds live payloads, never submits
+python -m src.main status             # decisions, risk blocks, positions
+python -m src.main stop               # creates STOP_TRADING (kill switch)
 ```
 
-Paper trades, when enabled and approved, are stored in `data/paper_trades.db`. Decisions and risk blocks are stored in `data/trading_agent.db`.
+Paper trades land in `data/paper_trades.db`; decisions and risk blocks in
+`data/trading_agent.db` (SQLite).
 
-## Review Logs
+## Enable live trading
 
-```console
-python -m src.main status
-```
-
-For detailed inspection, open the SQLite databases:
-
-```console
-sqlite3 data/trading_agent.db "select timestamp, symbol, action, reason from decisions order by id desc limit 20;"
-sqlite3 data/trading_agent.db "select timestamp, symbol, side, reason from risk_blocks order by id desc limit 20;"
-sqlite3 data/paper_trades.db "select timestamp, symbol, side, quantity, price, status from paper_trades order by id desc limit 20;"
-```
-
-## Dry Run Mode
-
-Dry-run mode prepares live order payloads but does not submit them:
-
-```console
-python -m src.main run-dry --once
-```
-
-Use this after paper testing and after adding valid Robinhood API credentials.
-
-## Enable Live Trading
-
-Only after paper and dry-run testing:
-
-1. Set `.env`:
-
-```dotenv
-TRADING_MODE=live
-TRADING_ENABLED=true
-```
-
-2. Edit `config/trading_rules.yaml`:
-
-```yaml
-trading:
-  enabled: true
-  mode: live
-```
-
-3. Ensure no `STOP_TRADING` file exists.
-4. Confirm risk limits and allowed symbols.
-5. Start with one cycle:
-
-```console
-python -m src.main run-live --once
-```
-
-## Stop Immediately
-
-```console
-python -m src.main stop
-```
-
-This creates `STOP_TRADING`. The risk manager checks the kill switch before every action and blocks new orders while the file exists. You can also set `TRADING_ENABLED=false` in `.env`.
+Only after paper and dry-run testing: set `TRADING_MODE=live` +
+`TRADING_ENABLED=true` in `.env`, set `trading.enabled: true` +
+`trading.mode: live` in `config/trading_rules.yaml`, ensure no `STOP_TRADING`
+file, confirm risk limits and allowed symbols, then start with one cycle:
+`python -m src.main run-live --once`.
 
 ## CLI
 
 ```console
-python -m src.main init
-python -m src.main run-paper
-python -m src.main run-dry
-python -m src.main run-live
-python -m src.main status
-python -m src.main stop
-python -m src.main backtest
-python -m src.main test-connection
-python -m src.main preview-order BTC-USD buy 5
+python -m src.main init | run-paper | run-dry | run-live | status | stop
+python -m src.main backtest | test-connection | preview-order BTC-USD buy 5
 ```
 
-`test-connection` makes a read-only authenticated account request and never places an order.
+`test-connection` makes a read-only authenticated request and never places an
+order. `preview-order` runs the full risk path and prints the payload without
+submitting.
 
-`preview-order` fetches market data, estimates quantity, runs risk checks, prints the order payload, and never submits it.
+## Tests
 
-## Robinhood Endpoint Notes To Confirm
+```console
+python -m pytest tests/ -q
+```
 
-The official docs page currently documents both v1 and v2 Crypto Trading API families. This project defaults the client to v2 because v2 order configs document `time_in_force` for limit orders and include fee-tier fields. Before enabling live mode, confirm in Robinhood's current docs for your account:
+1,100+ tests across ~70 files, covering the risk gates, signature scheme
+(pinned to Robinhood's public docs test vector), lane logic, parsers, and the
+readiness gates.
 
-- Whether you should use v1 or v2.
-- The exact available account cash field returned by `GET /api/v2/crypto/trading/accounts/`.
-- Whether your account expects `quote_amount`, `asset_quantity`, or both for limit orders.
-- The current fee treatment for estimated and submitted orders.
+## Robinhood endpoint notes to confirm
+
+The official docs currently describe both v1 and v2 Crypto Trading API
+families; this client defaults to v2 (documented `time_in_force` on limit
+orders, fee-tier fields). Before enabling live mode, confirm for your account:
+v1 vs v2; the exact available-cash field on
+`GET /api/v2/crypto/trading/accounts/`; whether limit orders expect
+`quote_amount`, `asset_quantity`, or both; and current fee treatment. These
+are open questions on purpose — the live path stays off until they are
+confirmed.

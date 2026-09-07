@@ -34,3 +34,5 @@ GHL-SETUP.md
 # clone, so it is deliberately NOT ignored -- git_hygiene's _MUST_NOT_BE_IGNORED
 # pins that.)
 STOP_TRADING_EQUITIES
+# Generated local harness dashboard
+options-dashboard.html
